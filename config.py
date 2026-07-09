@@ -44,12 +44,15 @@ VISION_PROVIDER = os.getenv("VISION_PROVIDER", "anthropic").lower()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
+NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com")
 
 # --- Queue / Matchmaking ---
 QUEUE_SIZE = 10
 TEAM_SIZE = 5
 VOTE_TIMEOUT_SECONDS = 120           # timeout for operator-skill / map votes before fallback
 AFK_REQUEUE_PENALTY = -5             # reputation hit for not confirming in time
+
 
 # Bootstrap phase: use pure-random team/map assignment until a player
 # has logged at least this many official matches. Once the *pool* of
@@ -71,6 +74,11 @@ MMR_MVP_BONUS = 10
 REPUTATION_WARN_THRESHOLD = 70
 REPUTATION_PRIORITY_DROP_THRESHOLD = 50   # queued last among simultaneous joiners
 REPUTATION_BAN_THRESHOLD = 25             # temporary queue ban, admin must review
+
+# --- Abuse / cost-control guards ---
+MAX_SCOREBOARD_UPLOAD_BYTES = 8 * 1024 * 1024   # 8MB cap before sending to Vision AI (cost + DoS guard)
+REGISTER_COOLDOWN_SECONDS = 300                  # per-user cooldown on /register (spam guard)
+QUEUE_JOIN_COOLDOWN_SECONDS = 10                 # per-user cooldown on /queue-join (spam guard)
 
 # --- Suspicious-submission thresholds (route to admin review instead of auto-accept) ---
 STAT_OUTLIER_STD_DEVS = 2.5       # flag any player stat more than N std devs from their own rolling average

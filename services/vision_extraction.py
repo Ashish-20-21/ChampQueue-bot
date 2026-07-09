@@ -122,11 +122,55 @@ class QwenVisionProvider(VisionProvider):
             "wire this up to the Qwen-VL API once you confirm the endpoint/model."
         )
 
+class NvidiaVisionProvider(VisionProvider):
+    """NVIDIA NIM provider using meta/llama-3.2-90b-vision-instruct"""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    def extract(self, image_bytes: bytes, media_type: str = "image/png") -> dict[str, Any]:
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        resp = httpx.post(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "meta/llama-3.2-90b-vision-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media_type};base64,{b64_image}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": EXTRACTION_PROMPT
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 2000,
+                "temperature": 0.1,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"]
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(text)
 
 _PROVIDERS = {
     "anthropic": lambda: AnthropicVisionProvider(config.ANTHROPIC_API_KEY),
     "openai": lambda: OpenAIVisionProvider(config.OPENAI_API_KEY),
     "qwen": lambda: QwenVisionProvider(config.QWEN_API_KEY),
+    "nvidia_nim": lambda: NvidiaVisionProvider(config.NVIDIA_NIM_API_KEY),
 }
 
 

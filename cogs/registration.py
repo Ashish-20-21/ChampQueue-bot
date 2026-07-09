@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import config
 from database.db import db
 
 
@@ -10,6 +11,7 @@ class Registration(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="register", description="Register for Champion's Queue (one-time; requires admin approval)")
+    @app_commands.checks.cooldown(1, config.REGISTER_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     @app_commands.describe(
         cod_uid="Your COD Mobile UID (this becomes your permanent player identity)",
         ign="Your current in-game name",
@@ -54,6 +56,15 @@ class Registration(commands.Cog):
             return
         db.update_ign(player["id"], new_ign)
         await interaction.response.send_message(f"IGN updated to **{new_ign}**. Your stats and history are unaffected.", ephemeral=True)
+
+    @register.error
+    async def register_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f"Slow down — try `/register` again in {error.retry_after:.0f}s.", ephemeral=True
+            )
+        else:
+            raise error
 
     @app_commands.command(name="whoami", description="Check your registration status")
     async def whoami(self, interaction: discord.Interaction):

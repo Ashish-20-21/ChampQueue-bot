@@ -88,6 +88,7 @@ class Queue(commands.Cog):
         self._lock = asyncio.Lock()
 
     @app_commands.command(name="queue-join", description="Join the Champion's Queue matchmaking queue")
+    @app_commands.checks.cooldown(1, config.QUEUE_JOIN_COOLDOWN_SECONDS, key=lambda i: i.user.id)
     async def queue_join(self, interaction: discord.Interaction):
         player = db.get_player_by_discord_id(interaction.user.id)
         if not player:
@@ -118,6 +119,15 @@ class Queue(commands.Cog):
                 db.queue_mark_matched([p["player_id"] for p in pop])
                 players = [p["players"] for p in pop]
                 await self._start_match(interaction, players)
+
+    @queue_join.error
+    async def queue_join_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f"Slow down — try again in {error.retry_after:.0f}s.", ephemeral=True
+            )
+        else:
+            raise error
 
     @app_commands.command(name="queue-leave", description="Leave the queue")
     async def queue_leave(self, interaction: discord.Interaction):

@@ -39,6 +39,26 @@ class ChampionsQueueBot(commands.Bot):
 
     async def on_ready(self):
         log.info(f"Logged in as {self.user} (id={self.user.id})")
+        # Sweep in case the bot was added to a foreign guild while offline
+        # (belt-and-suspenders alongside on_guild_join, and alongside
+        # disabling "Public Bot" in the Developer Portal, which is the
+        # primary control — see SECURITY.md).
+        for guild in list(self.guilds):
+            if guild.id != config.GUILD_ID:
+                log.warning(f"Bot is in unauthorized guild '{guild.name}' ({guild.id}) — leaving.")
+                await guild.leave()
+
+    async def on_guild_join(self, guild: discord.Guild):
+        if guild.id != config.GUILD_ID:
+            log.warning(f"Added to unauthorized guild '{guild.name}' ({guild.id}) — leaving immediately.")
+            try:
+                if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+                    await guild.system_channel.send(
+                        "This bot is privately configured for a specific server and isn't available here. Leaving."
+                    )
+            except discord.Forbidden:
+                pass
+            await guild.leave()
 
 
 async def main():

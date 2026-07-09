@@ -40,6 +40,11 @@ class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @staticmethod
+    def _is_match_participant(match_id: int, player_id: int) -> bool:
+        match_players = db.get_match_players(match_id)
+        return any(mp["player_id"] == player_id for mp in match_players)
+
     @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
     async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
         match = db.get_match_by_code(match_id)
@@ -47,6 +52,11 @@ class Match(commands.Cog):
             await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
             return
         player = db.get_player_by_discord_id(interaction.user.id)
+        if not player or not self._is_match_participant(match["id"], player["id"]):
+            await interaction.response.send_message(
+                "Only players in this match can share its room code.", ephemeral=True
+            )
+            return
         db.update_match(match["id"], {
             "room_code": code,
             "room_code_shared_by": player["id"] if player else None,
@@ -60,6 +70,22 @@ class Match(commands.Cog):
         match = db.get_match_by_code(match_id)
         if not match or match["status"] not in ("in_progress", "awaiting_result"):
             await interaction.response.send_message("Match not found or not awaiting a result.", ephemeral=True)
+            return
+
+        player = db.get_player_by_discord_id(interaction.user.id)
+        if not player or not self._is_match_participant(match["id"], player["id"]):
+            await interaction.response.send_message(
+                "Only players in this match can submit its result.", ephemeral=True
+            )
+            return
+
+        if not (screenshot.content_type or "").startswith("image/"):
+            await interaction.response.send_message("Please upload an image file.", ephemeral=True)
+            return
+        if screenshot.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
+            await interaction.response.send_message(
+                f"Image is too large (max {config.MAX_SCOREBOARD_UPLOAD_BYTES // (1024*1024)}MB).", ephemeral=True
+            )
             return
 
         await interaction.response.defer(thinking=True)

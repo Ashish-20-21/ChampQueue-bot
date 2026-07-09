@@ -1,0 +1,284 @@
+"""
+Thin data-access layer over Supabase. Every other module talks to the
+database ONLY through this file — no raw supabase-py calls scattered
+around cogs/services. Makes it trivial to swap Supabase for raw
+psycopg2/asyncpg later if you ever outgrow it.
+"""
+
+from __future__ import annotations
+import random
+import string
+from typing import Any, Optional
+
+from supabase import create_client, Client
+import config
+
+
+class Database:
+    def __init__(self) -> None:
+        self.client: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
+
+    # ------------------------------------------------------------------
+    # PLAYERS
+    # ------------------------------------------------------------------
+    def get_player_by_discord_id(self, discord_id: str) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("discord_id", str(discord_id)).execute()
+        return res.data[0] if res.data else None
+
+    def get_player_by_uid(self, cod_uid: str) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("cod_uid", cod_uid).execute()
+        return res.data[0] if res.data else None
+
+    def get_player_by_id(self, player_id: int) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("id", player_id).execute()
+        return res.data[0] if res.data else None
+
+    def create_player(self, discord_id: str, cod_uid: str, ign: str, region: str,
+                       organization: Optional[str] = None) -> dict:
+        payload = {
+            "discord_id": str(discord_id),
+            "cod_uid": cod_uid,
+            "ign": ign,
+            "region": region,
+            "organization": organization,
+            "status": "pending",
+        }
+        res = self.client.table("players").insert(payload).execute()
+        return res.data[0]
+
+    def approve_player(self, player_id: int, approved_by: str) -> dict:
+        res = (
+            self.client.table("players")
+            .update({"status": "approved", "approved_by": approved_by, "approved_at": "now()"})
+            .eq("id", player_id)
+            .execute()
+        )
+        return res.data[0]
+
+    def reject_player(self, player_id: int) -> dict:
+        res = self.client.table("players").update({"status": "rejected"}).eq("id", player_id).execute()
+        return res.data[0]
+
+    def update_ign(self, player_id: int, new_ign: str) -> dict:
+        # UID stays the anchor; IGN is purely cosmetic and never touches stats.
+        res = self.client.table("players").update({"ign": new_ign}).eq("id", player_id).execute()
+        return res.data[0]
+
+    def update_player_fields(self, player_id: int, fields: dict) -> dict:
+        res = self.client.table("players").update(fields).eq("id", player_id).execute()
+        return res.data[0]
+
+    def leaderboard(self, order_by: str = "mmr", limit: int = 10) -> list[dict]:
+        res = (
+            self.client.table("players")
+            .select("*")
+            .eq("status", "approved")
+            .order(order_by, desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data
+
+    # ------------------------------------------------------------------
+    # QUEUE
+    # ------------------------------------------------------------------
+    def queue_join(self, player_id: int) -> Optional[dict]:
+        existing = (
+            self.client.table("queue_entries")
+            .select("*")
+            .eq("player_id", player_id)
+            .eq("status", "waiting")
+            .execute()
+        )
+        if existing.data:
+            return None  # already in queue
+        res = self.client.table("queue_entries").insert(
+            {"player_id": player_id, "status": "waiting"}
+        ).execute()
+        return res.data[0]
+
+    def queue_leave(self, player_id: int) -> None:
+        self.client.table("queue_entries").update({"status": "left"}).eq(
+            "player_id", player_id
+        ).eq("status", "waiting").execute()
+
+    def queue_current(self) -> list[dict]:
+        res = (
+            self.client.table("queue_entries")
+            .select("*, players(*)")
+            .eq("status", "waiting")
+            .order("joined_at")
+            .execute()
+        )
+        return res.data
+
+    def queue_mark_matched(self, player_ids: list[int]) -> None:
+        self.client.table("queue_entries").update({"status": "matched"}).in_(
+            "player_id", player_ids
+        ).eq("status", "waiting").execute()
+
+    # ------------------------------------------------------------------
+    # MATCHES
+    # ------------------------------------------------------------------
+    @staticmethod
+    def generate_match_id() -> str:
+        suffix = "".join(random.choices(string.digits, k=4))
+        return f"CQ-{suffix}"
+
+    def create_match(self, is_bootstrap: bool, season_id: Optional[int] = None) -> dict:
+        payload = {
+            "match_id": self.generate_match_id(),
+            "status": "forming",
+            "is_bootstrap": is_bootstrap,
+            "season_id": season_id,
+        }
+        res = self.client.table("matches").insert(payload).execute()
+        return res.data[0]
+
+    def get_match(self, match_id: int) -> Optional[dict]:
+        res = self.client.table("matches").select("*").eq("id", match_id).execute()
+        return res.data[0] if res.data else None
+
+    def get_match_by_code(self, match_code: str) -> Optional[dict]:
+        res = self.client.table("matches").select("*").eq("match_id", match_code).execute()
+        return res.data[0] if res.data else None
+
+    def update_match(self, match_id: int, fields: dict) -> dict:
+        res = self.client.table("matches").update(fields).eq("id", match_id).execute()
+        return res.data[0]
+
+    def add_match_player(self, match_id: int, player_id: int, team: str,
+                          is_captain: bool = False) -> dict:
+        res = self.client.table("match_players").insert(
+            {"match_id": match_id, "player_id": player_id, "team": team, "is_captain": is_captain}
+        ).execute()
+        return res.data[0]
+
+    def get_match_players(self, match_id: int) -> list[dict]:
+        res = (
+            self.client.table("match_players")
+            .select("*, players(*)")
+            .eq("match_id", match_id)
+            .execute()
+        )
+        return res.data
+
+    def update_match_player(self, match_id: int, player_id: int, fields: dict) -> dict:
+        res = (
+            self.client.table("match_players")
+            .update(fields)
+            .eq("match_id", match_id)
+            .eq("player_id", player_id)
+            .execute()
+        )
+        return res.data[0]
+
+    def player_recent_matches(self, player_id: int, limit: int = 2) -> list[dict]:
+        res = (
+            self.client.table("match_players")
+            .select("*, matches(*)")
+            .eq("player_id", player_id)
+            .order("id", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data
+
+    def player_completed_match_count(self, player_id: int) -> int:
+        res = (
+            self.client.table("match_players")
+            .select("id, matches!inner(status)", count="exact")
+            .eq("player_id", player_id)
+            .eq("matches.status", "completed")
+            .execute()
+        )
+        return res.count or 0
+
+    # ------------------------------------------------------------------
+    # VOTES
+    # ------------------------------------------------------------------
+    def cast_skill_vote(self, match_id: int, player_id: int, team: str, skill: str) -> dict:
+        res = self.client.table("operator_skill_votes").upsert(
+            {"match_id": match_id, "player_id": player_id, "team": team, "skill": skill},
+            on_conflict="match_id,player_id",
+        ).execute()
+        return res.data[0]
+
+    def get_skill_votes(self, match_id: int, team: Optional[str] = None) -> list[dict]:
+        q = self.client.table("operator_skill_votes").select("*").eq("match_id", match_id)
+        if team:
+            q = q.eq("team", team)
+        return q.execute().data
+
+    def cast_map_vote(self, match_id: int, player_id: int, map_name: str) -> dict:
+        res = self.client.table("map_votes").upsert(
+            {"match_id": match_id, "player_id": player_id, "map": map_name},
+            on_conflict="match_id,player_id",
+        ).execute()
+        return res.data[0]
+
+    def get_map_votes(self, match_id: int) -> list[dict]:
+        return self.client.table("map_votes").select("*").eq("match_id", match_id).execute().data
+
+    # ------------------------------------------------------------------
+    # REPUTATION
+    # ------------------------------------------------------------------
+    def apply_reputation_delta(self, player_id: int, delta: int, reason: str,
+                                match_id: Optional[int] = None) -> dict:
+        self.client.table("reputation_log").insert(
+            {"player_id": player_id, "delta": delta, "reason": reason, "match_id": match_id}
+        ).execute()
+        player = self.get_player_by_id(player_id)
+        new_rep = max(0, min(100, player["reputation"] + delta))
+        return self.update_player_fields(player_id, {"reputation": new_rep})
+
+    # ------------------------------------------------------------------
+    # ACHIEVEMENTS
+    # ------------------------------------------------------------------
+    def grant_achievement(self, player_id: int, achievement_code: str,
+                           season_id: Optional[int] = None) -> Optional[dict]:
+        ach = (
+            self.client.table("achievements").select("*").eq("code", achievement_code).execute()
+        )
+        if not ach.data:
+            return None
+        achievement_id = ach.data[0]["id"]
+        existing = (
+            self.client.table("player_achievements")
+            .select("*")
+            .eq("player_id", player_id)
+            .eq("achievement_id", achievement_id)
+            .execute()
+        )
+        if existing.data:
+            return None  # already earned
+        res = self.client.table("player_achievements").insert(
+            {"player_id": player_id, "achievement_id": achievement_id, "season_id": season_id}
+        ).execute()
+        return res.data[0]
+
+    def get_player_achievements(self, player_id: int) -> list[dict]:
+        res = (
+            self.client.table("player_achievements")
+            .select("*, achievements(*)")
+            .eq("player_id", player_id)
+            .execute()
+        )
+        return res.data
+
+    # ------------------------------------------------------------------
+    # SEASONS / HALL OF FAME
+    # ------------------------------------------------------------------
+    def get_active_season(self) -> Optional[dict]:
+        res = self.client.table("seasons").select("*").eq("is_active", True).execute()
+        return res.data[0] if res.data else None
+
+    def record_hall_of_fame(self, season_id: int, category: str, player_id: int, value: str) -> dict:
+        res = self.client.table("hall_of_fame").upsert(
+            {"season_id": season_id, "category": category, "player_id": player_id, "value": value},
+            on_conflict="season_id,category",
+        ).execute()
+        return res.data[0]
+
+
+db = Database()

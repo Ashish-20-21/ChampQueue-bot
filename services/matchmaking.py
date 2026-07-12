@@ -72,14 +72,9 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
         for player, side in zip(ranked, order):
             (team_a if side == "A" else team_b).append(player)
 
-    captain_a = max(team_a, key=_performance_score)
-    captain_b = max(team_b, key=_performance_score)
-
     return {
         "team_a": team_a,
         "team_b": team_b,
-        "captain_a": captain_a["id"],
-        "captain_b": captain_b["id"],
     }
 
 

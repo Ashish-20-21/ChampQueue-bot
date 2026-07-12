@@ -6,6 +6,7 @@ psycopg2/asyncpg later if you ever outgrow it.
 """
 
 from __future__ import annotations
+import asyncio
 import random
 import string
 from typing import Any, Optional
@@ -102,7 +103,13 @@ class Database:
             "player_id", player_id
         ).eq("status", "waiting").execute()
 
-    def queue_current(self) -> list[dict]:
+    def queue_current(self, region: Optional[str] = None) -> list[dict]:
+        """Pass region to scope the queue to one region only — required for
+        the region-scoped queue flow (East/West ping issue, see
+        SPRINT_PLAN.md §region). Filtered client-side on the already-joined
+        players.region rather than in the query itself, since queue volume
+        at any moment is at most a few dozen rows — a second round-trip or
+        a fragile nested-table filter isn't worth it at this scale."""
         res = (
             self.client.table("queue_entries")
             .select("*, players(*)")
@@ -110,7 +117,10 @@ class Database:
             .order("joined_at")
             .execute()
         )
-        return res.data
+        rows = res.data
+        if region is not None:
+            rows = [r for r in rows if r.get("players", {}).get("region") == region]
+        return rows
 
     def queue_mark_matched(self, player_ids: list[int]) -> None:
         self.client.table("queue_entries").update({"status": "matched"}).in_(
@@ -282,3 +292,47 @@ class Database:
 
 
 db = Database()
+
+
+# ======================================================================
+# ASYNC SAFETY LAYER
+# ----------------------------------------------------------------------
+# supabase-py is synchronous. Calling db.<method>(...) directly inside an
+# `async def` cog handler blocks the ENTIRE bot event loop for the length
+# of that HTTP round-trip — every other player's button click, command,
+# and Discord's own gateway heartbeat freezes until it returns. At 50-60
+# matches/day this can silently look like "occasional lag"; under any
+# real concurrent load (multiple matches finishing near-simultaneously)
+# it causes missed 3-second interaction acks and gateway timeouts.
+#
+# Fix: every DB call from a cog goes through `adb` instead of `db`.
+# `adb.<same method name>(...)` runs the identical synchronous method in
+# a worker thread via asyncio.to_thread, so the event loop stays free.
+# Nothing about Database's 30+ methods changes — this is purely additive,
+# so it's safe to introduce mid-sprint without touching cogs that haven't
+# been migrated yet (they can keep using `db.<method>` unchanged until
+# you get to them).
+#
+# Usage in a cog:
+#     from database.db import adb
+#     player = await adb.get_player_by_discord_id(interaction.user.id)
+# ======================================================================
+class _AsyncDatabaseProxy:
+    """Wraps every callable attribute of a Database instance so it can be
+    awaited without blocking the event loop. See module docstring above."""
+
+    def __init__(self, sync_db: Database) -> None:
+        self._db = sync_db
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._db, name)
+        if not callable(attr):
+            return attr
+
+        async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+            return await asyncio.to_thread(attr, *args, **kwargs)
+
+        return _wrapper
+
+
+adb = _AsyncDatabaseProxy(db)

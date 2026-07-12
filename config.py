@@ -88,14 +88,17 @@ VOTE_MISMATCH_BLOCKS_AUTO_ACCEPT = True  # if player winner-vote disagrees with 
 RANK_TIERS = ["Elite", "PRO", "Master", "Grandmaster", "Legendary", "Titans"]
 RANK_DIVISIONS = ["II", "I"]
 
-# --- Official competitive Hardpoint maps (edit to match your ruleset) ---
+# --- Official competitive Hardpoint maps ---
+# 3 of these are picked per match (see matchmaking.pick_map_candidates) and
+# assigned one-per-round for the Ro3 — there is NO player vote on this list,
+# it's announced as a fixed embed ("Map chosen are: X, Y, Z"). See
+# cogs/queue.py's map announcement step and matches.map_pool in the schema.
 HARDPOINT_MAPS = [
-    "Crash",
-    "Raid",
-    "Standoff",
-    "Nuketown",
-    "Firing Range",
-    "Slums",
+    "Summit",
+    "Hacienda",
+    "Combine",
+    "Takeoff",
+    "Arsenal",
 ]
 
 # --- Operator skills available for the pre-match vote ---

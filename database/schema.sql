@@ -1,242 +1,338 @@
--- Champion's Queue — Supabase/Postgres schema
--- Run this in the Supabase SQL editor (or via `psql`) before starting the bot.
+"""
+Thin data-access layer over Supabase. Every other module talks to the
+database ONLY through this file — no raw supabase-py calls scattered
+around cogs/services. Makes it trivial to swap Supabase for raw
+psycopg2/asyncpg later if you ever outgrow it.
+"""
 
--- ============================================================
--- PLAYERS
--- ============================================================
-create table if not exists players (
-    id                bigserial primary key,
-    discord_id        text unique not null,
-    cod_uid           text unique not null,        -- permanent identity anchor
-    ign               text not null,                -- mutable display name
-    region            text not null,
-    organization      text,
-    status            text not null default 'pending'
-                        check (status in ('pending', 'approved', 'rejected', 'banned')),
-    approved_by        text,
-    approved_at        timestamptz,
+from __future__ import annotations
+import asyncio
+import random
+import string
+from typing import Any, Optional
 
-    -- skill / ranking
-    mmr               integer not null default 1000,
-    peak_mmr          integer not null default 1000,
-    current_rank      text not null default 'Elite',
-    current_division  text not null default 'II',
-    peak_rank         text not null default 'Elite',
+from supabase import create_client, Client
+import config
 
-    -- trust
-    reputation        integer not null default 100,   -- 0-100 scale
 
-    -- career aggregates (denormalized for fast profile reads;
-    -- recomputed by the stats service after every match)
-    total_matches     integer not null default 0,
-    wins              integer not null default 0,
-    losses            integer not null default 0,
-    mvp_count         integer not null default 0,
-    avg_kills         numeric(6,2) not null default 0,
-    avg_deaths        numeric(6,2) not null default 0,
-    avg_damage        numeric(8,2) not null default 0,
-    avg_hill_time     numeric(6,2) not null default 0,
+class Database:
+    def __init__(self) -> None:
+        self.client: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 
-    created_at        timestamptz not null default now(),
-    updated_at        timestamptz not null default now()
-);
+    # ------------------------------------------------------------------
+    # PLAYERS
+    # ------------------------------------------------------------------
+    def get_player_by_discord_id(self, discord_id: str) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("discord_id", str(discord_id)).execute()
+        return res.data[0] if res.data else None
 
-create index if not exists idx_players_discord_id on players(discord_id);
-create index if not exists idx_players_status on players(status);
-create index if not exists idx_players_mmr on players(mmr desc);
+    def get_player_by_uid(self, cod_uid: str) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("cod_uid", cod_uid).execute()
+        return res.data[0] if res.data else None
 
--- ============================================================
--- SEASONS
--- ============================================================
-create table if not exists seasons (
-    id            bigserial primary key,
-    name          text not null,
-    start_date    timestamptz not null default now(),
-    end_date      timestamptz,
-    is_active     boolean not null default true
-);
+    def get_player_by_id(self, player_id: int) -> Optional[dict]:
+        res = self.client.table("players").select("*").eq("id", player_id).execute()
+        return res.data[0] if res.data else None
 
--- ============================================================
--- QUEUE
--- ============================================================
-create table if not exists queue_entries (
-    id            bigserial primary key,
-    player_id     bigint not null references players(id) on delete cascade,
-    joined_at     timestamptz not null default now(),
-    status        text not null default 'waiting'
-                    check (status in ('waiting', 'matched', 'left', 'timed_out')),
-    unique (player_id, status) -- a player can only have ONE active 'waiting' row at a time (enforced in app logic too)
-);
+    def create_player(self, discord_id: str, cod_uid: str, ign: str, region: str,
+                       organization: Optional[str] = None) -> dict:
+        payload = {
+            "discord_id": str(discord_id),
+            "cod_uid": cod_uid,
+            "ign": ign,
+            "region": region,
+            "organization": organization,
+            "status": "pending",
+        }
+        res = self.client.table("players").insert(payload).execute()
+        return res.data[0]
 
-create index if not exists idx_queue_status on queue_entries(status);
+    def approve_player(self, player_id: int, approved_by: str) -> dict:
+        res = (
+            self.client.table("players")
+            .update({"status": "approved", "approved_by": approved_by, "approved_at": "now()"})
+            .eq("id", player_id)
+            .execute()
+        )
+        return res.data[0]
 
--- ============================================================
--- MATCHES
--- ============================================================
-create table if not exists matches (
-    id                bigserial primary key,
-    match_id          text unique not null,          -- human-facing short ID, e.g. CQ-0001
-    season_id         bigint references seasons(id),
-    map               text,
-    status            text not null default 'forming'
-                        check (status in (
-                            'forming',       -- team balance / captain / skill vote in progress
-                            'map_vote',
-                            'awaiting_room', -- room code not yet shared
-                            'in_progress',
-                            'awaiting_result',
-                            'awaiting_review', -- flagged for admin review
-                            'completed',
-                            'cancelled'
-                        )),
-    is_bootstrap      boolean not null default false, -- true = random assignment phase, excluded/weighted differently in analysis
-    team_a_captain_id bigint references players(id),
-    team_b_captain_id bigint references players(id),
-    winner_team       text check (winner_team in ('A', 'B')),
-    final_score       text,                            -- e.g. "250-210"
-    mvp_player_id     bigint references players(id),
-    room_code         text,
-    room_code_shared_by bigint references players(id),
-    text_channel_id   text,
-    voice_channel_a_id text,
-    voice_channel_b_id text,
-    scoreboard_image_url text,
-    raw_extraction    jsonb,                            -- raw Vision AI output, kept for audits
-    created_at        timestamptz not null default now(),
-    completed_at      timestamptz
-);
+    def reject_player(self, player_id: int) -> dict:
+        res = self.client.table("players").update({"status": "rejected"}).eq("id", player_id).execute()
+        return res.data[0]
 
-create index if not exists idx_matches_status on matches(status);
-create index if not exists idx_matches_match_id on matches(match_id);
+    def update_ign(self, player_id: int, new_ign: str) -> dict:
+        # UID stays the anchor; IGN is purely cosmetic and never touches stats.
+        res = self.client.table("players").update({"ign": new_ign}).eq("id", player_id).execute()
+        return res.data[0]
 
--- ============================================================
--- MATCH PLAYERS (per-player, per-match stat line)
--- ============================================================
-create table if not exists match_players (
-    id             bigserial primary key,
-    match_id       bigint not null references matches(id) on delete cascade,
-    player_id      bigint not null references players(id),
-    team           text not null check (team in ('A', 'B')),
-    is_captain     boolean not null default false,
-    operator_skill text,
+    def update_player_fields(self, player_id: int, fields: dict) -> dict:
+        res = self.client.table("players").update(fields).eq("id", player_id).execute()
+        return res.data[0]
 
-    -- extracted / confirmed stats
-    kills          integer,
-    deaths         integer,
-    assists        integer,
-    damage         integer,
-    hill_time      numeric(6,2),
-    impact         numeric(6,2),
-    score          integer,
+    def leaderboard(self, order_by: str = "mmr", limit: int = 10) -> list[dict]:
+        res = (
+            self.client.table("players")
+            .select("*")
+            .eq("status", "approved")
+            .order(order_by, desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data
 
-    is_mvp         boolean not null default false,
-    mmr_before     integer,
-    mmr_after      integer,
-    mmr_change     integer,
+    # ------------------------------------------------------------------
+    # QUEUE
+    # ------------------------------------------------------------------
+    def queue_join(self, player_id: int) -> Optional[dict]:
+        existing = (
+            self.client.table("queue_entries")
+            .select("*")
+            .eq("player_id", player_id)
+            .eq("status", "waiting")
+            .execute()
+        )
+        if existing.data:
+            return None  # already in queue
+        res = self.client.table("queue_entries").insert(
+            {"player_id": player_id, "status": "waiting"}
+        ).execute()
+        return res.data[0]
 
-    -- integrity
-    stat_flagged   boolean not null default false,
-    stat_confirmed boolean not null default false,
+    def queue_leave(self, player_id: int) -> None:
+        self.client.table("queue_entries").update({"status": "left"}).eq(
+            "player_id", player_id
+        ).eq("status", "waiting").execute()
 
-    unique (match_id, player_id)
-);
+    def queue_current(self, region: Optional[str] = None) -> list[dict]:
+        """Pass region to scope the queue to one region only — required for
+        the region-scoped queue flow (East/West ping issue, see
+        SPRINT_PLAN.md §region). Filtered client-side on the already-joined
+        players.region rather than in the query itself, since queue volume
+        at any moment is at most a few dozen rows — a second round-trip or
+        a fragile nested-table filter isn't worth it at this scale."""
+        res = (
+            self.client.table("queue_entries")
+            .select("*, players(*)")
+            .eq("status", "waiting")
+            .order("joined_at")
+            .execute()
+        )
+        rows = res.data
+        if region is not None:
+            rows = [r for r in rows if r.get("players", {}).get("region") == region]
+        return rows
 
-create index if not exists idx_match_players_match on match_players(match_id);
-create index if not exists idx_match_players_player on match_players(player_id);
+    def queue_mark_matched(self, player_ids: list[int]) -> None:
+        self.client.table("queue_entries").update({"status": "matched"}).in_(
+            "player_id", player_ids
+        ).eq("status", "waiting").execute()
 
--- ============================================================
--- OPERATOR SKILL VOTES (per match, per team; unique skill per team enforced in app logic)
--- ============================================================
-create table if not exists operator_skill_votes (
-    id          bigserial primary key,
-    match_id    bigint not null references matches(id) on delete cascade,
-    player_id   bigint not null references players(id),
-    team        text not null check (team in ('A', 'B')),
-    skill       text not null,
-    voted_at    timestamptz not null default now(),
-    unique (match_id, player_id)
-);
+    # ------------------------------------------------------------------
+    # MATCHES
+    # ------------------------------------------------------------------
+    @staticmethod
+    def generate_match_id() -> str:
+        suffix = "".join(random.choices(string.digits, k=4))
+        return f"CQ-{suffix}"
 
--- ============================================================
--- MAP VOTES (round of 3 candidates, one match-wide vote)
--- ============================================================
-create table if not exists map_votes (
-    id          bigserial primary key,
-    match_id    bigint not null references matches(id) on delete cascade,
-    player_id   bigint not null references players(id),
-    map         text not null,
-    voted_at    timestamptz not null default now(),
-    unique (match_id, player_id)
-);
+    def create_match(self, is_bootstrap: bool, season_id: Optional[int] = None) -> dict:
+        payload = {
+            "match_id": self.generate_match_id(),
+            "status": "forming",
+            "is_bootstrap": is_bootstrap,
+            "season_id": season_id,
+        }
+        res = self.client.table("matches").insert(payload).execute()
+        return res.data[0]
 
--- ============================================================
--- REPUTATION LOG (audit trail; players.reputation is the running total)
--- ============================================================
-create table if not exists reputation_log (
-    id          bigserial primary key,
-    player_id   bigint not null references players(id) on delete cascade,
-    delta       integer not null,
-    reason      text not null,   -- 'afk', 'rage_quit', 'toxicity', 'fake_submission', 'match_dodge', 'admin_adjustment'
-    match_id    bigint references matches(id),
-    created_at  timestamptz not null default now()
-);
+    def get_match(self, match_id: int) -> Optional[dict]:
+        res = self.client.table("matches").select("*").eq("id", match_id).execute()
+        return res.data[0] if res.data else None
 
--- ============================================================
--- ACHIEVEMENTS
--- ============================================================
-create table if not exists achievements (
-    id            bigserial primary key,
-    code          text unique not null,     -- e.g. 'first_win', 'hill_king'
-    name          text not null,
-    description   text not null,
-    category      text not null check (category in ('general', 'hardpoint', 'streak', 'seasonal'))
-);
+    def get_match_by_code(self, match_code: str) -> Optional[dict]:
+        res = self.client.table("matches").select("*").eq("match_id", match_code).execute()
+        return res.data[0] if res.data else None
 
-create table if not exists player_achievements (
-    id              bigserial primary key,
-    player_id       bigint not null references players(id) on delete cascade,
-    achievement_id  bigint not null references achievements(id),
-    season_id       bigint references seasons(id),  -- null for permanent/general achievements
-    earned_at       timestamptz not null default now(),
-    unique (player_id, achievement_id, season_id)
-);
+    def update_match(self, match_id: int, fields: dict) -> dict:
+        res = self.client.table("matches").update(fields).eq("id", match_id).execute()
+        return res.data[0]
 
--- ============================================================
--- HALL OF FAME (per completed season)
--- ============================================================
-create table if not exists hall_of_fame (
-    id          bigserial primary key,
-    season_id   bigint not null references seasons(id),
-    category    text not null,   -- 'champion', 'highest_mmr', 'highest_kd', 'highest_damage', 'best_objective', 'most_mvps'
-    player_id   bigint not null references players(id),
-    value       text,            -- display value, e.g. "2.14 KD" or "1842 MMR"
-    unique (season_id, category)
-);
+    def add_match_player(self, match_id: int, player_id: int, team: str,
+                          is_captain: bool = False) -> dict:
+        res = self.client.table("match_players").insert(
+            {"match_id": match_id, "player_id": player_id, "team": team, "is_captain": is_captain}
+        ).execute()
+        return res.data[0]
 
--- ============================================================
--- SEED DATA: achievements
--- ============================================================
-insert into achievements (code, name, description, category) values
-    ('first_win', 'First Win', 'Win your first official match', 'general'),
-    ('matches_100', '100 Matches', 'Play 100 official matches', 'general'),
-    ('kills_500', '500 Kills', 'Reach 500 career kills', 'general'),
-    ('hill_king', 'Hill King', 'Highest hill time in a match', 'hardpoint'),
-    ('rotation_master', 'Rotation Master', 'Fastest average rotation across a match (tracked via impact/hill-time ratio)', 'hardpoint'),
-    ('anchor', 'Anchor', 'Most hill time on your team while holding a positive KD', 'hardpoint'),
-    ('break_specialist', 'Break Specialist', 'High impact in the final 60 seconds of a hill window (manual/admin tag until detection is automated)', 'hardpoint'),
-    ('win_streak_10', '10 Win Streak', 'Win 10 official matches in a row', 'streak'),
-    ('positive_kd_streak', 'Positive KD Streak', 'Maintain a positive KD across 5 consecutive matches', 'streak'),
-    ('mvp_streak', 'MVP Streak', 'Earn MVP in 3 consecutive matches', 'streak'),
-    ('season_champion', 'Season Champion', '#1 MMR at season end', 'seasonal'),
-    ('top_10', 'Top 10', 'Finish a season in the top 10 leaderboard', 'seasonal'),
-    ('highest_damage_season', 'Highest Damage', 'Highest average damage for a season', 'seasonal'),
-    ('most_mvps_season', 'Most MVPs', 'Most MVP awards in a season', 'seasonal'),
-    ('best_objective_season', 'Best Objective Player', 'Highest average hill time for a season', 'seasonal')
-on conflict (code) do nothing;
+    def get_match_players(self, match_id: int) -> list[dict]:
+        res = (
+            self.client.table("match_players")
+            .select("*, players(*)")
+            .eq("match_id", match_id)
+            .execute()
+        )
+        return res.data
 
--- ============================================================
--- SEED DATA: an active season
--- ============================================================
-insert into seasons (name, is_active)
-select 'Season 1', true
-where not exists (select 1 from seasons where is_active = true);
+    def update_match_player(self, match_id: int, player_id: int, fields: dict) -> dict:
+        res = (
+            self.client.table("match_players")
+            .update(fields)
+            .eq("match_id", match_id)
+            .eq("player_id", player_id)
+            .execute()
+        )
+        return res.data[0]
+
+    def player_recent_matches(self, player_id: int, limit: int = 2) -> list[dict]:
+        res = (
+            self.client.table("match_players")
+            .select("*, matches(*)")
+            .eq("player_id", player_id)
+            .order("id", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data
+
+    def player_completed_match_count(self, player_id: int) -> int:
+        res = (
+            self.client.table("match_players")
+            .select("id, matches!inner(status)", count="exact")
+            .eq("player_id", player_id)
+            .eq("matches.status", "completed")
+            .execute()
+        )
+        return res.count or 0
+
+    # ------------------------------------------------------------------
+    # VOTES
+    # ------------------------------------------------------------------
+    def cast_skill_vote(self, match_id: int, player_id: int, team: str, skill: str) -> dict:
+        res = self.client.table("operator_skill_votes").upsert(
+            {"match_id": match_id, "player_id": player_id, "team": team, "skill": skill},
+            on_conflict="match_id,player_id",
+        ).execute()
+        return res.data[0]
+
+    def get_skill_votes(self, match_id: int, team: Optional[str] = None) -> list[dict]:
+        q = self.client.table("operator_skill_votes").select("*").eq("match_id", match_id)
+        if team:
+            q = q.eq("team", team)
+        return q.execute().data
+
+    def cast_map_vote(self, match_id: int, player_id: int, map_name: str) -> dict:
+        res = self.client.table("map_votes").upsert(
+            {"match_id": match_id, "player_id": player_id, "map": map_name},
+            on_conflict="match_id,player_id",
+        ).execute()
+        return res.data[0]
+
+    def get_map_votes(self, match_id: int) -> list[dict]:
+        return self.client.table("map_votes").select("*").eq("match_id", match_id).execute().data
+
+    # ------------------------------------------------------------------
+    # REPUTATION
+    # ------------------------------------------------------------------
+    def apply_reputation_delta(self, player_id: int, delta: int, reason: str,
+                                match_id: Optional[int] = None) -> dict:
+        self.client.table("reputation_log").insert(
+            {"player_id": player_id, "delta": delta, "reason": reason, "match_id": match_id}
+        ).execute()
+        player = self.get_player_by_id(player_id)
+        new_rep = max(0, min(100, player["reputation"] + delta))
+        return self.update_player_fields(player_id, {"reputation": new_rep})
+
+    # ------------------------------------------------------------------
+    # ACHIEVEMENTS
+    # ------------------------------------------------------------------
+    def grant_achievement(self, player_id: int, achievement_code: str,
+                           season_id: Optional[int] = None) -> Optional[dict]:
+        ach = (
+            self.client.table("achievements").select("*").eq("code", achievement_code).execute()
+        )
+        if not ach.data:
+            return None
+        achievement_id = ach.data[0]["id"]
+        existing = (
+            self.client.table("player_achievements")
+            .select("*")
+            .eq("player_id", player_id)
+            .eq("achievement_id", achievement_id)
+            .execute()
+        )
+        if existing.data:
+            return None  # already earned
+        res = self.client.table("player_achievements").insert(
+            {"player_id": player_id, "achievement_id": achievement_id, "season_id": season_id}
+        ).execute()
+        return res.data[0]
+
+    def get_player_achievements(self, player_id: int) -> list[dict]:
+        res = (
+            self.client.table("player_achievements")
+            .select("*, achievements(*)")
+            .eq("player_id", player_id)
+            .execute()
+        )
+        return res.data
+
+    # ------------------------------------------------------------------
+    # SEASONS / HALL OF FAME
+    # ------------------------------------------------------------------
+    def get_active_season(self) -> Optional[dict]:
+        res = self.client.table("seasons").select("*").eq("is_active", True).execute()
+        return res.data[0] if res.data else None
+
+    def record_hall_of_fame(self, season_id: int, category: str, player_id: int, value: str) -> dict:
+        res = self.client.table("hall_of_fame").upsert(
+            {"season_id": season_id, "category": category, "player_id": player_id, "value": value},
+            on_conflict="season_id,category",
+        ).execute()
+        return res.data[0]
+
+
+db = Database()
+
+
+# ======================================================================
+# ASYNC SAFETY LAYER
+# ----------------------------------------------------------------------
+# supabase-py is synchronous. Calling db.<method>(...) directly inside an
+# `async def` cog handler blocks the ENTIRE bot event loop for the length
+# of that HTTP round-trip — every other player's button click, command,
+# and Discord's own gateway heartbeat freezes until it returns. At 50-60
+# matches/day this can silently look like "occasional lag"; under any
+# real concurrent load (multiple matches finishing near-simultaneously)
+# it causes missed 3-second interaction acks and gateway timeouts.
+#
+# Fix: every DB call from a cog goes through `adb` instead of `db`.
+# `adb.<same method name>(...)` runs the identical synchronous method in
+# a worker thread via asyncio.to_thread, so the event loop stays free.
+# Nothing about Database's 30+ methods changes — this is purely additive,
+# so it's safe to introduce mid-sprint without touching cogs that haven't
+# been migrated yet (they can keep using `db.<method>` unchanged until
+# you get to them).
+#
+# Usage in a cog:
+#     from database.db import adb
+#     player = await adb.get_player_by_discord_id(interaction.user.id)
+# ======================================================================
+class _AsyncDatabaseProxy:
+    """Wraps every callable attribute of a Database instance so it can be
+    awaited without blocking the event loop. See module docstring above."""
+
+    def __init__(self, sync_db: Database) -> None:
+        self._db = sync_db
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._db, name)
+        if not callable(attr):
+            return attr
+
+        async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+            return await asyncio.to_thread(attr, *args, **kwargs)
+
+        return _wrapper
+
+
+adb = _AsyncDatabaseProxy(db)

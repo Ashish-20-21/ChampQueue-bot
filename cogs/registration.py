@@ -1,3 +1,5 @@
+import re
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -6,16 +8,16 @@ import config
 from database.db import adb
 
 VALID_REGIONS = ["East", "West"]
+COD_UID_PATTERN = re.compile(r"^\d{19}$")  # exactly 19 digits, numeric only
 
 
 class Registration(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="register", description="Register for Champion's Queue (one-time; requires admin approval)")
-    @app_commands.checks.cooldown(1, config.REGISTER_COOLDOWN_SECONDS, key=lambda i: i.user.id)
+    @app_commands.command(name="register", description="Register for Champion's Queue")
     @app_commands.describe(
-        cod_uid="Your COD Mobile UID (this becomes your permanent player identity)",
+        cod_uid="Your COD Mobile UID — 19 digits, exactly as shown in-game",
         ign="Your current in-game name",
         region="Your competitive region",
         organization="Your organization, if any (optional)",
@@ -32,6 +34,16 @@ class Registration(commands.Cog):
         if region not in VALID_REGIONS:
             await interaction.response.send_message(
                 f"Invalid region `{region}`. Must be exactly one of: {', '.join(VALID_REGIONS)}.",
+                ephemeral=True,
+            )
+            return
+
+        cod_uid = cod_uid.strip()
+        if not COD_UID_PATTERN.match(cod_uid):
+            await interaction.response.send_message(
+                "That doesn't look like a valid COD Mobile UID — it must be exactly 19 digits, "
+                "numbers only (check Settings > Account in-game for your UID). "
+                "Nothing was saved — just run `/register` again with the correct UID.",
                 ephemeral=True,
             )
             return
@@ -54,15 +66,28 @@ class Registration(commands.Cog):
             )
             return
 
-        player = await adb.create_player(interaction.user.id, cod_uid, ign, region, organization)
+        try:
+            player = await adb.create_player(interaction.user.id, cod_uid, ign, region, organization)
+        except Exception as e:
+            # Handles the race where two people submit the same UID at
+            # nearly the same instant — both pass the uid_taken check above
+            # before either INSERT lands, so the DB's unique constraint is
+            # the real backstop. Give a clean message instead of a raw 500.
+            if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
+                await interaction.response.send_message(
+                    "That COD Mobile UID was just registered by someone else a moment ago. "
+                    "If this is your UID, contact an admin.",
+                    ephemeral=True,
+                )
+                return
+            raise
+
+        await adb.approve_player(player["id"], approved_by="auto")
         await interaction.response.send_message(
-            f"Registration submitted for **{ign}** (UID `{cod_uid}`, region `{region}`). "
-            f"An admin needs to approve you before you can join the queue.",
+            f"You're registered and approved, **{ign}**! (UID `{cod_uid}`, region `{region}`) "
+            f"You can head to your region's queue channel and join now.",
             ephemeral=True,
         )
-
-        # Notify admin channel/role if configured — left as a follow-up
-        # since it depends on which channel you want approvals posted to.
 
     @app_commands.command(name="update-ign", description="Update your display IGN (your career stats stay attached to your UID)")
     async def update_ign(self, interaction: discord.Interaction, new_ign: str):
@@ -72,15 +97,6 @@ class Registration(commands.Cog):
             return
         await adb.update_ign(player["id"], new_ign)
         await interaction.response.send_message(f"IGN updated to **{new_ign}**. Your stats and history are unaffected.", ephemeral=True)
-
-    @register.error
-    async def register_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f"Slow down — try `/register` again in {error.retry_after:.0f}s.", ephemeral=True
-            )
-        else:
-            raise error
 
     @app_commands.command(name="whoami", description="Check your registration status")
     async def whoami(self, interaction: discord.Interaction):

@@ -127,6 +127,16 @@ class Database:
             "player_id", player_ids
         ).eq("status", "waiting").execute()
 
+    def queue_mark_waiting(self, player_ids: list[int]) -> None:
+        """Rollback counterpart to queue_mark_matched — used when
+        _start_match_flow fails partway through (e.g. Discord channel
+        creation error) so the 10 players aren't permanently stranded
+        outside the queue with no way back in. Only flips rows that are
+        currently 'matched' back to 'waiting', scoped to these player_ids."""
+        self.client.table("queue_entries").update({"status": "waiting"}).in_(
+            "player_id", player_ids
+        ).eq("status", "matched").execute()
+
     # ------------------------------------------------------------------
     # MATCHES
     # ------------------------------------------------------------------

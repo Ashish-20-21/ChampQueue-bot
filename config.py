@@ -48,8 +48,8 @@ NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
 NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com")
 
 # --- Queue / Matchmaking ---
-QUEUE_SIZE = 2
-TEAM_SIZE = 1
+QUEUE_SIZE = 10
+TEAM_SIZE = 5
 VOTE_TIMEOUT_SECONDS = 120           # timeout for operator-skill / map votes before fallback
 AFK_REQUEUE_PENALTY = -5             # reputation hit for not confirming in time
 

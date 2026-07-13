@@ -3,7 +3,9 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from database.db import db
+from database.db import adb
+
+VALID_REGIONS = ["East", "West"]
 
 
 class Registration(commands.Cog):
@@ -18,9 +20,23 @@ class Registration(commands.Cog):
         region="Your competitive region",
         organization="Your organization, if any (optional)",
     )
+    @app_commands.choices(region=[
+        app_commands.Choice(name="East", value="East"),
+        app_commands.Choice(name="West", value="West"),
+    ])
     async def register(self, interaction: discord.Interaction, cod_uid: str, ign: str,
                         region: str, organization: str | None = None):
-        existing = db.get_player_by_discord_id(interaction.user.id)
+        # Belt-and-suspenders: app_commands.choices restricts the Discord UI
+        # dropdown, but validate again here in case of stale command cache
+        # or any other path that bypasses the dropdown.
+        if region not in VALID_REGIONS:
+            await interaction.response.send_message(
+                f"Invalid region `{region}`. Must be exactly one of: {', '.join(VALID_REGIONS)}.",
+                ephemeral=True,
+            )
+            return
+
+        existing = await adb.get_player_by_discord_id(interaction.user.id)
         if existing:
             await interaction.response.send_message(
                 f"You're already registered as **{existing['ign']}** (status: `{existing['status']}`). "
@@ -29,7 +45,7 @@ class Registration(commands.Cog):
             )
             return
 
-        uid_taken = db.get_player_by_uid(cod_uid)
+        uid_taken = await adb.get_player_by_uid(cod_uid)
         if uid_taken:
             await interaction.response.send_message(
                 "That COD Mobile UID is already registered to another Discord account. "
@@ -38,7 +54,7 @@ class Registration(commands.Cog):
             )
             return
 
-        player = db.create_player(interaction.user.id, cod_uid, ign, region, organization)
+        player = await adb.create_player(interaction.user.id, cod_uid, ign, region, organization)
         await interaction.response.send_message(
             f"Registration submitted for **{ign}** (UID `{cod_uid}`, region `{region}`). "
             f"An admin needs to approve you before you can join the queue.",
@@ -50,11 +66,11 @@ class Registration(commands.Cog):
 
     @app_commands.command(name="update-ign", description="Update your display IGN (your career stats stay attached to your UID)")
     async def update_ign(self, interaction: discord.Interaction, new_ign: str):
-        player = db.get_player_by_discord_id(interaction.user.id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
         if not player:
             await interaction.response.send_message("You're not registered yet — use `/register` first.", ephemeral=True)
             return
-        db.update_ign(player["id"], new_ign)
+        await adb.update_ign(player["id"], new_ign)
         await interaction.response.send_message(f"IGN updated to **{new_ign}**. Your stats and history are unaffected.", ephemeral=True)
 
     @register.error
@@ -68,7 +84,7 @@ class Registration(commands.Cog):
 
     @app_commands.command(name="whoami", description="Check your registration status")
     async def whoami(self, interaction: discord.Interaction):
-        player = db.get_player_by_discord_id(interaction.user.id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
         if not player:
             await interaction.response.send_message("You're not registered yet — use `/register` first.", ephemeral=True)
             return

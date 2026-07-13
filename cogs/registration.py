@@ -69,16 +69,46 @@ class Registration(commands.Cog):
         try:
             player = await adb.create_player(interaction.user.id, cod_uid, ign, region, organization)
         except Exception as e:
-            # Handles the race where two people submit the same UID at
-            # nearly the same instant — both pass the uid_taken check above
-            # before either INSERT lands, so the DB's unique constraint is
-            # the real backstop. Give a clean message instead of a raw 500.
-            if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
-                await interaction.response.send_message(
-                    "That COD Mobile UID was just registered by someone else a moment ago. "
-                    "If this is your UID, contact an admin.",
-                    ephemeral=True,
-                )
+            # Handles races where the same request gets processed twice
+            # (confirmed cause: Discord client-side retry/double-fire on a
+            # slow response — not manual double-submission; seen twice in
+            # testing, 2026-07-13/14, same UID landing successfully once,
+            # second near-simultaneous attempt hitting the DB's unique
+            # constraint milliseconds later). Two different constraints can
+            # fire — check which one, then check whether the row that
+            # exists now belongs to THIS account before saying "someone
+            # else" took it, since that's misleading when it was actually
+            # their own request's echo.
+            err_str = str(e).lower()
+            is_discord_id_conflict = "players_discord_id_key" in err_str
+            is_uid_conflict = "players_cod_uid_key" in err_str or "duplicate key" in err_str
+
+            if is_discord_id_conflict:
+                existing_now = await adb.get_player_by_discord_id(interaction.user.id)
+                if existing_now:
+                    await interaction.response.send_message(
+                        f"You're already registered as **{existing_now['ign']}** "
+                        f"(status: `{existing_now['status']}`). That last click just duplicated "
+                        f"your own request — no action needed.",
+                        ephemeral=True,
+                    )
+                    return
+                raise
+
+            if is_uid_conflict:
+                winner = await adb.get_player_by_uid(cod_uid)
+                if winner and str(winner.get("discord_id")) == str(interaction.user.id):
+                    await interaction.response.send_message(
+                        f"You're already registered as **{winner['ign']}** (status: `{winner['status']}`). "
+                        f"That last click just duplicated your own request — no action needed.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "That COD Mobile UID is already registered to another Discord account. "
+                        "If this is your UID, contact an admin.",
+                        ephemeral=True,
+                    )
                 return
             raise
 

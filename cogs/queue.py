@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 
 import discord
@@ -11,6 +12,8 @@ import config
 from database.db import db, adb
 from services import matchmaking, reputation
 from utils.permissions import admin_only
+
+logger = logging.getLogger("champions_queue")
 
 
 class SkillVoteView(discord.ui.View):
@@ -58,12 +61,12 @@ def make_queue_embed(region: str, current_queue: list[dict]) -> discord.Embed:
         mmr = player_info.get("mmr", 1000)
         rank = player_info.get("current_rank")
         division = player_info.get("current_division")
-        
+
         rank_str = f" [{rank} {division}]" if rank else ""
         player_lines.append(f"`{idx:02d}` **{ign}**{rank_str} — MMR: {mmr}")
-        
+
     names = "\n".join(player_lines) if player_lines else "*No players in queue. Be the first to join!*"
-    
+
     embed = discord.Embed(
         title=f"🛡️ Champion's Queue — {region.upper()} Region",
         description=f"Join the competitive matchmaking lobby for the **{region.upper()}** region.",
@@ -79,7 +82,7 @@ class RegionQueueView(discord.ui.View):
         super().__init__(timeout=None)
         self.region = region
         self.cog = cog
-        
+
         self.join_button = discord.ui.Button(
             label="Join Queue",
             style=discord.ButtonStyle.success,
@@ -87,7 +90,7 @@ class RegionQueueView(discord.ui.View):
         )
         self.join_button.callback = self.join_callback
         self.add_item(self.join_button)
-        
+
         self.leave_button = discord.ui.Button(
             label="Leave Queue",
             style=discord.ButtonStyle.danger,
@@ -95,14 +98,14 @@ class RegionQueueView(discord.ui.View):
         )
         self.leave_button.callback = self.leave_callback
         self.add_item(self.leave_button)
-        
+
         self.start_match_button = discord.ui.Button(
             label="Start Match",
             style=discord.ButtonStyle.primary,
             custom_id=f"start_match_{region}"
         )
         self.start_match_button.callback = self.start_match_callback
-        
+
     async def update_view_state(self, current_queue: list[dict]):
         if len(current_queue) >= 10:
             if self.start_match_button not in self.children:
@@ -113,10 +116,10 @@ class RegionQueueView(discord.ui.View):
 
     async def join_callback(self, interaction: discord.Interaction):
         await self.cog.handle_join(interaction, self.region, self)
-        
+
     async def leave_callback(self, interaction: discord.Interaction):
         await self.cog.handle_leave(interaction, self.region, self)
-        
+
     async def start_match_callback(self, interaction: discord.Interaction):
         await self.cog.handle_start_match(interaction, self.region, self)
 
@@ -136,12 +139,12 @@ class Queue(commands.Cog):
                 "Invalid region. Please specify either 'East' or 'West'.", ephemeral=True
             )
             return
-            
+
         await interaction.response.defer(thinking=True)
         current_queue = await adb.queue_current(region=region_norm)
         view = RegionQueueView(region_norm, self)
         await view.update_view_state(current_queue)
-        
+
         embed = make_queue_embed(region_norm, current_queue)
         await interaction.channel.send(embed=embed, view=view)
         await interaction.followup.send(f"Successfully posted the persistent queue panel for **{region_norm}**.", ephemeral=True)
@@ -155,7 +158,7 @@ class Queue(commands.Cog):
                 "Invalid region. Please specify either 'East' or 'West'.", ephemeral=True
             )
             return
-            
+
         current = await adb.queue_current(region=region_norm)
         names = ", ".join(p["players"]["ign"] for p in current) or "empty"
         await interaction.response.send_message(f"**{region_norm} Queue ({len(current)}/10):** {names}")
@@ -233,8 +236,24 @@ class Queue(commands.Cog):
                 )
                 return
 
-            await interaction.response.defer(ephemeral=True)
+            # Validate every player has a real, resolvable Discord ID BEFORE
+            # touching the DB at all. This is the fix for the fake-test-data
+            # crash: catch it here, with zero side effects, instead of
+            # partway through channel creation after players are already
+            # marked matched.
             pop = current_queue[:10]
+            players_list = [p["players"] for p in pop]
+            bad_ids = [p["ign"] for p in players_list if not str(p.get("discord_id", "")).isdigit()]
+            if bad_ids:
+                await interaction.response.send_message(
+                    f"Can't start this match — these players have invalid Discord IDs and can't be "
+                    f"added to a real channel: {', '.join(bad_ids)}. (This usually means test/fake "
+                    f"data is still in the queue — clear it before testing Start Match.)",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
             player_ids = [p["player_id"] for p in pop]
             await adb.queue_mark_matched(player_ids)
 
@@ -245,10 +264,26 @@ class Queue(commands.Cog):
             new_embed = make_queue_embed(region, remaining_queue)
             await interaction.message.edit(embed=new_embed, view=new_view)
 
-            # Spawn the match creation and setup
-            players_list = [p["players"] for p in pop]
-            await self._start_match_flow(interaction, players_list, player["id"], region)
-            await interaction.followup.send("Match started successfully!", ephemeral=True)
+            # Spawn the match creation and setup. Everything past this point
+            # touches Discord's API (channel/VC creation) which can fail for
+            # reasons outside our control (permissions, rate limits, etc).
+            # If it does, roll the 10 players back to 'waiting' instead of
+            # leaving them stranded in a dead 'forming' match with no path
+            # back into the queue.
+            try:
+                await self._start_match_flow(interaction, players_list, player["id"], region)
+                await interaction.followup.send("Match started successfully!", ephemeral=True)
+            except Exception:
+                logger.exception(
+                    f"_start_match_flow failed for region={region}, host_player_id={player['id']}. "
+                    f"Rolling back {len(player_ids)} players to 'waiting'."
+                )
+                await adb.queue_mark_waiting(player_ids)
+                await interaction.followup.send(
+                    "Something went wrong setting up the match — you've been returned to the queue. "
+                    "An admin has been notified.",
+                    ephemeral=True,
+                )
 
     async def _start_match_flow(self, interaction: discord.Interaction, players: list[dict], host_player_id: int, region: str):
         channel = interaction.channel

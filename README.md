@@ -3,12 +3,11 @@
 Invite-only competitive matchmaking bot for the COD Mobile esports community.
 Python (discord.py) + Supabase (Postgres) + swappable Vision AI extraction.
 
-Tested in this build: every module byte-compiles, all services import cleanly
-with real dependencies installed, and all 6 cogs load into a live discord.py
-`Bot` instance registering **19 slash commands** with no errors. This sandbox
-has no network access to Discord's gateway, so the actual `bot.start()` /
-login step has **not** been run — that's the one thing to verify first when
-you deploy.
+> **Design decisions and their reasoning live in [`DECISIONS.md`](./DECISIONS.md),
+> not in this file.** This README describes what the bot does and how to run
+> it. If you're wondering *why* something works a certain way, check
+> `DECISIONS.md` first — it's the source of truth and gets updated whenever a
+> real decision changes. This file can drift; that one shouldn't.
 
 ---
 
@@ -34,14 +33,23 @@ cp .env.example .env
 | `DIGEST_CHANNEL_ID` | optional — channel for the daily digest post |
 
 ### Discord bot permissions/intents
-In the Developer Portal, enable **Server Members Intent** and **Message
-Content Intent** (the bot's `INTENTS` in `bot.py` already requests both).
-Invite the bot with at least: `Manage Channels`, `Send Messages`,
-`Use Slash Commands`, `Connect` (voice channel creation).
+Enable **Server Members Intent** and **Message Content Intent** in the
+Developer Portal. Invite the bot with at least: `Manage Channels`,
+`Send Messages`, `Use Slash Commands`, `Connect` (voice channel creation).
 
 ### Database
-Open the Supabase SQL editor and run `database/schema.sql` once. It creates
-every table, seeds the achievement list, and creates Season 1.
+Run these once, in order, in the Supabase SQL editor:
+1. `database/schema.sql` — creates every table, seeds achievements, creates Season 1
+2. `database/migration_ro3_verification.sql` — RO3 screenshot table + host-approval tracking
+3. `database/migration_002_region_and_maps.sql` — map pool column + East/West region constraint
+
+### Discord server setup (not code — you do this manually)
+- Create one text channel per region for the queue panel (e.g. `#queue-east`,
+  `#queue-west`). Channel visibility/permissions are your responsibility —
+  the bot does not create or hide these channels.
+- After the bot is running, post the persistent queue panel once per region:
+  `/queue-post East` (run inside `#queue-east`), `/queue-post West` (inside
+  `#queue-west`).
 
 ### Run it
 ```bash
@@ -54,82 +62,100 @@ python3 bot.py
 
 ```
 bot.py                  entry point, loads all cogs, syncs slash commands
-config.py               every tunable constant lives here (MMR weights,
-                         reputation thresholds, vote timeouts, maps, etc.)
+config.py               tunable constants (MMR weights, reputation
+                         thresholds, vote timeouts, map pool, region list, etc.)
 database/
-  schema.sql            run once in Supabase
-  db.py                 ALL database access goes through this file
+  schema.sql             run once in Supabase
+  migration_ro3_verification.sql    RO3 screenshots + approval tracking
+  migration_002_region_and_maps.sql  map_pool column + East/West constraint
+  db.py                  ALL synchronous database access goes through this file
+                         also exposes `adb` — an async-safe proxy (see below)
 services/
-  matchmaking.py        team balance, captain pick, bootstrap-vs-analysis mode
-  mmr_engine.py          MMR delta formula + rank derivation
-  vision_extraction.py  swappable Vision AI provider interface
-  validation.py         outlier + vote-mismatch checks -> auto-accept or review
-  reputation.py         penalty amounts + tiered consequences
-  stats_engine.py       career-stat recompute + achievement checks, post-match
+  matchmaking.py         team balance ONLY — no captain selection (removed)
+  mmr_engine.py           MMR delta formula + rank derivation
+  vision_extraction.py   swappable Vision AI provider interface
+  validation.py          outlier + vote-mismatch checks -> auto-accept or review
+  reputation.py          penalty amounts + tiered consequences
+  stats_engine.py        career-stat recompute + achievement checks, post-match
 cogs/
-  registration.py       /register /update-ign /whoami
-  queue.py               /queue-join /queue-leave /queue-status + full match-
-                         formation flow (balance, captain, skill vote, map
-                         vote, channel/voice creation)
-  match.py               /match-roomcode /match-submit + winner vote +
-                         finalize (MMR, MVP, result card)
-  stats.py               /profile /leaderboard /compare-last-match
-                         /rank-progress /achievements
-  admin.py               /admin-approve /admin-reject /admin-review-queue
+  registration.py        /register /update-ign /whoami — region locked to a
+                         dropdown (East/West only), validated server-side too
+  queue.py                Region-scoped queue. `/queue-post` (admin-only,
+                         posts the persistent Join/Leave panel per region),
+                         `/queue-status`. No captains, no map vote — see
+                         DECISIONS.md. Handles match formation: team split,
+                         skill vote, map announcement, private channel/VC
+                         creation, room-code parsing (`+room <code>` in the
+                         match's private text channel).
+  match.py                `/match-roomcode`, `/match-submit` (scoreboard
+                         screenshot -> vision extraction -> winner vote ->
+                         MMR finalize). Still uses sync `db`, not `adb` —
+                         unmigrated. [in progress — see DECISIONS.md for
+                         the open RO3→MMR aggregation question; the current
+                         code computes one MMR change per match, not yet
+                         per-round]
+  stats.py                /profile /leaderboard /compare-last-match
+                         /rank-progress /achievements — all region-scoped
+  admin.py                 /admin-approve /admin-reject /admin-review-queue
                          /admin-approve-match /admin-correct-stat
                          /admin-adjust-reputation
-  digest.py               daily automated summary post
+  digest.py                daily automated summary post
 utils/
-  embeds.py              all Discord embed builders (result card, profile,
-                         leaderboard, comparison)
-  permissions.py         admin-role check decorator
+  embeds.py               all Discord embed builders
+  permissions.py          admin-role check decorator
 ```
+
+### `db` vs `adb` — which to use
+`database/db.py` exposes two things: `db` (synchronous — blocks the whole
+bot while waiting on Supabase) and `adb` (async-safe wrapper — doesn't
+block). **All new or edited code must use `adb`, always, no exceptions.**
+See `DECISIONS.md` → "db vs adb" for the full reasoning. If you find a
+`db.<method>(...)` call anywhere in a cog, that's leftover/unmigrated code,
+not an intentional choice.
 
 ---
 
-## 3. Design decisions already made for you
+## 3. Confirmed design decisions
 
-These were open questions in the original spec — resolved as follows, all
-adjustable in `config.py` or by editing the relevant service:
+Full reasoning for each of these lives in [`DECISIONS.md`](./DECISIONS.md).
+Summary only, here:
 
-1. **Registration vs. `/queue-join`**: registration is one-time and
-   admin-gated; `/queue-join` only checks the player is already approved.
-2. **Scoreboard schema**: unified into one canonical extraction schema —
-   `ign, team, kills, deaths, assists, damage, hill_time, impact, score` —
-   see `EXTRACTION_PROMPT` in `services/vision_extraction.py`.
-3. **Captain selection**: highest composite performance score per team
-   (MMR + win rate + avg damage + avg hill time — see `_performance_score`
-   in `matchmaking.py`), fully deterministic.
-4. **Bootstrap → analysis cutover**: gated on **match count**, not calendar
-   days (`BOOTSTRAP_MATCH_THRESHOLD` = 10 matches per player,
-   `BOOTSTRAP_MIN_ELIGIBLE_POOL` = 20 graduated players minimum) — see
-   `matchmaking.is_bootstrap_match()`.
-5. **Suspicious-submission thresholds**: per-player stat z-score vs. their
-   own rolling history (`STAT_OUTLIER_STD_DEVS` = 2.5), OR any player-vote
-   winner disagreeing with the scoreboard winner — either one forces
-   `awaiting_review` instead of auto-accept.
+- **No captain system.** Every player on a team is identical. The only
+  privileged player is whoever clicks "Start Match" — they're the Host for
+  that match's entire lifecycle (room code + approval).
+- **No map vote.** Backend picks 3 maps from the Hardpoint pool and
+  announces them plainly. No player input on map selection.
+- **RO3 ≠ Best-of-3.** All 3 rounds are always played and always count
+  individually — there's no "stop early at 2 wins" logic. How the 3 rounds
+  combine into a single MMR/result is **still open** — see DECISIONS.md.
+- **Exactly two regions: "East" and "West".** Casing matters — it's
+  enforced by a DB constraint and locked in the `/register` dropdown.
+- **Skill-vote picks are stored but not currently shown in the match-log.**
+  Flagged as NOT FINAL in DECISIONS.md — data is kept for future analysis,
+  display was deliberately reduced from the original spec.
 
-## 4. Things you still need to decide / build out
+---
 
-- **Vision AI provider**: you said GPT-4.1/Qwen are still being evaluated.
-  `AnthropicVisionProvider` is fully implemented and working; `OpenAIVisionProvider`
-  and `QwenVisionProvider` are stubs in the same file — implement `.extract()`
-  on whichever you land on and flip `VISION_PROVIDER` in `.env`. No other
-  code needs to change.
-- **IGN-to-player matching on submission**: `match.py._finalize()` currently
-  matches extracted scoreboard rows to registered players by exact IGN
-  string. If IGNs are typo'd or the extraction gets a name wrong, that row
-  won't be matched and will need `/admin-correct-stat`. Worth hardening
-  later with fuzzy matching or UID-in-screenshot if COD Mobile ever shows it.
-- **Fastest Climbers (daily digest)**: needs a `mmr_snapshots` table to diff
-  day-over-day — not built yet since it's additive, not blocking. Left a
-  note in `cogs/digest.py` where it plugs in.
-- **Discord role automation**: explicitly deferred as "future update" in the
-  spec — not built.
-- **Reference queue UI**: you mentioned a NeatQueue screenshot for reference
-  that didn't attach. Send it over and I'll match the embed/button layout
-  in `cogs/queue.py` to it.
-- **Live Discord test**: I can't reach Discord's gateway from this sandbox
-  (network is restricted to package registries), so the login/connect path
-  is unverified — everything up to that boundary (imports, cog loading,
-  command registration, all business logic) is confirmed working.
+## 4. Still open / not yet built
+
+- **RO3 → MMR aggregation formula** — blocking `match.py`'s finalize logic.
+  See DECISIONS.md.
+- **Vision AI provider** — `AnthropicVisionProvider` is implemented and
+  working; `OpenAIVisionProvider` / `QwenVisionProvider` are stubs.
+  `LayoutOCRProvider` (primary, OCR-based) is scaffolded but `.extract()`
+  is not yet implemented.
+- **IGN-to-player matching on submission** — currently exact string match
+  against the registered roster; no fuzzy matching yet.
+- **Fastest Climbers (daily digest)** — needs a `mmr_snapshots` table, not
+  built yet.
+- **Discord role automation** — explicitly deferred, not built.
+- **Bot error/audit logging** — no `#bot-logs` channel wiring yet.
+
+---
+
+## 5. Testing notes
+
+No automated test suite yet. Current verification is manual:
+`python -m py_compile <file>` for syntax, then live local testing against a
+private test Discord server before any change is considered done. See
+`DECISIONS.md` for anything that changed behavior as a result of testing.

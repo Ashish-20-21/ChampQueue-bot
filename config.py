@@ -103,12 +103,14 @@ HARDPOINT_MAPS = [
 
 # --- Operator skills available for the pre-match vote ---
 OPERATOR_SKILLS = [
-    "Sensor Dart",
-    "War Machine",
-    "Purifier",
-    "Trip Mine",
-    "Cluster Grenade",
-    "Concussion Strike",
     "Annihilator",
+    "Claw",
+    "Death Machine",
+    "Equalizer",
+    "Gravity Spikes",
+    "Gravity Vortex",
+    "Gun Purifier",
+    "Sparrow",
     "Tempest",
+    "War Machine",
 ]

@@ -18,7 +18,12 @@ logger = logging.getLogger("champions_queue")
 
 class SkillVoteView(discord.ui.View):
     """One view per team. Enforces unique-skill-per-team by disabling
-    a skill button for everyone on that team once someone picks it."""
+    a skill button for everyone on that team once someone picks it, AND
+    locks each player to their first vote — once you've picked, you can't
+    switch to a different skill. This matters beyond UI polish: if a
+    player could silently swap picks mid-vote, teammates and the match-log
+    record could show a different skill than what the player actually
+    ends up using in-game, which risks a false /AFK or dispute report."""
 
     def __init__(self, match_id: int, team: str, team_player_ids: set[int]):
         super().__init__(timeout=config.VOTE_TIMEOUT_SECONDS)
@@ -26,6 +31,7 @@ class SkillVoteView(discord.ui.View):
         self.team = team
         self.team_player_ids = team_player_ids
         self.taken_skills: set[str] = set()
+        self.voted_player_ids: set[int] = set()
         for skill in config.OPERATOR_SKILLS:
             self.add_item(self._make_button(skill))
 
@@ -37,17 +43,47 @@ class SkillVoteView(discord.ui.View):
             if not player or player["id"] not in self.team_player_ids:
                 await interaction.response.send_message("This isn't your team's vote.", ephemeral=True)
                 return
+            if player["id"] in self.voted_player_ids:
+                await interaction.response.send_message(
+                    "You've already picked an operator skill for this match — it's locked in, "
+                    "you can't change it. Check the button showing your name for what you picked.",
+                    ephemeral=True,
+                )
+                return
             if skill in self.taken_skills:
                 await interaction.response.send_message(
                     f"**{skill}** was already picked by a teammate — operator skills must be unique per team.",
                     ephemeral=True,
                 )
                 return
+
             await adb.cast_skill_vote(self.match_id, player["id"], self.team, skill)
             self.taken_skills.add(skill)
+            self.voted_player_ids.add(player["id"])
             button.disabled = True
             button.label = f"{skill} ✓ ({player['ign']})"
-            await interaction.response.edit_message(view=self)
+
+            # The DB write above already succeeded — that's the source of
+            # truth. This visual update can fail on a stale/expired
+            # interaction token (network delay), which would otherwise
+            # leave the player thinking their vote didn't register even
+            # though it did. Fall back to a plain confirmation message so
+            # they always know their pick locked in correctly.
+            try:
+                await interaction.response.edit_message(view=self)
+            except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+                logger.warning(
+                    "SkillVoteView: edit_message failed for player_id=%s, skill=%s (vote already saved): %s",
+                    player["id"], skill, e,
+                )
+                try:
+                    await interaction.followup.send(
+                        f"Your pick (**{skill}**) is locked in — your vote was saved successfully "
+                        f"even though the button display didn't update.",
+                        ephemeral=True,
+                    )
+                except discord.errors.HTTPException:
+                    pass  # both the edit and the fallback failed — vote is still safely in the DB
 
         button.callback = callback
         return button
@@ -241,7 +277,7 @@ class Queue(commands.Cog):
             # crash: catch it here, with zero side effects, instead of
             # partway through channel creation after players are already
             # marked matched.
-            pop = current_queue[:10]
+            pop = current_queue[:10]  # take the first 10 players in queue
             players_list = [p["players"] for p in pop]
             bad_ids = [p["ign"] for p in players_list if not str(p.get("discord_id", "")).isdigit()]
             if bad_ids:
@@ -361,6 +397,12 @@ class Queue(commands.Cog):
             member = guild.get_member(int(p["discord_id"]))
             if member:
                 overwrites_vc_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+
+        vc_b = await guild.create_voice_channel(
+            name="Team Attacker",
+            category=category,
+            overwrites=overwrites_vc_b
+        )
 
         await adb.update_match(match["id"], {
             "text_channel_id": str(text_channel.id),

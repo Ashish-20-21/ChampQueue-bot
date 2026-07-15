@@ -426,7 +426,7 @@ class Queue(commands.Cog):
                 overwrites_text[member] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
         text_channel = await guild.create_text_channel(
-            name=f"qc-{match['match_id'].lower()}",
+            name=match['match_id'].lower(),
             category=category,
             overwrites=overwrites_text
         )
@@ -444,10 +444,10 @@ class Queue(commands.Cog):
                 overwrites_vc_a[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
         vc_a = await guild.create_voice_channel(
-            name=f"🛡️ {match['match_id']} Defender",
+            name=f"🛡️ {match['match_id']} ",
             category=category,
             overwrites=overwrites_vc_a
-        )
+        )        
 
         # Private VC B overwrites (Attacker Team)
         overwrites_vc_b = {
@@ -462,7 +462,7 @@ class Queue(commands.Cog):
                 overwrites_vc_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
         vc_b = await guild.create_voice_channel(
-            name=f"⚔️ {match['match_id']} Attacker",
+            name=f"⚔️ {match['match_id']}",
             category=category,
             overwrites=overwrites_vc_b
         )
@@ -542,11 +542,11 @@ class Queue(commands.Cog):
         slash alias — same host-privilege check, same DB write, same
         match-log post either way. `respond` is a callable(str) that sends
         feedback back through whichever entry point was used."""
-        if not channel.name.startswith("qc-"):
+        if not channel.name.startswith("cq-"):
             await respond("Room codes can only be shared in a match channel.")
             return
 
-        match_code = channel.name[len("qc-"):].upper()
+        match_code = channel.name[len("cq-"):].upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
             await respond("Couldn't find a match tied to this channel.")
@@ -662,7 +662,7 @@ class Queue(commands.Cog):
         if message.author.bot:
             return
 
-        if not message.channel.name.startswith("qc-"):
+        if not message.channel.name.startswith("cq-"):
             return
 
         content = message.content.strip()
@@ -686,7 +686,7 @@ class Queue(commands.Cog):
     @app_commands.command(name="afk", description="Report a player (including the host) who isn't following through on this match")
     @app_commands.describe(target="The player who's gone AFK/unresponsive", reason="Optional — what happened")
     async def afk(self, interaction: discord.Interaction, target: discord.Member, reason: str = "No reason given"):
-        if not isinstance(interaction.channel, discord.TextChannel) or not interaction.channel.name.startswith("qc-"):
+        if not isinstance(interaction.channel, discord.TextChannel) or not interaction.channel.name.startswith("cq-"):
             await interaction.response.send_message("This only works inside a match channel.", ephemeral=True)
             return
 
@@ -696,7 +696,7 @@ class Queue(commands.Cog):
             await interaction.response.send_message("Both players need to be registered.", ephemeral=True)
             return
 
-        match_code = interaction.channel.name[len("qc-"):].upper()
+        match_code = interaction.channel.name[len("cq-"):].upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
             await interaction.response.send_message("Couldn't find a match tied to this channel.", ephemeral=True)

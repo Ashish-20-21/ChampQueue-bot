@@ -13,26 +13,29 @@ threshold progress.
 """
 
 from __future__ import annotations
+import asyncio
 import random
 from typing import Any
 
 import config
-from database.db import db
+from database.db import db, adb
 
 
-def is_bootstrap_match(player_ids: list[int]) -> bool:
+async def is_bootstrap_match(player_ids: list[int]) -> bool:
     """A match runs in random/bootstrap mode unless every player already
     has enough completed matches AND the overall graduated pool is large
     enough for analysis to be meaningful."""
     graduated = [
         pid for pid in player_ids
-        if db.player_completed_match_count(pid) >= config.BOOTSTRAP_MATCH_THRESHOLD
+        if await adb.player_completed_match_count(pid) >= config.BOOTSTRAP_MATCH_THRESHOLD
     ]
     if len(graduated) < len(player_ids):
         return True  # someone in this pop hasn't graduated yet
     # Everyone in this pop has graduated — but also require a healthy
     # overall pool so early "analysis" isn't based on 10 people total.
-    pool_res = db.client.table("players").select("id", count="exact").eq("status", "approved").execute()
+    pool_res = await asyncio.to_thread(
+        lambda: db.client.table("players").select("id", count="exact").eq("status", "approved").execute()
+    )
     return (pool_res.count or 0) < config.BOOTSTRAP_MIN_ELIGIBLE_POOL
 
 
@@ -78,8 +81,8 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
     }
 
 
-def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], bootstrap: bool,
-                         n: int = 3) -> list[str]:
+async def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], bootstrap: bool,
+                               n: int = 3) -> list[str]:
     """
     Pick n candidate maps for the vote. In bootstrap mode: pure random.
     In analysis mode: avoid maps where the historical win rate for either
@@ -96,12 +99,14 @@ def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], bootstrap:
     # for these specific players, lowest historical MMR-swing-per-map first.
     scored: list[tuple[str, float]] = []
     for map_name in config.HARDPOINT_MAPS:
-        res = (
-            db.client.table("matches")
-            .select("id, winner_team, match_players(player_id, team)")
-            .eq("map", map_name)
-            .eq("status", "completed")
-            .execute()
+        res = await asyncio.to_thread(
+            lambda map_name=map_name: (
+                db.client.table("matches")
+                .select("id, winner_team, match_players(player_id, team)")
+                .eq("map", map_name)
+                .eq("status", "completed")
+                .execute()
+            )
         )
         relevant = [
             m for m in res.data

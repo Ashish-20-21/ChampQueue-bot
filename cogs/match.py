@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from database.db import db
+from database.db import adb
 from services import vision_extraction, validation, mmr_engine, stats_engine, reputation
 from utils.embeds import result_card
 
@@ -20,7 +20,7 @@ class WinnerVoteView(discord.ui.View):
         self.votes: dict[int, str] = {}  # player_id -> "A"/"B"
 
     async def _vote(self, interaction: discord.Interaction, team: str):
-        player = db.get_player_by_discord_id(interaction.user.id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
         if not player or player["id"] not in self.all_player_ids:
             await interaction.response.send_message("This isn't your match's vote.", ephemeral=True)
             return
@@ -41,23 +41,23 @@ class Match(commands.Cog):
         self.bot = bot
 
     @staticmethod
-    def _is_match_participant(match_id: int, player_id: int) -> bool:
-        match_players = db.get_match_players(match_id)
+    async def _is_match_participant(match_id: int, player_id: int) -> bool:
+        match_players = await adb.get_match_players(match_id)
         return any(mp["player_id"] == player_id for mp in match_players)
 
     @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
     async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
-        match = db.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id)
         if not match or match["status"] != "awaiting_room":
             await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
             return
-        player = db.get_player_by_discord_id(interaction.user.id)
-        if not player or not self._is_match_participant(match["id"], player["id"]):
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        if not player or not await self._is_match_participant(match["id"], player["id"]):
             await interaction.response.send_message(
                 "Only players in this match can share its room code.", ephemeral=True
             )
             return
-        db.update_match(match["id"], {
+        await adb.update_match(match["id"], {
             "room_code": code,
             "room_code_shared_by": player["id"] if player else None,
             "status": "in_progress",
@@ -67,13 +67,13 @@ class Match(commands.Cog):
     @app_commands.command(name="match-submit", description="Upload the final scoreboard screenshot for a match")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot="Final scoreboard screenshot")
     async def match_submit(self, interaction: discord.Interaction, match_id: str, screenshot: discord.Attachment):
-        match = db.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id)
         if not match or match["status"] not in ("in_progress", "awaiting_result"):
             await interaction.response.send_message("Match not found or not awaiting a result.", ephemeral=True)
             return
 
-        player = db.get_player_by_discord_id(interaction.user.id)
-        if not player or not self._is_match_participant(match["id"], player["id"]):
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        if not player or not await self._is_match_participant(match["id"], player["id"]):
             await interaction.response.send_message(
                 "Only players in this match can submit its result.", ephemeral=True
             )
@@ -100,10 +100,10 @@ class Match(commands.Cog):
                 f"Couldn't extract data from that screenshot ({e}). An admin can enter stats manually with "
                 f"`/admin-correct-stat`, or try re-uploading a clearer screenshot."
             )
-            db.update_match(match["id"], {"status": "awaiting_review", "scoreboard_image_url": screenshot.url})
+            await adb.update_match(match["id"], {"status": "awaiting_review", "scoreboard_image_url": screenshot.url})
             return
 
-        db.update_match(match["id"], {
+        await adb.update_match(match["id"], {
             "status": "awaiting_result",
             "scoreboard_image_url": screenshot.url,
             "raw_extraction": extraction,
@@ -111,7 +111,7 @@ class Match(commands.Cog):
             "final_score": extraction.get("final_score"),
         })
 
-        match_players = db.get_match_players(match["id"])
+        match_players = await adb.get_match_players(match["id"])
         all_ids = {mp["player_id"] for mp in match_players}
         view = WinnerVoteView(match["id"], all_ids)
         await interaction.followup.send(
@@ -123,8 +123,8 @@ class Match(commands.Cog):
         await self._finalize(interaction.channel, match["id"], extraction, view.votes)
 
     async def _finalize(self, channel: discord.abc.Messageable, match_id: int, extraction: dict, votes: dict[int, str]):
-        match = db.get_match(match_id)
-        match_players = db.get_match_players(match_id)
+        match = await adb.get_match(match_id)
+        match_players = await adb.get_match_players(match_id)
 
         # Map extracted rows onto match_players by IGN match (best-effort;
         # falls back to leaving nulls for admin correction if no IGN match found).
@@ -133,7 +133,7 @@ class Match(commands.Cog):
             ign = mp["players"]["ign"].strip().lower()
             row = extracted_by_ign.get(ign)
             if row:
-                db.update_match_player(match_id, mp["player_id"], {
+                await adb.update_match_player(match_id, mp["player_id"], {
                     "kills": row.get("kills"),
                     "deaths": row.get("deaths"),
                     "assists": row.get("assists"),
@@ -143,7 +143,7 @@ class Match(commands.Cog):
                     "score": row.get("score"),
                 })
 
-        match_players = db.get_match_players(match_id)  # refresh with new stats
+        match_players = await adb.get_match_players(match_id)  # refresh with new stats
 
         # Determine scoreboard-implied winner from raw extraction if present, else from vote majority.
         vote_tally = {"A": 0, "B": 0}
@@ -153,14 +153,15 @@ class Match(commands.Cog):
         scoreboard_winner = extraction.get("winner_team") or vote_winner
 
         vote_records = [{"player_id": pid, "winner": team} for pid, team in votes.items()]
-        result = validation.validate_submission(match_id, extraction, vote_records)
+        result = await validation.validate_submission(match_id, extraction, vote_records)
 
         if not result["auto_accept"]:
-            db.update_match(match_id, {"status": "awaiting_review"})
-            flag_summary = "\n".join(
-                f"<@{db.get_player_by_id(pid)['discord_id']}>: {', '.join(flags)}"
-                for pid, flags in result["flags"].items()
-            ) or "—"
+            await adb.update_match(match_id, {"status": "awaiting_review"})
+            flag_lines = []
+            for pid, flags in result["flags"].items():
+                flagged_player = await adb.get_player_by_id(pid)
+                flag_lines.append(f"<@{flagged_player['discord_id']}>: {', '.join(flags)}")
+            flag_summary = "\n".join(flag_lines) or "—"
             await channel.send(
                 f"⚠️ Match **{match['match_id']}** flagged for admin review.\n"
                 f"Vote mismatch: {result['vote_mismatch']}\nStat flags:\n{flag_summary}"
@@ -180,25 +181,25 @@ class Match(commands.Cog):
             team_avg = avg_a if mp["team"] == "A" else avg_b
             won = mp["team"] == winner
             is_mvp = mp["player_id"] == mvp_candidate["player_id"] and mp["team"] == winner
-            player = db.get_player_by_id(mp["player_id"])
+            player = await adb.get_player_by_id(mp["player_id"])
             change = mmr_engine.calculate_mmr_change(mp, team_avg, won, is_mvp)
             new_mmr = max(0, player["mmr"] + change)
-            db.update_match_player(match_id, mp["player_id"], {
+            await adb.update_match_player(match_id, mp["player_id"], {
                 "mmr_before": player["mmr"],
                 "mmr_after": new_mmr,
                 "mmr_change": change,
                 "is_mvp": is_mvp,
             })
-            db.update_player_fields(player["id"], {"mmr": new_mmr})
+            await adb.update_player_fields(player["id"], {"mmr": new_mmr})
 
-        db.update_match(match_id, {"status": "completed", "completed_at": "now()", "winner_team": winner,
-                                    "mvp_player_id": mvp_candidate["player_id"]})
+        await adb.update_match(match_id, {"status": "completed", "completed_at": "now()", "winner_team": winner,
+                                           "mvp_player_id": mvp_candidate["player_id"]})
 
-        match_players = db.get_match_players(match_id)
+        match_players = await adb.get_match_players(match_id)
         for mp in match_players:
             stats_engine.process_post_match(mp["player_id"])
 
-        match = db.get_match(match_id)
+        match = await adb.get_match(match_id)
         embed = result_card(match, match_players)
         await channel.send(embed=embed)
 

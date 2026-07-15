@@ -10,7 +10,7 @@ consequences, tiered by config thresholds:
 from __future__ import annotations
 
 import config
-from database.db import db
+from database.db import adb
 
 PENALTIES = {
     "afk": -8,
@@ -21,10 +21,10 @@ PENALTIES = {
 }
 
 
-def apply_penalty(player_id: int, reason: str, match_id: int | None = None) -> dict:
+async def apply_penalty(player_id: int, reason: str, match_id: int | None = None) -> dict:
     if reason not in PENALTIES:
         raise ValueError(f"Unknown reputation penalty reason: {reason}")
-    return db.apply_reputation_delta(player_id, PENALTIES[reason], reason, match_id)
+    return await adb.apply_reputation_delta(player_id, PENALTIES[reason], reason, match_id)
 
 
 def get_status(reputation: int) -> str:

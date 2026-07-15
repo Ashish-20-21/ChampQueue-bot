@@ -10,3 +10,4 @@ venv/
 __pycache__/
 *.pyc
 DECISIONS.md
+__pycache__/

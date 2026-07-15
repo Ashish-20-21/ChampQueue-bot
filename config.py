@@ -35,6 +35,21 @@ DISCORD_BOT_TOKEN = _require("DISCORD_BOT_TOKEN")
 GUILD_ID = int(_require("GUILD_ID"))
 ADMIN_ROLE_ID = int(_require("ADMIN_ROLE_ID"))
 
+# --- P4: AFK reporting + match-log channel ---
+# Both channels are created manually in Discord (bot doesn't create them) —
+# grab each channel's ID and set it here or in .env. Optional at import time
+# (default None) so the bot doesn't crash on boot if these haven't been
+# created yet; the features that need them just no-op with a log warning
+# until they're set.
+AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
+MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
+
+# How often the abandoned/completed-match channel cleanup sweep runs.
+# Independent of the 1hr cleanup delay itself — this just controls how
+# often the bot checks "is anything due yet".
+CLEANUP_SWEEP_INTERVAL_MINUTES = 5
+MATCH_CHANNEL_CLEANUP_DELAY_SECONDS = 3600   # 1hr grace window before deletion
+
 # --- Supabase / Postgres ---
 SUPABASE_URL = _require("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _require("SUPABASE_SERVICE_KEY")
@@ -77,7 +92,9 @@ REPUTATION_BAN_THRESHOLD = 25             # temporary queue ban, admin must revi
 
 # --- Abuse / cost-control guards ---
 MAX_SCOREBOARD_UPLOAD_BYTES = 8 * 1024 * 1024   # 8MB cap before sending to Vision AI (cost + DoS guard)
-REGISTER_COOLDOWN_SECONDS = 300                  # per-user cooldown on /register (spam guard)
+# NOTE: registration cooldown was removed entirely (DECISIONS.md — final,
+# 2026-07-13). REGISTER_COOLDOWN_SECONDS deliberately deleted here since it
+# was dead/unused in registration.py; don't re-add without re-opening that decision.
 QUEUE_JOIN_COOLDOWN_SECONDS = 10                 # per-user cooldown on /queue-join (spam guard)
 
 # --- Suspicious-submission thresholds (route to admin review instead of auto-accept) ---

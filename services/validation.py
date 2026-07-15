@@ -17,13 +17,13 @@ import statistics
 from typing import Any
 
 import config
-from database.db import db
+from database.db import adb
 
 
-def check_stat_outliers(player_id: int, new_stats: dict) -> list[str]:
+async def check_stat_outliers(player_id: int, new_stats: dict) -> list[str]:
     """Returns a list of human-readable flags for any field that's an outlier
     versus this player's own history. Empty list = nothing suspicious."""
-    history = db.player_recent_matches(player_id, limit=15)
+    history = await adb.player_recent_matches(player_id, limit=15)
     if len(history) < 5:
         return []  # not enough history to judge yet — don't false-flag new players
 
@@ -53,17 +53,17 @@ def check_vote_mismatch(match_id: int, scoreboard_winner: str, player_votes: lis
     return len(disagreeing) > 0
 
 
-def validate_submission(match_id: int, extraction: dict, player_votes: list[dict]) -> dict[str, Any]:
+async def validate_submission(match_id: int, extraction: dict, player_votes: list[dict]) -> dict[str, Any]:
     """
     Returns:
         {"auto_accept": bool, "flags": {player_id: [flag strings]}, "vote_mismatch": bool}
     """
     all_flags: dict[int, list[str]] = {}
     for p in extraction.get("players", []):
-        player = db.get_player_by_uid(p.get("cod_uid", "")) or db.get_player_by_discord_id(p.get("discord_id", ""))
+        player = await adb.get_player_by_uid(p.get("cod_uid", "")) or await adb.get_player_by_discord_id(p.get("discord_id", ""))
         if not player:
             continue
-        flags = check_stat_outliers(player["id"], p)
+        flags = await check_stat_outliers(player["id"], p)
         if flags:
             all_flags[player["id"]] = flags
 

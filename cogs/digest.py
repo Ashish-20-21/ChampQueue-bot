@@ -5,7 +5,7 @@ import datetime
 import discord
 from discord.ext import commands, tasks
 
-from database.db import db
+from database.db import adb
 
 DIGEST_HOUR_UTC = 12  # edit to taste
 
@@ -27,9 +27,9 @@ class Digest(commands.Cog):
         if not channel:
             return
 
-        top_mmr = db.leaderboard(order_by="mmr", limit=5)
-        top_mvp = db.leaderboard(order_by="mvp_count", limit=5)
-        top_damage = db.leaderboard(order_by="avg_damage", limit=5)
+        top_mmr = await adb.leaderboard(order_by="mmr", limit=5)
+        top_mvp = await adb.leaderboard(order_by="mvp_count", limit=5)
+        top_damage = await adb.leaderboard(order_by="avg_damage", limit=5)
 
         embed = discord.Embed(
             title="📊 Champion's Queue — Daily Digest",

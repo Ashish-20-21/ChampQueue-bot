@@ -253,6 +253,83 @@ class Database:
         return self.update_player_fields(player_id, {"reputation": new_rep})
 
     # ------------------------------------------------------------------
+    # MMR — ADMIN ADJUSTMENTS (disciplinary, not match-driven)
+    # ------------------------------------------------------------------
+    def apply_mmr_adjustment(self, player_id: int, delta: int, reason: str,
+                              adjusted_by: str) -> dict:
+        """Admin-issued MMR change (e.g. after repeated AFK warnings), logged
+        separately from match-driven mmr_before/after changes in
+        match_players so it's never an unexplained jump in /profile or
+        /rank-progress later. See mmr_adjustment_log in
+        migration_004_p4_afk_and_cleanup.sql."""
+        self.client.table("mmr_adjustment_log").insert(
+            {"player_id": player_id, "delta": delta, "reason": reason, "adjusted_by": str(adjusted_by)}
+        ).execute()
+        player = self.get_player_by_id(player_id)
+        new_mmr = max(0, player["mmr"] + delta)
+        return self.update_player_fields(player_id, {"mmr": new_mmr})
+
+    def get_mmr_adjustment_log(self, player_id: int, limit: int = 10) -> list[dict]:
+        res = (
+            self.client.table("mmr_adjustment_log")
+            .select("*")
+            .eq("player_id", player_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data
+
+    # ------------------------------------------------------------------
+    # MATCH ABANDONMENT / CLEANUP SWEEP
+    # ------------------------------------------------------------------
+    def mark_match_abandoned(self, match_id: int, cleanup_at: str) -> dict:
+        """Called by /admin-scrap-match after a host/player AFK report is
+        confirmed by a human. Sets status + a due-timestamp for the text
+        channel; VC deletion happens immediately in the caller, not here —
+        this only schedules the *text* channel, which gets a grace window."""
+        res = (
+            self.client.table("matches")
+            .update({"status": "abandoned", "cleanup_at": cleanup_at})
+            .eq("id", match_id)
+            .execute()
+        )
+        return res.data[0]
+
+    def schedule_match_cleanup(self, match_id: int, cleanup_at: str) -> dict:
+        """Used for completed matches too (same 1hr grace window rule) —
+        distinct from mark_match_abandoned since status doesn't change here."""
+        res = (
+            self.client.table("matches")
+            .update({"cleanup_at": cleanup_at})
+            .eq("id", match_id)
+            .execute()
+        )
+        return res.data[0]
+
+    def get_due_cleanups(self, now_iso: str) -> list[dict]:
+        """Polled every CLEANUP_SWEEP_INTERVAL_MINUTES by the background
+        task in cogs/queue.py. DB-backed (not an in-memory asyncio.sleep)
+        specifically so a bot restart mid-window doesn't silently lose the
+        scheduled deletion — see DECISIONS.md for the reasoning."""
+        res = (
+            self.client.table("matches")
+            .select("*")
+            .not_.is_("cleanup_at", "null")
+            .not_.is_("text_channel_id", "null")
+            .lte("cleanup_at", now_iso)
+            .execute()
+        )
+        return res.data
+
+    def clear_cleanup(self, match_id: int) -> None:
+        """Called after the sweep successfully deletes a channel, so it's
+        never picked up again on the next poll."""
+        self.client.table("matches").update(
+            {"cleanup_at": None, "text_channel_id": None}
+        ).eq("id", match_id).execute()
+
+    # ------------------------------------------------------------------
     # ACHIEVEMENTS
     # ------------------------------------------------------------------
     def grant_achievement(self, player_id: int, achievement_code: str,

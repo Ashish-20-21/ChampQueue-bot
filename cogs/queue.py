@@ -500,7 +500,7 @@ class Queue(commands.Cog):
 
         await adb.update_match(match["id"], {
             "room_code": code,
-            "status": "in_progress"
+            "status": "awaiting_result"
         })
         await message.channel.send(f"Room code updated to **{code}**. Match is now live!")
 

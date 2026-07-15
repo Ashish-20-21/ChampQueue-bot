@@ -1,206 +1,209 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections import Counter
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 import config
-from database.db import db
-from services import vision_extraction, validation, mmr_engine, stats_engine, reputation
-from utils.embeds import result_card
+from database.db import adb
+from services import localization, mmr_engine, validation, vision_extraction
+from utils.embeds import ro3_result_card, ro3_verification_card
 
 
-class WinnerVoteView(discord.ui.View):
-    def __init__(self, match_id: int, all_player_ids: set[int]):
-        super().__init__(timeout=config.VOTE_TIMEOUT_SECONDS)
+_INTEGER_FIELDS = ("position", "kills", "deaths", "assists", "damage", "score")
+_INTEGER_RE = re.compile(r"^\d+$")
+_HILL_TIME_RE = re.compile(r"^\d+\.\d+$")
+_SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
+
+
+class HostApprovalView(discord.ui.View):
+    def __init__(self, cog: "Match", match_id: int):
+        super().__init__(timeout=3600)
+        self.cog = cog
         self.match_id = match_id
-        self.all_player_ids = all_player_ids
-        self.votes: dict[int, str] = {}  # player_id -> "A"/"B"
 
-    async def _vote(self, interaction: discord.Interaction, team: str):
-        player = db.get_player_by_discord_id(interaction.user.id)
-        if not player or player["id"] not in self.all_player_ids:
-            await interaction.response.send_message("This isn't your match's vote.", ephemeral=True)
-            return
-        self.votes[player["id"]] = team
-        await interaction.response.send_message(f"Vote recorded: Team {team}.", ephemeral=True)
-
-    @discord.ui.button(label="Team A Won", style=discord.ButtonStyle.success)
-    async def team_a(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._vote(interaction, "A")
-
-    @discord.ui.button(label="Team B Won", style=discord.ButtonStyle.danger)
-    async def team_b(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._vote(interaction, "B")
+    @discord.ui.button(label="Approve Result", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self.cog.approve_result(interaction, self.match_id)
 
 
 class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-
-    @staticmethod
-    def _is_match_participant(match_id: int, player_id: int) -> bool:
-        match_players = db.get_match_players(match_id)
-        return any(mp["player_id"] == player_id for mp in match_players)
+        localization.load_map_translations()
 
     @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
     async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
-        match = db.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
         if not match or match["status"] != "awaiting_room":
             await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
             return
-        player = db.get_player_by_discord_id(interaction.user.id)
-        if not player or not self._is_match_participant(match["id"], player["id"]):
-            await interaction.response.send_message(
-                "Only players in this match can share its room code.", ephemeral=True
-            )
+        if not player or match.get("room_code_shared_by") != player["id"]:
+            await interaction.response.send_message("Only the Match Host can share the room code.", ephemeral=True)
             return
-        db.update_match(match["id"], {
-            "room_code": code,
-            "room_code_shared_by": player["id"] if player else None,
-            "status": "in_progress",
-        })
-        await interaction.response.send_message(f"Room code for **{match_id}** set. Match is live — GLHF!")
+        await adb.update_match(match["id"], {"room_code": code, "status": "awaiting_result"})
+        await interaction.response.send_message(f"Room code for **{match_id}** set. Play all three rounds, then upload the scoreboards.")
 
-    @app_commands.command(name="match-submit", description="Upload the final scoreboard screenshot for a match")
-    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot="Final scoreboard screenshot")
-    async def match_submit(self, interaction: discord.Interaction, match_id: str, screenshot: discord.Attachment):
-        match = db.get_match_by_code(match_id)
-        if not match or match["status"] not in ("in_progress", "awaiting_result"):
-            await interaction.response.send_message("Match not found or not awaiting a result.", ephemeral=True)
+    @app_commands.command(name="match-submit", description="Host upload of all three RO3 scoreboard screenshots")
+    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")
+    async def match_submit(self, interaction: discord.Interaction, match_id: str,
+                           screenshot_1: discord.Attachment, screenshot_2: discord.Attachment,
+                           screenshot_3: discord.Attachment):
+        match = await adb.get_match_by_code(match_id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        if not match or match.get("status") != "awaiting_result":
+            await interaction.response.send_message("Match not found or not awaiting its three scoreboards.", ephemeral=True)
             return
-
-        player = db.get_player_by_discord_id(interaction.user.id)
-        if not player or not self._is_match_participant(match["id"], player["id"]):
-            await interaction.response.send_message(
-                "Only players in this match can submit its result.", ephemeral=True
-            )
+        if not player or match.get("room_code_shared_by") != player["id"]:
+            await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
             return
 
-        if not (screenshot.content_type or "").startswith("image/"):
-            await interaction.response.send_message("Please upload an image file.", ephemeral=True)
-            return
-        if screenshot.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
-            await interaction.response.send_message(
-                f"Image is too large (max {config.MAX_SCOREBOARD_UPLOAD_BYTES // (1024*1024)}MB).", ephemeral=True
-            )
+        attachments = (screenshot_1, screenshot_2, screenshot_3)
+        for attachment in attachments:
+            if not (attachment.content_type or "").startswith("image/"):
+                await interaction.response.send_message("All three uploads must be image files.", ephemeral=True)
+                return
+            if attachment.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
+                await interaction.response.send_message("Each image must be within the configured upload limit.", ephemeral=True)
+                return
+
+        maps = match.get("map_pool") or []
+        if len(maps) != 3:
+            await interaction.response.send_message("This match has no valid three-map announcement; it requires admin review.", ephemeral=True)
+            await adb.update_match(match["id"], {"status": "awaiting_review"})
             return
 
         await interaction.response.defer(thinking=True)
-
-        image_bytes = await screenshot.read()
-        media_type = screenshot.content_type or "image/png"
-
+        payloads = await asyncio.gather(*(attachment.read() for attachment in attachments))
         try:
-            extraction = vision_extraction.extract_scoreboard(image_bytes, media_type)
-        except Exception as e:
-            await interaction.followup.send(
-                f"Couldn't extract data from that screenshot ({e}). An admin can enter stats manually with "
-                f"`/admin-correct-stat`, or try re-uploading a clearer screenshot."
-            )
-            db.update_match(match["id"], {"status": "awaiting_review", "scoreboard_image_url": screenshot.url})
+            extractions = await asyncio.gather(*(
+                asyncio.to_thread(vision_extraction.extract_scoreboard, image_bytes, attachment.content_type or "image/png")
+                for image_bytes, attachment in zip(payloads, attachments)
+            ))
+        except Exception as exc:
+            await adb.update_match(match["id"], {"status": "awaiting_review"})
+            await interaction.followup.send(f"OCR failed ({exc}). This match has been routed to admin review.")
             return
 
-        db.update_match(match["id"], {
-            "status": "awaiting_result",
-            "scoreboard_image_url": screenshot.url,
-            "raw_extraction": extraction,
-            "map": extraction.get("map") or match.get("map"),
-            "final_score": extraction.get("final_score"),
-        })
+        match_players = await adb.get_match_players(match["id"])
+        round_data, review_reasons = self._prepare_rounds(match_players, maps, extractions)
 
-        match_players = db.get_match_players(match["id"])
-        all_ids = {mp["player_id"] for mp in match_players}
-        view = WinnerVoteView(match["id"], all_ids)
-        await interaction.followup.send(
-            f"Scoreboard extracted for **{match_id}**. All 10 players: vote on the winner below "
-            f"(cross-checked against the scoreboard).",
-            view=view,
-        )
-        await asyncio.sleep(config.VOTE_TIMEOUT_SECONDS)
-        await self._finalize(interaction.channel, match["id"], extraction, view.votes)
+        # Preserve the raw OCR audit record for every submitted screenshot,
+        # even when one of them cannot safely be accepted.
+        await asyncio.gather(*(
+            adb.upsert_match_screenshot(match["id"], number, attachment.url, player["id"], extraction,
+                                         extraction.get("ocr_confidence"))
+            for number, (attachment, extraction) in enumerate(zip(attachments, extractions), start=1)
+        ))
 
-    async def _finalize(self, channel: discord.abc.Messageable, match_id: int, extraction: dict, votes: dict[int, str]):
-        match = db.get_match(match_id)
-        match_players = db.get_match_players(match_id)
-
-        # Map extracted rows onto match_players by IGN match (best-effort;
-        # falls back to leaving nulls for admin correction if no IGN match found).
-        extracted_by_ign = {p["ign"].strip().lower(): p for p in extraction.get("players", [])}
-        for mp in match_players:
-            ign = mp["players"]["ign"].strip().lower()
-            row = extracted_by_ign.get(ign)
-            if row:
-                db.update_match_player(match_id, mp["player_id"], {
-                    "kills": row.get("kills"),
-                    "deaths": row.get("deaths"),
-                    "assists": row.get("assists"),
-                    "damage": row.get("damage"),
-                    "hill_time": row.get("hill_time"),
-                    "impact": row.get("impact"),
-                    "score": row.get("score"),
-                })
-
-        match_players = db.get_match_players(match_id)  # refresh with new stats
-
-        # Determine scoreboard-implied winner from raw extraction if present, else from vote majority.
-        vote_tally = {"A": 0, "B": 0}
-        for v in votes.values():
-            vote_tally[v] += 1
-        vote_winner = max(vote_tally, key=vote_tally.get) if any(vote_tally.values()) else None
-        scoreboard_winner = extraction.get("winner_team") or vote_winner
-
-        vote_records = [{"player_id": pid, "winner": team} for pid, team in votes.items()]
-        result = validation.validate_submission(match_id, extraction, vote_records)
-
-        if not result["auto_accept"]:
-            db.update_match(match_id, {"status": "awaiting_review"})
-            flag_summary = "\n".join(
-                f"<@{db.get_player_by_id(pid)['discord_id']}>: {', '.join(flags)}"
-                for pid, flags in result["flags"].items()
-            ) or "—"
-            await channel.send(
-                f"⚠️ Match **{match['match_id']}** flagged for admin review.\n"
-                f"Vote mismatch: {result['vote_mismatch']}\nStat flags:\n{flag_summary}"
-            )
+        if review_reasons:
+            await adb.update_match(match["id"], {"status": "awaiting_review"})
+            await interaction.followup.send("Submission routed to admin review: " + "; ".join(review_reasons))
             return
 
-        # --- Auto-accept path: compute MMR, MVP, finalize ---
-        team_a_stats = [mp for mp in match_players if mp["team"] == "A"]
-        team_b_stats = [mp for mp in match_players if mp["team"] == "B"]
-        avg_a = mmr_engine.team_average(team_a_stats)
-        avg_b = mmr_engine.team_average(team_b_stats)
+        # Each valid round is individually queryable immediately. These are
+        # provisional records only: the approval RPC is the sole place that
+        # can ever mutate players.mmr.
+        await asyncio.gather(*(
+            adb.replace_match_round_results(match["id"], item["round_number"], item["results"])
+            for item in round_data
+        ))
 
-        winner = scoreboard_winner or "A"
-        mvp_candidate = max(match_players, key=lambda mp: (mp.get("impact") or 0))
+        validations = await asyncio.gather(*(
+            validation.validate_submission(match["id"], extraction)
+            for extraction in extractions
+        ))
+        flags = {pid: issues for result in validations for pid, issues in result["flags"].items()}
+        if flags:
+            await adb.update_match(match["id"], {"status": "awaiting_review"})
+            players = {item["id"]: item for item in await adb.get_players_by_ids(list(flags))}
+            summary = "; ".join(f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items())
+            await interaction.followup.send(f"Submission routed to admin review for stat validation: {summary}")
+            return
 
-        for mp in match_players:
-            team_avg = avg_a if mp["team"] == "A" else avg_b
-            won = mp["team"] == winner
-            is_mvp = mp["player_id"] == mvp_candidate["player_id"] and mp["team"] == winner
-            player = db.get_player_by_id(mp["player_id"])
-            change = mmr_engine.calculate_mmr_change(mp, team_avg, won, is_mvp)
-            new_mmr = max(0, player["mmr"] + change)
-            db.update_match_player(match_id, mp["player_id"], {
-                "mmr_before": player["mmr"],
-                "mmr_after": new_mmr,
-                "mmr_change": change,
-                "is_mvp": is_mvp,
-            })
-            db.update_player_fields(player["id"], {"mmr": new_mmr})
+        await adb.update_match(match["id"], {"status": "pending_verification"})
+        await interaction.followup.send(embed=ro3_verification_card(match, round_data), view=HostApprovalView(self, match["id"]))
 
-        db.update_match(match_id, {"status": "completed", "completed_at": "now()", "winner_team": winner,
-                                    "mvp_player_id": mvp_candidate["player_id"]})
+    @staticmethod
+    def _prepare_rounds(match_players: list[dict], maps: list[str], extractions: list[dict]) -> tuple[list[dict], list[str]]:
+        roster = {mp["players"]["ign"].strip().lower(): mp for mp in match_players}
+        rounds: list[dict] = []
+        reasons: list[str] = []
+        for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
+            resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
+            if resolved_map != announced_map.upper():
+                reasons.append(f"round {round_number}: map is unrecognized or does not match announced {announced_map}")
+            score = str(extraction.get("final_score") or "")
+            score_match = _SCORE_RE.fullmatch(score)
+            if not score_match or score_match.group(1) == score_match.group(2):
+                reasons.append(f"round {round_number}: final score is unreadable")
+                continue
+            winner = "A" if int(score_match.group(1)) > int(score_match.group(2)) else "B"
+            results: list[dict] = []
+            seen_players: set[int] = set()
+            per_team = Counter()
+            for row in extraction.get("players", []):
+                ign = str(row.get("ign") or "").strip().lower()
+                mp = roster.get(ign)
+                if not mp:
+                    reasons.append(f"round {round_number}: unknown OCR IGN {row.get('ign')!r}")
+                    continue
+                if mp["player_id"] in seen_players:
+                    reasons.append(f"round {round_number}: duplicate OCR player {row.get('ign')}")
+                    continue
+                if row.get("team") != mp["team"]:
+                    reasons.append(f"round {round_number}: team mismatch for {row.get('ign')}")
+                    continue
+                invalid = [field for field in _INTEGER_FIELDS if not _INTEGER_RE.fullmatch(str(row.get(field, "")))]
+                if not _HILL_TIME_RE.fullmatch(str(row.get("hill_time", ""))):
+                    invalid.append("hill_time")
+                if invalid:
+                    reasons.append(f"round {round_number}: invalid OCR digit format for {row.get('ign')} ({', '.join(invalid)})")
+                    continue
+                position = int(row["position"])
+                if not 1 <= position <= 5:
+                    reasons.append(f"round {round_number}: invalid position for {row.get('ign')}")
+                    continue
+                if not isinstance(row.get("is_mvp"), bool):
+                    reasons.append(f"round {round_number}: MVP flag is missing or invalid for {row.get('ign')}")
+                    continue
+                is_mvp = row["is_mvp"]
+                results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
+                                "mmr_delta": mmr_engine.calculate_mmr_change(position, mp["team"] == winner, is_mvp),
+                                "team": mp["team"], "discord_id": mp["players"]["discord_id"]})
+                seen_players.add(mp["player_id"])
+                per_team[mp["team"]] += 1
+            if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
+                reasons.append(f"round {round_number}: scoreboard does not contain one valid row for every match player")
+            for team in ("A", "B"):
+                if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
+                    reasons.append(f"round {round_number}: Team {team} must have exactly one game-provided MVP")
+            rounds.append({"round_number": round_number, "map_name": announced_map, "final_score": score, "results": results})
+        return rounds, reasons
 
-        match_players = db.get_match_players(match_id)
-        for mp in match_players:
-            stats_engine.process_post_match(mp["player_id"])
-
-        match = db.get_match(match_id)
-        embed = result_card(match, match_players)
-        await channel.send(embed=embed)
+    async def approve_result(self, interaction: discord.Interaction, match_id: int):
+        match = await adb.get_match(match_id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        if not match or match.get("status") != "pending_verification":
+            await interaction.response.send_message("This result is no longer awaiting host approval.", ephemeral=True)
+            return
+        if not player or match.get("room_code_shared_by") != player["id"]:
+            await interaction.response.send_message("Only the Match Host can approve this result.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            await adb.approve_ro3_match(match_id, player["id"])
+        except Exception as exc:
+            await interaction.followup.send(f"Approval could not be committed safely: {exc}", ephemeral=True)
+            return
+        match = await adb.get_match(match_id)
+        match_players, round_results = await asyncio.gather(adb.get_match_players(match_id), adb.get_match_round_results(match_id))
+        await interaction.followup.send(embed=ro3_result_card(match, match_players, round_results, match.get("map_pool") or []))
 
 
 async def setup(bot: commands.Bot):

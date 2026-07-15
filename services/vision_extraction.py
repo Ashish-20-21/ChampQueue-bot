@@ -5,7 +5,8 @@ so you can flip config.VISION_PROVIDER between "anthropic" / "openai" /
 
 Canonical extraction schema (resolves the two field lists in the source
 doc into one): for each of the 10 players —
-    ign, team, kills, deaths, assists, damage, hill_time, impact, score
+    ign, team, position, is_mvp, kills, deaths, assists, damage, hill_time,
+    impact, score
 
 To add a new provider: implement `extract(image_bytes) -> dict` on a new
 class following the same contract as AnthropicVisionProvider below, then
@@ -33,6 +34,8 @@ no commentary, matching exactly this schema:
     {
       "ign": "string, exactly as shown",
       "team": "A or B — infer from screen position/grouping, top group = A",
+      "position": integer from 1 to 5, or null if not clearly visible,
+      "is_mvp": true or false, or null if the MVP tag is not clearly visible,
       "kills": integer,
       "deaths": integer,
       "assists": integer or null if not shown,
@@ -47,7 +50,9 @@ no commentary, matching exactly this schema:
 
 If a field is not legible or not present in the image, use null for that field —
 never guess or fabricate a number. Double-check digits that could be visually
-ambiguous (e.g. 0 vs O, 1 vs 7, 8 vs 3) by cross-referencing column alignment."""
+ambiguous (e.g. 0 vs O, 1 vs 7, 8 vs 3), including each player's position,
+by cross-referencing column alignment. Verify MVP tags visually; report true
+only where the tag is visible and false only where its absence is clear."""
 
 
 class VisionProvider(ABC):

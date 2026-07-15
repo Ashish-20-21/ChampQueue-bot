@@ -346,3 +346,43 @@ class _AsyncDatabaseProxy:
 
 
 adb = _AsyncDatabaseProxy(db)
+
+
+# RO3 additions are intentionally appended so existing data-access methods
+# remain untouched for concurrent work on other cogs.
+def _get_players_by_ids(self: Database, player_ids: list[int]) -> list[dict]:
+    return self.client.table("players").select("*").in_("id", player_ids).execute().data
+
+
+def _upsert_match_screenshot(self: Database, match_id: int, round_number: int,
+                              image_url: str, uploaded_by: int, raw_extraction: dict,
+                              ocr_confidence: float | None = None) -> dict:
+    payload = {"match_id": match_id, "round_number": round_number, "image_url": image_url,
+               "uploaded_by": uploaded_by, "raw_extraction": raw_extraction,
+               "ocr_confidence": ocr_confidence}
+    res = self.client.table("match_screenshots").upsert(payload, on_conflict="match_id,round_number").execute()
+    return res.data[0]
+
+
+def _replace_match_round_results(self: Database, match_id: int, round_number: int,
+                                 results: list[dict]) -> list[dict]:
+    self.client.table("match_round_results").delete().eq("match_id", match_id).eq("round_number", round_number).execute()
+    if not results:
+        return []
+    payload = [{**row, "match_id": match_id, "round_number": round_number} for row in results]
+    return self.client.table("match_round_results").insert(payload).execute().data
+
+
+def _get_match_round_results(self: Database, match_id: int) -> list[dict]:
+    return self.client.table("match_round_results").select("*").eq("match_id", match_id).order("round_number").execute().data
+
+
+def _approve_ro3_match(self: Database, match_id: int, approved_by: int) -> list[dict]:
+    return self.client.rpc("approve_ro3_match", {"p_match_id": match_id, "p_approved_by": approved_by}).execute().data
+
+
+Database.get_players_by_ids = _get_players_by_ids
+Database.upsert_match_screenshot = _upsert_match_screenshot
+Database.replace_match_round_results = _replace_match_round_results
+Database.get_match_round_results = _get_match_round_results
+Database.approve_ro3_match = _approve_ro3_match

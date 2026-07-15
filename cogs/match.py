@@ -47,7 +47,7 @@ class Match(commands.Cog):
 
     @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
     async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
-        match = await adb.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id.strip().upper())
         if not match or match["status"] != "awaiting_room":
             await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
             return
@@ -67,7 +67,7 @@ class Match(commands.Cog):
     @app_commands.command(name="match-submit", description="Upload the final scoreboard screenshot for a match")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot="Final scoreboard screenshot")
     async def match_submit(self, interaction: discord.Interaction, match_id: str, screenshot: discord.Attachment):
-        match = await adb.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id.strip().upper())
         if not match or match["status"] not in ("in_progress", "awaiting_result"):
             await interaction.response.send_message("Match not found or not awaiting a result.", ephemeral=True)
             return

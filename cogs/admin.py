@@ -51,7 +51,7 @@ class Admin(commands.Cog):
     @app_commands.command(name="admin-approve-match", description="[Admin] Force-accept a flagged match as-submitted")
     @admin_only()
     async def approve_match(self, interaction: discord.Interaction, match_id: str):
-        match = await adb.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id.strip().upper())
         if not match or match["status"] != "awaiting_review":
             await interaction.response.send_message("Match not found or not awaiting review.", ephemeral=True)
             return
@@ -66,7 +66,7 @@ class Admin(commands.Cog):
     @admin_only()
     async def correct_stat(self, interaction: discord.Interaction, match_id: str, user: discord.Member,
                             field: str, value: int):
-        match = await adb.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
             await interaction.response.send_message("Match not found.", ephemeral=True)
             return
@@ -111,7 +111,11 @@ class Admin(commands.Cog):
     @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after 1hr")
     @admin_only()
     async def scrap_match(self, interaction: discord.Interaction, match_id: str, reason: str):
-        match = await adb.get_match_by_code(match_id)
+        # Normalize case — match_id is always stored uppercase (CQ-XXXX) but
+        # admins will naturally type whatever case they saw it in (channel
+        # names are lowercase, match-log embeds show uppercase). Normalizing
+        # here beats relying on everyone remembering the exact case.
+        match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
             await interaction.response.send_message("Match not found.", ephemeral=True)
             return

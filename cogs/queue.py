@@ -546,7 +546,7 @@ class Queue(commands.Cog):
             await respond("Room codes can only be shared in a match channel.")
             return
 
-        match_code = channel.name[len("cq-"):].upper()
+        match_code = channel.name.upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
             await respond("Couldn't find a match tied to this channel.")
@@ -696,7 +696,7 @@ class Queue(commands.Cog):
             await interaction.response.send_message("Both players need to be registered.", ephemeral=True)
             return
 
-        match_code = interaction.channel.name[len("cq-"):].upper()
+        match_code = interaction.channel.name.upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
             await interaction.response.send_message("Couldn't find a match tied to this channel.", ephemeral=True)

@@ -224,6 +224,20 @@ class Database:
         ).execute()
         return res.data[0]
 
+    def cast_skill_votes_bulk(self, votes: list[dict]) -> list[dict]:
+        """Batched version of cast_skill_vote — one upsert call for
+        multiple rows instead of one call per player. `votes` is a list of
+        {"match_id", "player_id", "team", "skill"} dicts. Used by
+        SkillVoteView to flush an entire team's picks in a single write
+        instead of firing cast_skill_vote on every individual click."""
+        if not votes:
+            return []
+        res = self.client.table("operator_skill_votes").upsert(
+            votes,
+            on_conflict="match_id,player_id",
+        ).execute()
+        return res.data
+
     def get_skill_votes(self, match_id: int, team: Optional[str] = None) -> list[dict]:
         q = self.client.table("operator_skill_votes").select("*").eq("match_id", match_id)
         if team:

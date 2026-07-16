@@ -23,7 +23,14 @@ class SkillVoteView(discord.ui.View):
     switch to a different skill. This matters beyond UI polish: if a
     player could silently swap picks mid-vote, teammates and the match-log
     record could show a different skill than what the player actually
-    ends up using in-game, which risks a false /AFK or dispute report."""
+    ends up using in-game, which risks a false /AFK or dispute report.
+
+    Vote writes are batched, not per-click: picks accumulate in
+    self.pending_votes (in-memory) and only hit the DB once, either when
+    the whole team (5/5) has picked, or as a fallback when Discord's own
+    View timeout fires (see on_timeout) — whichever happens first. UI
+    lock-in (button disabled/relabeled) is still instant on every click,
+    same as before; only the DB write timing changed."""
 
     def __init__(self, match_id: int, team: str, team_player_ids: set[int]):
         super().__init__(timeout=config.VOTE_TIMEOUT_SECONDS)
@@ -32,8 +39,36 @@ class SkillVoteView(discord.ui.View):
         self.team_player_ids = team_player_ids
         self.taken_skills: set[str] = set()
         self.voted_player_ids: set[int] = set()
+        self.pending_votes: list[dict] = []
+        self._flushed = False
         for skill in config.OPERATOR_SKILLS:
             self.add_item(self._make_button(skill))
+
+    async def _flush_votes(self) -> None:
+        """Writes whatever's currently in self.pending_votes in a single
+        bulk call, then clears it. Safe to call more than once — later
+        calls just have nothing new to send. Not tied to any player-facing
+        message or forced skill assignment; purely a backend write."""
+        if not self.pending_votes:
+            return
+        votes_to_write = self.pending_votes
+        self.pending_votes = []
+        try:
+            await adb.cast_skill_votes_bulk(votes_to_write)
+        except Exception:
+            logger.exception(
+                "SkillVoteView: bulk vote flush failed for match_id=%s team=%s (%d votes lost)",
+                self.match_id, self.team, len(votes_to_write),
+            )
+
+    async def on_timeout(self) -> None:
+        # Discord-library-level callback — fires automatically after
+        # config.VOTE_TIMEOUT_SECONDS of view inactivity. Not a sleep we
+        # wrote, doesn't block or touch _start_match_flow. Only job here:
+        # make sure any votes that were cast but never hit 5/5 (so never
+        # auto-flushed) still get saved. No forced/random skill assignment
+        # for anyone who didn't vote — they simply have no row.
+        await self._flush_votes()
 
     def _make_button(self, skill: str) -> discord.ui.Button:
         button = discord.ui.Button(label=skill, style=discord.ButtonStyle.secondary)
@@ -41,7 +76,7 @@ class SkillVoteView(discord.ui.View):
         async def callback(interaction: discord.Interaction):
             # Stop Discord's 3-second clock FIRST, before any DB calls.
             # Under concurrent votes (8-10 players clicking within the same
-            # window), get_player_by_discord_id + cast_skill_vote compete
+            # window), get_player_by_discord_id + the vote write compete
             # for the same connection pool — by the later clicks, those two
             # round trips alone can exceed 3s even though nothing is
             # actually broken. defer() is a single fast Discord-side call
@@ -66,23 +101,36 @@ class SkillVoteView(discord.ui.View):
                 )
                 return
 
-            await adb.cast_skill_vote(self.match_id, player["id"], self.team, skill)
+            # In-memory lock-in — instant, same as before, no DB round
+            # trip in the critical path of the click itself.
             self.taken_skills.add(skill)
             self.voted_player_ids.add(player["id"])
+            self.pending_votes.append({
+                "match_id": self.match_id,
+                "player_id": player["id"],
+                "team": self.team,
+                "skill": skill,
+            })
             button.disabled = True
             button.label = f"{skill} ✓ ({player['ign']})"
 
-            # The DB write above already succeeded — that's the source of
-            # truth. This visual update can still fail on a stale/expired
+            # Once the whole team (5/5) has picked, flush the batch in one
+            # bulk write instead of waiting for the view timeout. This is
+            # the actual optimization: 5 individual writes collapsed to 1.
+            if len(self.voted_player_ids) >= len(self.team_player_ids):
+                await self._flush_votes()
+
+            # This visual update can still fail on a stale/expired
             # interaction token in rare cases, which would otherwise
             # leave the player thinking their vote didn't register even
-            # though it did. Fall back to a plain confirmation message so
-            # they always know their pick locked in correctly.
+            # though the in-memory pick (and, once flushed, the DB write)
+            # already happened. Fall back to a plain confirmation message
+            # so they always know their pick locked in correctly.
             try:
                 await interaction.edit_original_response(view=self)
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:
                 logger.warning(
-                    "SkillVoteView: edit_original_response failed for player_id=%s, skill=%s (vote already saved): %s",
+                    "SkillVoteView: edit_original_response failed for player_id=%s, skill=%s (vote already recorded): %s",
                     player["id"], skill, e,
                 )
                 try:
@@ -94,7 +142,7 @@ class SkillVoteView(discord.ui.View):
                 except discord.errors.HTTPException as e2:
                     logger.warning(
                         "SkillVoteView: fallback followup also failed for player_id=%s, skill=%s "
-                        "(vote already saved, player will see it as failed on their end): %s",
+                        "(vote already recorded, player will see it as failed on their end): %s",
                         player["id"], skill, e2,
                     )
 
@@ -356,12 +404,12 @@ class Queue(commands.Cog):
             new_embed = make_queue_embed(region, remaining_queue)
             await interaction.message.edit(embed=new_embed, view=new_view)
             # Lock released here — everything below (channel creation, the
-            # 120s skill-vote wait) is slow, and the 10 players are already
+            # skill-vote views) is slow, and the 10 players are already
             # marked matched + off the queue panel, so there's nothing left
             # for the lock to protect. Holding it through this used to
             # freeze Join/Leave for this whole region (worse: for BOTH
-            # regions, before the per-region split above) until the skill
-            # vote timer expired — see DECISIONS.md for the 10062 write-up.
+            # regions, before the per-region split above) — see
+            # DECISIONS.md for the 10062 write-up.
 
         # Spawn the match creation and setup. Everything past this point
         # touches Discord's API (channel/VC creation) which can fail for
@@ -514,27 +562,20 @@ class Queue(commands.Cog):
             f"{mentions}\n\n"
             f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
             f"Host {host_mention}: share the room code here with `+roomcode<code>` "
-            f"(or `/rc <code>`). Made a typo? Use `+updateroomcode<code>` to correct it."
+            f"(or `/rc <code>`). Made a typo? Use `+updateroomcode<code>` to correct it.\n"
+            f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."
         )
 
-        # Skill votes
+        # Skill votes — no blocking wait here anymore. Views are sent and
+        # the flow ends; each view batches its own team's writes (flushed
+        # at 5/5, or as a fallback on Discord's own view timeout — see
+        # SkillVoteView.on_timeout). Nothing downstream (room code,
+        # match-log, MMR, approval) depends on skill votes being complete,
+        # so there's nothing here to wait on before finishing the flow.
         view_a = SkillVoteView(match["id"], "A", team_a_ids)
         view_b = SkillVoteView(match["id"], "B", team_b_ids)
         await text_channel.send(f"**Defender Team** — vote your operator skill (unique per team):", view=view_a)
         await text_channel.send(f"**Attacker Team** — vote your operator skill (unique per team):", view=view_b)
-        await asyncio.sleep(config.VOTE_TIMEOUT_SECONDS)
-        await self._finalize_skill_vote(match["id"], "A", team_a, view_a)
-        await self._finalize_skill_vote(match["id"], "B", team_b, view_b)
-
-    async def _finalize_skill_vote(self, match_id: int, team: str, team_players: list[dict], view: SkillVoteView):
-        votes = await adb.get_skill_votes(match_id, team)
-        voted_ids = {v["player_id"] for v in votes}
-        missing = [p for p in team_players if p["id"] not in voted_ids]
-        available_skills = [s for s in config.OPERATOR_SKILLS if s not in view.taken_skills]
-        for p in missing:
-            skill = available_skills.pop(0) if available_skills else random.choice(config.OPERATOR_SKILLS)
-            await adb.cast_skill_vote(match_id, p["id"], team, skill)
-        view.stop()
 
     async def _handle_room_code_share(self, message_or_interaction, channel: discord.TextChannel,
                                         author_id: int, code: str, respond) -> None:
@@ -567,7 +608,10 @@ class Queue(commands.Cog):
         # Match-log entry: only post fresh on the *first* share. A
         # correction just updates the room code in place — re-posting a
         # whole new log entry on every typo-fix would clutter the log
-        # channel with duplicates for the same match.
+        # channel with duplicates for the same match. Note: this can
+        # happen while skill votes are still in progress on either team —
+        # that's expected and fine, the two are independent (see
+        # DECISIONS.md).
         if is_first_share:
             await self._post_match_log(match["id"], code)
         else:

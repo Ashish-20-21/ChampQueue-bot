@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import discord
 from discord.ext import commands
@@ -62,6 +63,21 @@ class ChampionsQueueBot(commands.Bot):
 
 
 async def main():
+    # Every DB call goes through asyncio.to_thread (see database/db.py's
+    # __getattr__ proxy), which by default shares Python's stdlib thread
+    # pool — sized to min(32, cpu_count + 4), i.e. often just 8-12 threads.
+    # That's shared across EVERY concurrent DB call from every region's
+    # queue, every match's skill votes, every /profile or /stats command,
+    # all at once. At real multi-queue, multi-match concurrency, that
+    # ceiling can genuinely saturate — calls start queueing for a free
+    # thread, reintroducing the same kind of latency the interaction-token
+    # races earlier tonight were caused by, just one layer deeper. This is
+    # cheap and safe to raise: these are I/O-bound (waiting on network),
+    # not CPU-bound, so having more threads mostly-idle-waiting costs
+    # nothing meaningful.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=50, thread_name_prefix="db-io"))
+
     bot = ChampionsQueueBot()
     async with bot:
         await bot.start(config.DISCORD_BOT_TOKEN)

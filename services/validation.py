@@ -6,10 +6,8 @@ routed to admin review. Two independent triggers, either one forces review:
      config.STAT_OUTLIER_STD_DEVS away from THAT PLAYER'S OWN rolling
      history (not the lobby average — a player's personal baseline is a
      much stronger signal than comparing across different skill levels).
-  2. Vote mismatch: the winner declared by the in-Discord player vote
-     disagrees with the winner implied by the scoreboard.
-
-Either trigger sets match.status = 'awaiting_review' instead of 'completed'.
+Either trigger sets match.status = 'awaiting_review' instead of being
+eligible for host approval.
 """
 
 from __future__ import annotations
@@ -43,32 +41,24 @@ async def check_stat_outliers(player_id: int, new_stats: dict) -> list[str]:
     return flags
 
 
-def check_vote_mismatch(match_id: int, scoreboard_winner: str, player_votes: list[dict]) -> bool:
-    """Returns True if there's a meaningful mismatch that should block auto-accept."""
-    if not config.VOTE_MISMATCH_BLOCKS_AUTO_ACCEPT or not player_votes:
-        return False
-    disagreeing = [v for v in player_votes if v.get("winner") != scoreboard_winner]
-    # Any disagreement at all is enough to force a human look, since the
-    # cost of a bad auto-accept (permanent stat record) is high.
-    return len(disagreeing) > 0
-
-
-async def validate_submission(match_id: int, extraction: dict, player_votes: list[dict]) -> dict[str, Any]:
+async def validate_submission(match_id: int, extraction: dict, player_votes: list[dict] | None = None) -> dict[str, Any]:
     """
     Returns:
-        {"auto_accept": bool, "flags": {player_id: [flag strings]}, "vote_mismatch": bool}
+        {"auto_accept": bool, "flags": {player_id: [flag strings]}}
     """
     all_flags: dict[int, list[str]] = {}
+    match_players = await adb.get_match_players(match_id)
+    players_by_ign = {
+        candidate.get("players", {}).get("ign", "").strip().lower(): candidate
+        for candidate in match_players
+    }
     for p in extraction.get("players", []):
-        player = await adb.get_player_by_uid(p.get("cod_uid", "")) or await adb.get_player_by_discord_id(p.get("discord_id", ""))
+        ign = str(p.get("ign") or "").strip().lower()
+        player = players_by_ign.get(ign)
         if not player:
             continue
-        flags = await check_stat_outliers(player["id"], p)
+        flags = await check_stat_outliers(player["player_id"], p)
         if flags:
-            all_flags[player["id"]] = flags
+            all_flags[player["player_id"]] = flags
 
-    scoreboard_winner = extraction.get("winner_team")
-    vote_mismatch = check_vote_mismatch(match_id, scoreboard_winner, player_votes)
-
-    auto_accept = not all_flags and not vote_mismatch
-    return {"auto_accept": auto_accept, "flags": all_flags, "vote_mismatch": vote_mismatch}
+    return {"auto_accept": not all_flags, "flags": all_flags}

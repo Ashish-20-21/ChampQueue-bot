@@ -545,7 +545,6 @@ class Queue(commands.Cog):
         maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=3)
         await adb.update_match(match["id"], {
             "map_pool": maps,
-            "map": maps[0],
             "status": "awaiting_room"
         })
 
@@ -632,7 +631,7 @@ class Queue(commands.Cog):
         team_a = [mp["players"]["ign"] for mp in match_players if mp["team"] == "A"]
         team_b = [mp["players"]["ign"] for mp in match_players if mp["team"] == "B"]
 
-        map_pool = match.get("map_pool") or [match.get("map", "—")]
+        map_pool = match.get("map_pool") or ["—"]
         maps_display = "\n".join(f"Round {i+1}: **{m}**" for i, m in enumerate(map_pool))
 
         embed = discord.Embed(

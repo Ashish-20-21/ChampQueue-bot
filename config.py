@@ -44,6 +44,16 @@ ADMIN_ROLE_ID = int(_require("ADMIN_ROLE_ID"))
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
+# --- P5: result upload + approval channels ---
+# Two separate channels by design: upload channel takes /match-submit (and
+# the persistent "Submit Match Results" button) only; approval channel is
+# where the host-facing verification card and the final result card are
+# posted, regardless of which channel the submission happened from. Same
+# optional-at-import pattern as AFK/MATCH_LOG above — features no-op with a
+# clear rejection message until these are set, bot doesn't crash on boot.
+RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
+RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
+
 # How often the abandoned/completed-match channel cleanup sweep runs.
 # Independent of the 1hr cleanup delay itself — this just controls how
 # often the bot checks "is anything due yet".
@@ -58,6 +68,14 @@ SUPABASE_SERVICE_KEY = _require("SUPABASE_SERVICE_KEY")
 VISION_PROVIDER = os.getenv("VISION_PROVIDER", "anthropic").lower()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.4-mini")
+# gpt-5.4-mini chosen after live A/B testing against gpt-4.1-nano (2026-07-17):
+# nano showed a column-mapping bug (damage/score/impact values swapped when
+# a Damage column wasn't present) and a Simzy/Simpy-style IGN misread that
+# recurred across multiple screenshots. gpt-5.4-mini, single-pass, matched
+# ground truth exactly (score/impact/kills/deaths/hill_time) across 3
+# separate real screenshots with zero numeric errors. Don't downgrade this
+# default without re-running that comparison.
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
 NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com")

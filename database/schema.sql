@@ -77,7 +77,6 @@ create table if not exists matches (
     id                bigserial primary key,
     match_id          text unique not null,          -- human-facing short ID, e.g. CQ-0001
     season_id         bigint references seasons(id),
-    map               text,
     status            text not null default 'forming'
                         check (status in (
                             'forming',       -- team balance / captain / skill vote in progress

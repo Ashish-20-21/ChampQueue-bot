@@ -218,8 +218,17 @@ class Match(commands.Cog):
         # Each valid round is individually queryable immediately. These are
         # provisional records only: the approval RPC is the sole place that
         # can ever mutate players.mmr.
+        #
+        # NOTE: results rows carry "discord_id" for the verification embed's
+        # @mentions (ro3_verification_card below), but match_round_results
+        # has no such column — confirmed live via a 400 PGRST204 error when
+        # this wasn't stripped first. Strip it only for the DB payload; the
+        # embed still gets the full row with discord_id intact via round_data.
         await asyncio.gather(*(
-            adb.replace_match_round_results(match["id"], item["round_number"], item["results"])
+            adb.replace_match_round_results(
+                match["id"], item["round_number"],
+                [{k: v for k, v in row.items() if k != "discord_id"} for row in item["results"]],
+            )
             for item in round_data
         ))
 

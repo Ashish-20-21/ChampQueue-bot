@@ -131,6 +131,16 @@ class OpenAIVisionProvider(VisionProvider):
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
 
+    @staticmethod
+    def _max_tokens_kwarg(model: str) -> dict:
+        """gpt-5.x models rejected the old "max_tokens" param outright
+        during live testing (400 Bad Request: use max_completion_tokens
+        instead). gpt-4.x still wants the old name. Confirmed via a real
+        API call against gpt-5.4-mini before this fix was added."""
+        if model.startswith("gpt-5") or model.startswith("o"):
+            return {"max_completion_tokens": 2000}
+        return {"max_tokens": 2000}
+
     def extract(self, image_bytes: bytes, media_type: str = "image/png") -> dict[str, Any]:
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
         resp = httpx.post(
@@ -149,18 +159,27 @@ class OpenAIVisionProvider(VisionProvider):
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:{media_type};base64,{b64_image}"
+                                    "url": f"data:{media_type};base64,{b64_image}",
+                                    "detail": "high",  # dense small-text scoreboard — confirmed during
+                                                        # testing this matters more than a no-op on some images
                                 },
                             },
                         ],
                     }
                 ],
-                "max_tokens": 2000,
+                **self._max_tokens_kwarg(config.OPENAI_VISION_MODEL),
                 "temperature": 0.1,
                 "response_format": {"type": "json_object"},
             },
             timeout=90,
         )
+        if resp.status_code >= 400:
+            # Surface the real OpenAI error message rather than a bare
+            # HTTPStatusError — this is what let us diagnose the
+            # max_tokens rejection quickly during testing instead of
+            # guessing at it.
+            raise RuntimeError(f"OpenAI vision API error ({resp.status_code}) for model "
+                                f"{config.OPENAI_VISION_MODEL!r}: {resp.text}")
         resp.raise_for_status()
         data = resp.json()
         text = data["choices"][0]["message"]["content"]

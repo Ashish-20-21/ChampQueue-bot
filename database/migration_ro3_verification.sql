@@ -43,7 +43,10 @@ alter table matches add constraint matches_status_check check (
         'pending_verification',  -- all 3 screenshots uploaded + OCR'd, waiting on host approval
         'awaiting_review',       -- flagged for admin review (OCR low-confidence or stat outlier)
         'completed',
-        'cancelled'
+        'cancelled',
+        'abandoned'  -- written by admin-scrap-match (AFK confirmation); was missing from this
+                     -- migration originally, which blocked the constraint from applying at all
+                     -- once any real abandoned-match rows existed. Found via live testing 2026-07-17.
     )
 );
 

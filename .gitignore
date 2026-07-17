@@ -13,5 +13,6 @@ DECISIONS.md
 p5-merge-test.bundle
 p5_integration*.patch
 p5_integration_summary.txt
+vision_max_tokens_fix.patch
 test_vision.py
 __pycache__/

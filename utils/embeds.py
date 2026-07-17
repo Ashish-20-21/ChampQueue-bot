@@ -77,3 +77,41 @@ def comparison_embed(ign: str, previous: dict, latest: dict) -> discord.Embed:
     embed.add_field(name="Hill Time", value=row("hill_time"), inline=True)
     embed.add_field(name="MMR Change", value=row("mmr_change"), inline=True)
     return embed
+
+
+def ro3_verification_card(match: dict, round_data: list[dict]) -> discord.Embed:
+    """Host-facing verification card: one independently readable block/map."""
+    embed = discord.Embed(
+        title=f"Match {match['match_id']} — RO3 Verification",
+        description="Review all three rounds. Only the Match Host can approve this result.",
+        color=discord.Color.gold(),
+    )
+    for round_info in sorted(round_data, key=lambda item: item["round_number"]):
+        lines = []
+        for row in sorted(round_info["results"], key=lambda item: (item["team"], item["position"])):
+            mvp = " MVP" if row.get("is_mvp") else ""
+            delta = row["mmr_delta"]
+            lines.append(f"Team {row['team']} #{row['position']} — <@{row['discord_id']}>: {delta:+d} MMR{mvp}")
+        embed.add_field(
+            name=f"Round {round_info['round_number']} — {round_info['map_name']} ({round_info['final_score']})",
+            value="\n".join(lines) or "No readable player rows.",
+            inline=False,
+        )
+    return embed
+
+
+def ro3_result_card(match: dict, match_players: list[dict], round_results: list[dict], maps: list[str]) -> discord.Embed:
+    """Final result with visible per-round MMR components and match totals."""
+    embed = discord.Embed(title=f"Match {match['match_id']} — Result", color=discord.Color.green())
+    by_player: dict[int, list[dict]] = {}
+    for row in round_results:
+        by_player.setdefault(row["player_id"], []).append(row)
+    names = {mp["player_id"]: mp["players"]["ign"] for mp in match_players}
+    for player_id, rows in sorted(by_player.items(), key=lambda item: names.get(item[0], "")):
+        lines = []
+        for row in sorted(rows, key=lambda item: item["round_number"]):
+            bonus = " (+5 MVP)" if row.get("is_mvp") else ""
+            lines.append(f"{maps[row['round_number'] - 1]} — {row['mmr_delta']:+d}{bonus}")
+        total = sum(row["mmr_delta"] for row in rows)
+        embed.add_field(name=names.get(player_id, f"Player {player_id}"), value="\n".join(lines) + f"\n**Total: {total:+d} MMR**", inline=False)
+    return embed

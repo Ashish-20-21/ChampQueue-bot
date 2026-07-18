@@ -404,6 +404,29 @@ class Match(commands.Cog):
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            await self._submit_body(interaction, match, player, maps, attachments)
+        except Exception as exc:
+            # Safety net for anything NOT already caught by the specific
+            # try/excepts inside _submit_body (OCR failure, validation
+            # failure, etc.) — an unhandled crash here should never leave
+            # the player staring at "thinking..." forever with silence.
+            # Found live 2026-07-18: a return-value mismatch in
+            # _prepare_rounds crashed match_submit with zero notification
+            # to anyone, player or admin.
+            logger.exception("match_submit: unhandled exception for match_id=%s", match_id)
+            try:
+                await self._route_to_review(match, player["id"] if player else None, "vision_failure",
+                                             f"Unhandled exception in match_submit: {exc!r}")
+            except Exception:
+                logger.exception("match_submit: even _route_to_review failed while handling the original exception")
+            await interaction.followup.send(
+                "Something went wrong on our end processing this submission — it's been flagged for admin "
+                "review automatically. Sorry about that, we'll sort it out.", ephemeral=True
+            )
+
+    async def _submit_body(self, interaction: discord.Interaction, match: dict, player: dict | None,
+                            maps: list[str], attachments: tuple[discord.Attachment, ...]) -> None:
         payloads = await asyncio.gather(*(attachment.read() for attachment in attachments))
         try:
             extractions = await asyncio.gather(*(
@@ -431,7 +454,7 @@ class Match(commands.Cog):
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
 
-        round_data, review_reasons, _ = self._prepare_rounds(match_players, maps, ordered_extractions)
+        round_data, review_reasons = self._prepare_rounds(match_players, maps, ordered_extractions)
 
         if review_reasons:
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", _truncate_for_discord("Validation failed: ", review_reasons))

@@ -328,6 +328,15 @@ class Match(commands.Cog):
 
     async def _finish_resolving_issue(self, interaction: discord.Interaction, issue_id: int,
                                        original_message: discord.Message, note: str | None) -> None:
+        # Defer FIRST, before any DB/Discord work — this function does
+        # several sequential awaits (DB writes, a message edit, an
+        # outbound send) that can easily eat the ~3s initial-response
+        # window. Found live 2026-07-18: calling response.send_message
+        # only at the end raised "Unknown interaction" (404) because the
+        # token had already expired by the time we got there. Same
+        # defer-first pattern already used correctly in match_submit.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         admin_player = await adb.get_player_by_discord_id(interaction.user.id)
         issue = await adb.resolve_match_issue(issue_id, admin_player["id"] if admin_player else None, note)
         reporter = await adb.get_players_by_ids([issue["reported_by"]])
@@ -353,7 +362,7 @@ class Match(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        await interaction.response.send_message("Marked resolved.", ephemeral=True)
+        await interaction.followup.send("Marked resolved.", ephemeral=True)
 
     @app_commands.command(name="match-submit", description="Host upload of all three RO3 scoreboard screenshots")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")

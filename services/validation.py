@@ -15,13 +15,13 @@ import statistics
 from typing import Any
 
 import config
-from database.db import adb
+from database.db import adb, with_retry
 
 
 async def check_stat_outliers(player_id: int, new_stats: dict) -> list[str]:
     """Returns a list of human-readable flags for any field that's an outlier
     versus this player's own history. Empty list = nothing suspicious."""
-    history = await adb.player_recent_matches(player_id, limit=15)
+    history = await with_retry(adb.player_recent_matches, player_id, limit=15)
     if len(history) < 5:
         return []  # not enough history to judge yet — don't false-flag new players
 
@@ -47,7 +47,7 @@ async def validate_submission(match_id: int, extraction: dict, player_votes: lis
         {"auto_accept": bool, "flags": {player_id: [flag strings]}}
     """
     all_flags: dict[int, list[str]] = {}
-    match_players = await adb.get_match_players(match_id)
+    match_players = await with_retry(adb.get_match_players, match_id)
     players_by_ign = {
         candidate.get("players", {}).get("ign", "").strip().lower(): candidate
         for candidate in match_players

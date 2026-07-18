@@ -79,26 +79,56 @@ def comparison_embed(ign: str, previous: dict, latest: dict) -> discord.Embed:
     return embed
 
 
-def ro3_verification_card(match: dict, round_data: list[dict]) -> discord.Embed:
-    """Host-facing verification card: one independently readable block/map."""
+def ro3_verification_card(match: dict, round_data: list[dict], extractions: list[dict], maps: list[str]) -> discord.Embed:
+    """Host-facing verification card. Shows the actual per-round stats
+    (K/D/A, Impact, MVP) a host can visually compare against their own
+    screenshot — not MMR deltas as the primary content. MMR moves to a
+    compact one-line summary at the bottom of each round instead, since
+    a bare list of +N MMR values gives the host nothing to verify against;
+    the raw stats are what catches an OCR misread. See DECISIONS.md
+    (2026-07-18 planning session) for why this replaced the earlier
+    MMR-only version."""
     embed = discord.Embed(
         title=f"Match {match['match_id']} — RO3 Verification",
         description=(
-            "Review all three rounds. Only the Match Host can approve this result. "
-            "**MMR values below are proposed** — nothing is applied to anyone's actual "
-            "MMR or the leaderboard until Approve is clicked."
+            "Review all three rounds against your own screenshots. Only the Match Host can approve. "
+            "**MMR values are proposed** — nothing is applied until Approve is clicked."
         ),
         color=discord.Color.gold(),
     )
-    for round_info in sorted(round_data, key=lambda item: item["round_number"]):
-        lines = []
-        for row in sorted(round_info["results"], key=lambda item: (item["team"], item["position"])):
-            mvp = " MVP" if row.get("is_mvp") else ""
-            delta = row["mmr_delta"]
-            lines.append(f"Team {row['team']} #{row['position']} — <@{row['discord_id']}>: {delta:+d} MMR{mvp}")
+    results_by_round = {item["round_number"]: item["results"] for item in round_data}
+
+    for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
+        results = results_by_round.get(round_number, [])
+        delta_by_ign = {row["ign"].strip().lower(): row for row in results}
+
+        players = sorted(extraction.get("players", []), key=lambda p: (p.get("team"), p.get("position", 9)))
+        team_lines = {"A": [], "B": []}
+        for p in players:
+            ign = str(p.get("ign") or "?")
+            kda = f"{p.get('kills', '?')}/{p.get('deaths', '?')}/{p.get('assists', '?')}"
+            impact = p.get("impact")
+            impact_str = str(impact) if impact is not None else "—"
+            mvp = "  MVP" if p.get("is_mvp") else ""
+            team_lines.setdefault(p.get("team"), []).append(
+                f"{p.get('position', '?')}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
+            )
+
+        block = f"Team A\n```\n{chr(10).join(team_lines.get('A', [])) or '(no readable rows)'}\n```\n" \
+                f"Team B\n```\n{chr(10).join(team_lines.get('B', [])) or '(no readable rows)'}\n```"
+
+        mmr_line = ""
+        if results:
+            team_a_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
+                (r for r in results if r["team"] == "A"), key=lambda r: r["position"]))
+            team_b_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
+                (r for r in results if r["team"] == "B"), key=lambda r: r["position"]))
+            mmr_line = f"\n*MMR (proposed): A {team_a_deltas}  ·  B {team_b_deltas}*"
+
+        final_score = extraction.get("final_score") or "—"
         embed.add_field(
-            name=f"Round {round_info['round_number']} — {round_info['map_name']} ({round_info['final_score']})",
-            value="\n".join(lines) or "No readable player rows.",
+            name=f"Round {round_number} — {announced_map} ({final_score})",
+            value=block + mmr_line,
             inline=False,
         )
     return embed

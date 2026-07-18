@@ -337,11 +337,6 @@ class Match(commands.Cog):
         # defer-first pattern already used correctly in match_submit.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        existing_issue = await adb.get_match_issue(issue_id)
-        if existing_issue and existing_issue["status"] == "resolved":
-            await interaction.followup.send("This was already marked resolved.", ephemeral=True)
-            return
-
         admin_player = await adb.get_player_by_discord_id(interaction.user.id)
         issue = await adb.resolve_match_issue(issue_id, admin_player["id"] if admin_player else None, note)
         reporter = await adb.get_players_by_ids([issue["reported_by"]])
@@ -521,7 +516,7 @@ class Match(commands.Cog):
                 ephemeral=True,
             )
             return
-        await approval_channel.send(embed=ro3_verification_card(match, round_data), view=HostApprovalView(self, match["id"]))
+        await approval_channel.send(embed=ro3_verification_card(match, round_data, ordered_extractions, maps), view=HostApprovalView(self, match["id"]))
         note_suffix = f" ({'; '.join(info_notes)})" if info_notes else ""
         await interaction.followup.send(
             f"Submitted. Check {approval_channel.mention} to approve once you've verified the rounds.{note_suffix}",

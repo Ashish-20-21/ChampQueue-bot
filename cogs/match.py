@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import timedelta
 
 import discord
+import httpx
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -41,6 +42,38 @@ _HILL_TIME_RE = re.compile(r"^\d+(\.\d+)?$")
 _SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
 _DISCORD_MESSAGE_LIMIT = 2000
 _DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
+
+# Transient transport-layer failures worth a retry — NOT application errors
+# (bad payload, schema mismatch, permission denied). Found live 2026-07-19:
+# an httpx.RemoteProtocolError (HTTP/2 COMPRESSION_ERROR — a connection-level
+# fault, unrelated to our request) crashed a match_round_results write
+# mid-submission. The DB operation itself had actually already succeeded
+# server-side by the time the error surfaced client-side, confirmed via the
+# log — this is exactly the class of "the network blinked, the request was
+# fine" failure a short retry is for, not a bug in our code to chase.
+_RETRYABLE_EXCEPTIONS = (httpx.RemoteProtocolError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
+
+
+async def _with_retry(coro_fn, *args, attempts: int = 3, base_delay: float = 0.5, **kwargs):
+    """Runs coro_fn(*args, **kwargs), retrying on _RETRYABLE_EXCEPTIONS only.
+    Anything else (a real application error) propagates immediately on the
+    first attempt — retrying those would just delay a failure that retrying
+    can't fix, and could mask a genuine bug behind a few seconds of silence.
+    Delay backs off linearly (0.5s, 1s) rather than instantly hammering a
+    connection that may still be recovering."""
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                logger.warning(
+                    "Transient network error on attempt %d/%d for %s: %r — retrying in %.1fs",
+                    attempt + 1, attempts, getattr(coro_fn, "__name__", coro_fn), exc, base_delay * (attempt + 1),
+                )
+                await asyncio.sleep(base_delay * (attempt + 1))
+    raise last_exc
 
 
 def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ", limit: int = _DISCORD_MESSAGE_LIMIT) -> str:
@@ -468,8 +501,8 @@ class Match(commands.Cog):
         # submission's audit trail would silently disagree with its own
         # MMR calculation.
         await asyncio.gather(*(
-            adb.upsert_match_screenshot(match["id"], number, attachment.url, player["id"], extraction,
-                                         extraction.get("ocr_confidence"))
+            _with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, player["id"], extraction,
+                        extraction.get("ocr_confidence"))
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
 
@@ -492,7 +525,8 @@ class Match(commands.Cog):
         # this wasn't stripped first. Strip it only for the DB payload; the
         # embed still gets the full row with discord_id intact via round_data.
         await asyncio.gather(*(
-            adb.replace_match_round_results(
+            _with_retry(
+                adb.replace_match_round_results,
                 match["id"], item["round_number"],
                 [{k: v for k, v in row.items() if k != "discord_id"} for row in item["results"]],
             )

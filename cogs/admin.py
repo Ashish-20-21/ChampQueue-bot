@@ -241,12 +241,15 @@ class Admin(commands.Cog):
     @approve.error
     @reject.error
     @review_queue.error
-    @approve_match.error
-    @correct_stat.error
+    @correct_round.error
+    @force_approve.error
     @adjust_reputation.error
     @adjust_mmr.error
     @scrap_match.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
         if isinstance(error, app_commands.CheckFailure):
             await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         else:

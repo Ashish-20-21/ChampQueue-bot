@@ -40,17 +40,27 @@ _HILL_TIME_RE = re.compile(r"^\d+(\.\d+)?$")
 # prompt/provider version returns fractional seconds.
 _SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
 _DISCORD_MESSAGE_LIMIT = 2000
+_DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
 
 
-def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ") -> str:
-    """Join `parts` onto `prefix`, trimming to stay under Discord's 2000-char
-    message cap. Cuts whole parts (never mid-sentence) and appends a
-    "+N more" note so admins know the list was cut, not truncated silently."""
+def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ", limit: int = _DISCORD_MESSAGE_LIMIT) -> str:
+    """Join `parts` onto `prefix`, trimming to stay under `limit`. Cuts
+    whole parts (never mid-sentence) and appends a "+N more" note so
+    admins know the list was cut, not truncated silently.
+
+    Default limit (2000) is Discord's plain-message cap — right for
+    direct chat sends. Pass limit=_DISCORD_EMBED_DESCRIPTION_LIMIT (4096)
+    when populating an embed description instead; using the wrong one
+    was a real bug found live 2026-07-19 — a single long technical_detail
+    string, evaluated against the 2000 message limit while living inside
+    an embed, couldn't fit as a whole "part" and silently fell back to
+    nothing but the "+1 more" placeholder, hiding the entire detail an
+    admin actually needed."""
     text = prefix
     included = 0
     for part in parts:
         candidate = text + (sep if included else "") + part
-        if len(candidate) > _DISCORD_MESSAGE_LIMIT - 40:  # headroom for the "+N more" suffix
+        if len(candidate) > limit - 40:  # headroom for the "+N more" suffix
             break
         text = candidate
         included += 1
@@ -310,7 +320,7 @@ class Match(commands.Cog):
                 await intake_channel.send(
                     embed=discord.Embed(
                         title=f"Match {match['match_id']} — needs review",
-                        description=_truncate_for_discord("", [technical_detail]),
+                        description=_truncate_for_discord("", [technical_detail], limit=_DISCORD_EMBED_DESCRIPTION_LIMIT),
                         color=discord.Color.orange(),
                     ).add_field(name="Reason", value=reason).add_field(name="Issue ID", value=str(issue["id"])),
                     view=IssueResolveView(self, issue["id"]),
@@ -467,7 +477,7 @@ class Match(commands.Cog):
 
         if review_reasons:
             screenshot_links = "\n".join(f"Round {i}: {pair[1].url}" for i, pair in enumerate(ordered_pairs, start=1))
-            technical_detail = _truncate_for_discord("Validation failed: ", review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
+            technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
@@ -497,7 +507,7 @@ class Match(commands.Cog):
         if flags:
             players = {item["id"]: item for item in await adb.get_players_by_ids(list(flags))}
             summary_parts = [f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items()]
-            await self._route_to_review(match, player["id"] if player else None, "vision_failure", _truncate_for_discord("Stat validation flagged: ", summary_parts))
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", "Stat validation flagged: " + "; ".join(summary_parts))
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 

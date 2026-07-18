@@ -135,7 +135,7 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="admin-force-approve", description="[Admin] Approve a match once all 30 round-result rows exist (RO3-aware replacement for the old approve-match)")
+    @app_commands.command(name="admin-force-approve", description="[Admin] Approve a match once all 30 round-result rows exist")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
     @admin_only()
     async def force_approve(self, interaction: discord.Interaction, match_id: str):

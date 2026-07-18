@@ -466,7 +466,9 @@ class Match(commands.Cog):
         round_data, review_reasons = self._prepare_rounds(match_players, maps, ordered_extractions)
 
         if review_reasons:
-            await self._route_to_review(match, player["id"] if player else None, "vision_failure", _truncate_for_discord("Validation failed: ", review_reasons))
+            screenshot_links = "\n".join(f"Round {i}: {pair[1].url}" for i, pair in enumerate(ordered_pairs, start=1))
+            technical_detail = _truncate_for_discord("Validation failed: ", review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
@@ -624,7 +626,12 @@ class Match(commands.Cog):
         for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
             resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
             if resolved_map != announced_map.upper():
-                reasons.append(f"round {round_number}: map is unrecognized or does not match announced {announced_map}")
+                raw_map = extraction.get("map")
+                reasons.append(
+                    f"round {round_number}: map mismatch — announced **{announced_map}**, "
+                    f"screenshot read as {raw_map!r}" +
+                    (f" (resolved to {resolved_map}, still doesn't match)" if resolved_map else " (not recognized by the map translation table at all)")
+                )
             score = str(extraction.get("final_score") or "")
             score_match = _SCORE_RE.fullmatch(score)
             if not score_match or score_match.group(1) == score_match.group(2):

@@ -472,8 +472,93 @@ def _approve_ro3_match(self: Database, match_id: int, approved_by: int) -> list[
     return self.client.rpc("approve_ro3_match", {"p_match_id": match_id, "p_approved_by": approved_by}).execute().data
 
 
+def _has_open_issue(self: Database, match_id: int) -> bool:
+    """The single guard used by BOTH the manual Approve button and the
+    auto-approve sweep — filing /correction-result blocks approval either
+    way, no separate 'pause the timer' mechanism needed. Checks the
+    partial index on (match_id) where status='open', so this stays cheap
+    regardless of how many resolved historical issues accumulate."""
+    res = (
+        self.client.table("match_issues")
+        .select("id", count="exact")
+        .eq("match_id", match_id)
+        .eq("status", "open")
+        .limit(1)
+        .execute()
+    )
+    return (res.count or 0) > 0
+
+
+def _create_match_issue(self: Database, match_id: int, reported_by: int, reason: str,
+                         detail_text: str | None = None, round_number: int | None = None) -> dict:
+    payload = {"match_id": match_id, "reported_by": reported_by, "reason": reason,
+               "detail_text": detail_text, "round_number": round_number}
+    return self.client.table("match_issues").insert(payload).execute().data[0]
+
+
+def _resolve_match_issue(self: Database, issue_id: int, resolved_by: int, resolution_note: str | None = None) -> dict:
+    payload = {"status": "resolved", "resolved_by": resolved_by, "resolved_at": "now()", "resolution_note": resolution_note}
+    return self.client.table("match_issues").update(payload).eq("id", issue_id).execute().data[0]
+
+
+def _get_match_issue(self: Database, issue_id: int) -> Optional[dict]:
+    res = self.client.table("match_issues").select("*").eq("id", issue_id).execute()
+    return res.data[0] if res.data else None
+
+
+def _get_open_issues_for_match(self: Database, match_id: int) -> list[dict]:
+    return self.client.table("match_issues").select("*").eq("match_id", match_id).eq("status", "open").execute().data
+
+
+def _get_overdue_pending_matches(self: Database, now_iso: str) -> list[dict]:
+    """Matches for the auto-approve sweep: still pending_verification,
+    deadline has passed. The open-issue check happens separately (via
+    has_open_issue) rather than as a join here, since it needs to run
+    again right before each approve call anyway to avoid a race between
+    the sweep reading this list and a correction being filed a moment
+    later — see match.py's sweep task."""
+    return (
+        self.client.table("matches")
+        .select("*")
+        .eq("status", "pending_verification")
+        .not_.is_("approval_deadline", "null")
+        .lte("approval_deadline", now_iso)
+        .execute()
+        .data
+    )
+
+
+def _set_approval_deadline(self: Database, match_id: int, deadline_iso: str) -> dict:
+    return self.client.table("matches").update({"approval_deadline": deadline_iso}).eq("id", match_id).execute().data[0]
+
+
+def _get_match_screenshot(self: Database, match_id: int, round_number: int) -> Optional[dict]:
+    res = (
+        self.client.table("match_screenshots")
+        .select("*")
+        .eq("match_id", match_id)
+        .eq("round_number", round_number)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _correct_match_round_result(self: Database, row_id: int, position: int, is_mvp: bool, mmr_delta: int) -> dict:
+    payload = {"position": position, "is_mvp": is_mvp, "mmr_delta": mmr_delta}
+    return self.client.table("match_round_results").update(payload).eq("id", row_id).execute().data[0]
+
+
 Database.get_players_by_ids = _get_players_by_ids
 Database.upsert_match_screenshot = _upsert_match_screenshot
 Database.replace_match_round_results = _replace_match_round_results
 Database.get_match_round_results = _get_match_round_results
 Database.approve_ro3_match = _approve_ro3_match
+Database.has_open_issue = _has_open_issue
+Database.create_match_issue = _create_match_issue
+Database.resolve_match_issue = _resolve_match_issue
+Database.get_match_issue = _get_match_issue
+Database.get_open_issues_for_match = _get_open_issues_for_match
+Database.get_overdue_pending_matches = _get_overdue_pending_matches
+Database.set_approval_deadline = _set_approval_deadline
+Database.get_match_screenshot = _get_match_screenshot
+Database.correct_match_round_result = _correct_match_round_result

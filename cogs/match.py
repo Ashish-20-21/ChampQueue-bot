@@ -4,15 +4,20 @@ import asyncio
 import difflib
 import re
 from collections import Counter
+from datetime import timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
+import logging
 from database.db import adb
 from services import localization, mmr_engine, validation, vision_extraction
 from utils.embeds import ro3_result_card, ro3_verification_card
+from utils.permissions import is_admin
+
+logger = logging.getLogger(__name__)
 
 
 _INTEGER_FIELDS = ("position", "kills", "deaths", "assists", "score")
@@ -64,6 +69,121 @@ class HostApprovalView(discord.ui.View):
     @discord.ui.button(label="Approve Result", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
         await self.cog.approve_result(interaction, self.match_id)
+
+
+class IssueResolveModal(discord.ui.Modal, title="Resolve Issue"):
+    note = discord.ui.TextInput(label="Resolution note (optional)", required=False, max_length=300, style=discord.TextStyle.paragraph)
+
+    def __init__(self, cog: "Match", issue_id: int, original_message: discord.Message):
+        super().__init__()
+        self.cog = cog
+        self.issue_id = issue_id
+        self.original_message = original_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._finish_resolving_issue(interaction, self.issue_id, self.original_message, self.note.value or None)
+
+
+class IssueResolveButton(discord.ui.DynamicItem[discord.ui.Button], template=r"issue_resolve:(?P<issue_id>[0-9]+)"):
+    """Attached to every intake-channel post — one button, works for any
+    issue reason (informational or correction). Admin-only via the same
+    permission role check the rest of the admin surface uses.
+
+    Uses DynamicItem (discord.py 2.4+) instead of a plain View button:
+    the custom_id embeds issue_id and gets regex-matched, so this stays
+    clickable for issues created long after the bot process that's
+    currently running was started — a restart doesn't quietly break old
+    Resolve buttons, no per-instance bot.add_view() registration needed.
+    Registered once, generically, in setup() below.
+    """
+
+    def __init__(self, issue_id: int):
+        super().__init__(
+            discord.ui.Button(label="Resolve", style=discord.ButtonStyle.success, custom_id=f"issue_resolve:{issue_id}")
+        )
+        self.issue_id = issue_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["issue_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Only admins can resolve reports.", ephemeral=True)
+            return
+        cog = interaction.client.get_cog("Match")
+        await interaction.response.send_modal(IssueResolveModal(cog, self.issue_id, interaction.message))
+
+
+class IssueResolveView(discord.ui.View):
+    """Thin wrapper so call sites can keep doing view=IssueResolveView(cog, issue_id)
+    without needing to know about DynamicItem internals."""
+
+    def __init__(self, cog: "Match", issue_id: int):
+        super().__init__(timeout=None)
+        self.add_item(IssueResolveButton(issue_id))
+
+
+class CorrectionReasonView(discord.ui.View):
+    """Case A (before approve): full reason set. Case B (already approved,
+    "approved by mistake"): a single, narrower reason — filed after the
+    fact means the host is flagging their own approval, not the data
+    itself, so it doesn't need the same options."""
+
+    def __init__(self, cog: "Match", match_id: int, host_player_id: int, already_approved: bool):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.match_id = match_id
+        self.host_player_id = host_player_id
+        self.already_approved = already_approved
+
+        if already_approved:
+            options = [discord.SelectOption(label="Approved by mistake", value="approved_by_mistake")]
+        else:
+            options = [
+                discord.SelectOption(label="Player stat correction needed", value="stat_correction"),
+                discord.SelectOption(label="Result issue (map, score, roster, etc.)", value="result_issue"),
+            ]
+        select = discord.ui.Select(placeholder="Choose a reason", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        reason = interaction.data["values"][0]
+        await interaction.response.send_modal(CorrectionDetailModal(self.cog, self.match_id, self.host_player_id, reason))
+
+
+class CorrectionDetailModal(discord.ui.Modal, title="Correction Details"):
+    detail = discord.ui.TextInput(label="Anything specific? (optional)", required=False, max_length=500, style=discord.TextStyle.paragraph)
+
+    def __init__(self, cog: "Match", match_id: int, host_player_id: int, reason: str):
+        super().__init__()
+        self.cog = cog
+        self.match_id = match_id
+        self.host_player_id = host_player_id
+        self.reason = reason
+
+    async def on_submit(self, interaction: discord.Interaction):
+        issue = await adb.create_match_issue(self.match_id, self.host_player_id, self.reason, self.detail.value or None)
+        match = await adb.get_match(self.match_id)
+
+        intake_channel = self.cog.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID) if config.ISSUE_INTAKE_CHANNEL_ID else None
+        if intake_channel:
+            try:
+                embed = discord.Embed(
+                    title=f"Match {match['match_id']} — host-filed correction request",
+                    description=self.detail.value or "(no additional detail provided)",
+                    color=discord.Color.orange(),
+                )
+                embed.add_field(name="Reason", value=self.reason)
+                embed.add_field(name="Issue ID", value=str(issue["id"]))
+                await intake_channel.send(embed=embed, view=IssueResolveView(self.cog, issue["id"]))
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.send_message(
+            "Thanks for flagging it — sent to admin review, we'll notify you once it's resolved.", ephemeral=True
+        )
 
 
 class MatchSubmitModal(discord.ui.Modal, title="Submit Match Results"):
@@ -121,6 +241,31 @@ class Match(commands.Cog):
             return True
         return interaction.channel_id == config.RESULT_UPLOAD_CHANNEL_ID
 
+    @app_commands.command(name="correction-result", description="Host: flag a problem with this match's result before or after approval")
+    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
+    @app_commands.checks.cooldown(1, config.CORRECTION_COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.channel_id))
+    async def correction_result(self, interaction: discord.Interaction, match_id: str):
+        match = await adb.get_match_by_code(match_id)
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+        if not player or match.get("room_code_shared_by") != player["id"]:
+            await interaction.response.send_message("Only the Match Host can file a correction request for this match.", ephemeral=True)
+            return
+        if match["status"] not in ("pending_verification", "awaiting_review", "completed"):
+            await interaction.response.send_message("This match doesn't have a submitted result yet — nothing to correct.", ephemeral=True)
+            return
+
+        # Case B: host already approved (status == completed) — shorter,
+        # "approved by mistake" framing rather than the full reason set.
+        already_approved = match["status"] == "completed"
+        await interaction.response.send_message(
+            "What's the issue?" if not already_approved else "Since this was already approved — what happened?",
+            view=CorrectionReasonView(self, match["id"], player["id"], already_approved),
+            ephemeral=True,
+        )
+
     async def _approval_channel(self) -> discord.abc.Messageable | None:
         if not config.RESULT_APPROVAL_CHANNEL_ID:
             return None
@@ -151,6 +296,65 @@ class Match(commands.Cog):
         await adb.update_match(match["id"], {"room_code": code, "status": "awaiting_result"})
         await interaction.response.send_message(f"Room code for **{match_id}** set. Play all three rounds, then upload the scoreboards.")
 
+    async def _route_to_review(self, match: dict, player_id: int | None, reason: str, technical_detail: str) -> None:
+        """Every failure path funnels through here: match status flips to
+        awaiting_review, the full technical detail goes to the intake
+        channel (for admins) as a match_issues row, and the player only
+        ever sees a short, reassuring message — never the raw reasons
+        list. reason must be one of match_issues' allowed reason values."""
+        await adb.update_match(match["id"], {"status": "awaiting_review"})
+        issue = await adb.create_match_issue(match["id"], player_id or match.get("room_code_shared_by"), reason, technical_detail)
+        intake_channel = self.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID) if config.ISSUE_INTAKE_CHANNEL_ID else None
+        if intake_channel:
+            try:
+                await intake_channel.send(
+                    embed=discord.Embed(
+                        title=f"Match {match['match_id']} — needs review",
+                        description=_truncate_for_discord("", [technical_detail]),
+                        color=discord.Color.orange(),
+                    ).add_field(name="Reason", value=reason).add_field(name="Issue ID", value=str(issue["id"])),
+                    view=IssueResolveView(self, issue["id"]),
+                )
+            except discord.HTTPException:
+                pass
+
+    @staticmethod
+    def _friendly_review_message() -> str:
+        return (
+            "Thanks for uploading — we hit a snag reading one of the scoreboards, so this has been "
+            "sent to admin review. No action needed on your end; we'll ping you once it's sorted and "
+            "the leaderboard's updated. Appreciate the patience! 🙏"
+        )
+
+    async def _finish_resolving_issue(self, interaction: discord.Interaction, issue_id: int,
+                                       original_message: discord.Message, note: str | None) -> None:
+        admin_player = await adb.get_player_by_discord_id(interaction.user.id)
+        issue = await adb.resolve_match_issue(issue_id, admin_player["id"] if admin_player else None, note)
+        reporter = await adb.get_players_by_ids([issue["reported_by"]])
+        reporter_discord_id = reporter[0]["discord_id"] if reporter else None
+
+        # Edit the intake message in place rather than deleting it, so the
+        # channel stays a readable history of what came in and what happened.
+        try:
+            resolved_embed = original_message.embeds[0]
+            resolved_embed.color = discord.Color.green()
+            resolved_embed.add_field(name="Status", value=f"✅ Resolved by {interaction.user.mention}" + (f" — {note}" if note else ""))
+            await original_message.edit(embed=resolved_embed, view=None)
+        except (discord.HTTPException, IndexError):
+            pass
+
+        outbound_channel = self.bot.get_channel(config.ISSUE_RESOLVED_CHANNEL_ID) if config.ISSUE_RESOLVED_CHANNEL_ID else None
+        if outbound_channel:
+            mention = f"<@{reporter_discord_id}>" if reporter_discord_id else "player"
+            try:
+                await outbound_channel.send(
+                    f"✅ {mention} — your match report's been reviewed and sorted. Leaderboard's up to date. Thanks for flagging it!"
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.send_message("Marked resolved.", ephemeral=True)
+
     @app_commands.command(name="match-submit", description="Host upload of all three RO3 scoreboard screenshots")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
@@ -165,8 +369,20 @@ class Match(commands.Cog):
 
         match = await adb.get_match_by_code(match_id)
         player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not match or match.get("status") != "awaiting_result":
-            await interaction.response.send_message("Match not found or not awaiting its three scoreboards.", ephemeral=True)
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+        if match.get("status") != "awaiting_result":
+            if match["status"] in ("pending_verification", "awaiting_review", "completed"):
+                await interaction.response.send_message(
+                    "This match's results were already submitted. If something looks wrong, "
+                    "contact an admin rather than resubmitting.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "This match isn't ready for scoreboard submission yet — make sure the room code has been shared first.",
+                    ephemeral=True,
+                )
             return
         if not player or match.get("room_code_shared_by") != player["id"]:
             await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
@@ -183,8 +399,8 @@ class Match(commands.Cog):
 
         maps = match.get("map_pool") or []
         if len(maps) != 3:
-            await interaction.response.send_message("This match has no valid three-map announcement; it requires admin review.", ephemeral=True)
-            await adb.update_match(match["id"], {"status": "awaiting_review"})
+            await self._route_to_review(match, player["id"] if player else None, "result_issue", "match has no valid three-map announcement (map_pool missing or incomplete)")
+            await interaction.response.send_message(self._friendly_review_message(), ephemeral=True)
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
@@ -195,24 +411,31 @@ class Match(commands.Cog):
                 for image_bytes, attachment in zip(payloads, attachments)
             ))
         except Exception as exc:
-            await adb.update_match(match["id"], {"status": "awaiting_review"})
-            await interaction.followup.send(f"OCR failed ({exc}). This match has been routed to admin review.", ephemeral=True)
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", f"OCR/extraction raised an exception: {exc}")
+            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
         match_players = await adb.get_match_players(match["id"])
-        round_data, review_reasons = self._prepare_rounds(match_players, maps, extractions)
+        ordered_pairs, info_notes = self._reorder_pairs_by_map(maps, list(zip(extractions, attachments)))
+        ordered_extractions = [pair[0] for pair in ordered_pairs]
 
         # Preserve the raw OCR audit record for every submitted screenshot,
-        # even when one of them cannot safely be accepted.
+        # even when one of them cannot safely be accepted. Uses the
+        # reordered pairs so the stored round_number always matches what
+        # _prepare_rounds actually used for MMR — otherwise a reordered
+        # submission's audit trail would silently disagree with its own
+        # MMR calculation.
         await asyncio.gather(*(
             adb.upsert_match_screenshot(match["id"], number, attachment.url, player["id"], extraction,
                                          extraction.get("ocr_confidence"))
-            for number, (attachment, extraction) in enumerate(zip(attachments, extractions), start=1)
+            for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
 
+        round_data, review_reasons, _ = self._prepare_rounds(match_players, maps, ordered_extractions)
+
         if review_reasons:
-            await adb.update_match(match["id"], {"status": "awaiting_review"})
-            await interaction.followup.send(_truncate_for_discord("Submission routed to admin review: ", review_reasons), ephemeral=True)
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", _truncate_for_discord("Validation failed: ", review_reasons))
+            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
         # Each valid round is individually queryable immediately. These are
@@ -234,17 +457,18 @@ class Match(commands.Cog):
 
         validations = await asyncio.gather(*(
             validation.validate_submission(match["id"], extraction)
-            for extraction in extractions
+            for extraction in ordered_extractions
         ))
         flags = {pid: issues for result in validations for pid, issues in result["flags"].items()}
         if flags:
-            await adb.update_match(match["id"], {"status": "awaiting_review"})
             players = {item["id"]: item for item in await adb.get_players_by_ids(list(flags))}
             summary_parts = [f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items()]
-            await interaction.followup.send(_truncate_for_discord("Submission routed to admin review for stat validation: ", summary_parts), ephemeral=True)
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", _truncate_for_discord("Stat validation flagged: ", summary_parts))
+            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
-        await adb.update_match(match["id"], {"status": "pending_verification"})
+        deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
+        await adb.update_match(match["id"], {"status": "pending_verification", "approval_deadline": deadline})
 
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit
@@ -261,7 +485,11 @@ class Match(commands.Cog):
             )
             return
         await approval_channel.send(embed=ro3_verification_card(match, round_data), view=HostApprovalView(self, match["id"]))
-        await interaction.followup.send(f"Submitted. Check {approval_channel.mention} to approve once you've verified the rounds.", ephemeral=True)
+        note_suffix = f" ({'; '.join(info_notes)})" if info_notes else ""
+        await interaction.followup.send(
+            f"Submitted. Check {approval_channel.mention} to approve once you've verified the rounds.{note_suffix}",
+            ephemeral=True,
+        )
 
     async def start_submission(self, interaction: discord.Interaction, match_id: str):
         """Entry point from the persistent-panel modal. Discord modals
@@ -326,6 +554,37 @@ class Match(commands.Cog):
         return None, f"ambiguous — could be {display}"
 
     @staticmethod
+    def _reorder_pairs_by_map(maps: list[str], pairs: list[tuple[dict, "discord.Attachment"]]) -> tuple[list[tuple[dict, "discord.Attachment"]], list[str]]:
+        """Hosts upload 3 screenshots in whatever order they have the files
+        open, not necessarily the announced round order. Since each
+        extraction already carries its own detected map name, match each
+        (extraction, attachment) pair to the round whose announced map it
+        resolves to, rather than trusting attachment slot position.
+
+        Falls back to the original (positional) order — with no info note
+        — whenever map-based matching can't be done confidently: a map
+        that doesn't resolve to anything in the announced pool, two
+        screenshots resolving to the same map, or an announced map with no
+        matching screenshot at all. In those cases the existing per-round
+        map-mismatch check in _prepare_rounds will still catch and report
+        the problem — this function only handles the *good* case of
+        "right maps, wrong order" transparently.
+        """
+        resolved = [localization.resolve_map_name(str(ex.get("map") or "")) for ex, _ in pairs]
+        announced_upper = [m.upper() for m in maps]
+
+        if len(set(resolved)) != len(resolved) or any(r is None for r in resolved):
+            return pairs, []
+        if set(resolved) != set(announced_upper):
+            return pairs, []
+
+        by_map = dict(zip(resolved, pairs))
+        reordered = [by_map[m] for m in announced_upper]
+        if reordered == pairs:
+            return pairs, []
+        return reordered, ["screenshots were uploaded out of order — matched to rounds by detected map name instead"]
+
+    @staticmethod
     def _prepare_rounds(match_players: list[dict], maps: list[str], extractions: list[dict]) -> tuple[list[dict], list[str]]:
         roster = {mp["players"]["ign"].strip().lower(): mp for mp in match_players}
         rounds: list[dict] = []
@@ -384,6 +643,58 @@ class Match(commands.Cog):
             rounds.append({"round_number": round_number, "map_name": announced_map, "final_score": score, "results": results})
         return rounds, reasons
 
+    async def _run_post_approval_cleanup(self, guild: discord.Guild | None, match: dict) -> None:
+        """Shared by the manual Approve button and the auto-approve sweep.
+        Mirrors admin-scrap-match's pattern: VCs die immediately, text
+        channel gets a 1hr grace window via the existing cleanup sweep
+        (schedule_match_cleanup), same as an abandoned match, just without
+        changing status off "completed"."""
+        if not guild:
+            return
+        for vc_field in ("voice_channel_a_id", "voice_channel_b_id"):
+            vc_id = match.get(vc_field)
+            if not vc_id:
+                continue
+            vc = guild.get_channel(int(vc_id))
+            if vc:
+                try:
+                    await vc.delete(reason="Match approved and completed")
+                except discord.HTTPException:
+                    pass
+
+        cleanup_at = (discord.utils.utcnow() + timedelta(seconds=config.MATCH_CHANNEL_CLEANUP_DELAY_SECONDS)).isoformat()
+        await adb.schedule_match_cleanup(match["id"], cleanup_at)
+
+        text_channel_id = match.get("text_channel_id")
+        text_channel = guild.get_channel(int(text_channel_id)) if text_channel_id else None
+        if text_channel:
+            try:
+                await text_channel.send(
+                    "🏆 **GG — result's locked in.** MMR is updated, this channel closes in about an hour. "
+                    "Head back to the queue whenever you're ready for the next one."
+                )
+            except discord.HTTPException:
+                pass
+
+    async def _do_approve(self, guild: discord.Guild | None, match_id: int, approved_by_id: int) -> tuple[bool, str]:
+        """The one real approval path — used by the manual Approve button,
+        /admin-force-approve, and the auto-approve sweep. Returns
+        (success, message). The open-issue check happens here, right
+        before the RPC call, not earlier — filing a correction after a
+        sweep has already listed a match as "overdue" but before this
+        actually runs still correctly blocks it, since this is the last
+        check before anything is committed."""
+        if await adb.has_open_issue(match_id):
+            return False, "This match has an open correction request — approval is blocked until it's resolved."
+        try:
+            await adb.approve_ro3_match(match_id, approved_by_id)
+        except Exception as exc:
+            return False, f"Approval could not be committed safely: {exc}"
+
+        match = await adb.get_match(match_id)
+        await self._run_post_approval_cleanup(guild, match)
+        return True, "approved"
+
     async def approve_result(self, interaction: discord.Interaction, match_id: int):
         if config.RESULT_APPROVAL_CHANNEL_ID and interaction.channel_id != config.RESULT_APPROVAL_CHANNEL_ID:
             await interaction.response.send_message(
@@ -399,17 +710,66 @@ class Match(commands.Cog):
             await interaction.response.send_message("Only the Match Host can approve this result.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        try:
-            await adb.approve_ro3_match(match_id, player["id"])
-        except Exception as exc:
-            await interaction.followup.send(f"Approval could not be committed safely: {exc}", ephemeral=True)
+        success, message = await self._do_approve(interaction.guild, match_id, player["id"])
+        if not success:
+            await interaction.followup.send(message, ephemeral=True)
             return
         match = await adb.get_match(match_id)
         match_players, round_results = await asyncio.gather(adb.get_match_players(match_id), adb.get_match_round_results(match_id))
         await interaction.followup.send(embed=ro3_result_card(match, match_players, round_results, match.get("map_pool") or []))
+
+    @tasks.loop(seconds=config.APPROVAL_SWEEP_INTERVAL_SECONDS)
+    async def approval_sweep(self):
+        """DB-backed, not an in-memory per-match timer — deadline lives on
+        matches.approval_deadline, so a bot restart mid-window doesn't lose
+        track of anything, same reasoning as queue.py's cleanup_sweep. One
+        query covers however many matches happen to be overdue at once —
+        cost doesn't scale with concurrent match count."""
+        now_iso = discord.utils.utcnow().isoformat()
+        try:
+            overdue = await adb.get_overdue_pending_matches(now_iso)
+        except Exception:
+            logger.exception("approval_sweep: get_overdue_pending_matches failed")
+            return
+
+        guild = self.bot.get_guild(config.GUILD_ID)
+        for match in overdue:
+            # Re-check has_open_issue right here (inside _do_approve), not
+            # just at query time — a correction filed between the query
+            # above and this call still correctly blocks approval.
+            success, _ = await self._do_approve(guild, match["id"], match.get("room_code_shared_by"))
+            if not success:
+                continue  # blocked by an open issue, or the RPC itself rejected it — try again next sweep
+
+            text_channel_id = match.get("text_channel_id")
+            channel = guild.get_channel(int(text_channel_id)) if guild and text_channel_id else None
+            if channel:
+                try:
+                    await channel.send(
+                        "⏱️ **Auto-approved** — host didn't confirm within the review window, so this result "
+                        "went through automatically. Flag anything wrong with `/correction-result`."
+                    )
+                except discord.HTTPException:
+                    pass
+
+            approval_channel = self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID) if config.RESULT_APPROVAL_CHANNEL_ID else None
+            if approval_channel:
+                try:
+                    await approval_channel.send(
+                        f"⏱️ Match **{match['match_id']}** auto-approved — host didn't review within "
+                        f"{config.APPROVAL_TIMEOUT_SECONDS // 60} min. Worth a look if this keeps happening for the same host."
+                    )
+                except discord.HTTPException:
+                    pass
+
+    @approval_sweep.before_loop
+    async def before_approval_sweep(self):
+        await self.bot.wait_until_ready()
 
 
 async def setup(bot: commands.Bot):
     cog = Match(bot)
     await bot.add_cog(cog)
     bot.add_view(SubmissionPanelView(cog))
+    bot.add_dynamic_items(IssueResolveButton)
+    cog.approval_sweep.start()

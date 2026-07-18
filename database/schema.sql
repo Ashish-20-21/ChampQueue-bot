@@ -84,9 +84,11 @@ create table if not exists matches (
                             'awaiting_room', -- room code not yet shared
                             'in_progress',
                             'awaiting_result',
-                            'awaiting_review', -- flagged for admin review
+                            'pending_verification', -- 3 screenshots parsed clean, host reviewing before approve
+                            'awaiting_review', -- flagged for admin review (OCR/validation failure or open correction)
                             'completed',
-                            'cancelled'
+                            'cancelled',
+                            'abandoned'      -- scrapped via /admin-scrap-match (AFK etc.)
                         )),
     is_bootstrap      boolean not null default false, -- true = random assignment phase, excluded/weighted differently in analysis
     team_a_captain_id bigint references players(id),

@@ -658,17 +658,22 @@ class Queue(commands.Cog):
         # Rename both VCs to include the room code, once — not on every
         # correction, since Discord only allows 2 name/topic edits per 10
         # minutes per channel, and a fast +updateroomcode right after would
-        # burn that budget. VC name already carries the match ID from
-        # creation, so this is purely the "which room to jump into" cue.
+        # burn that budget.
         guild = channel.guild
-        for vc_field, label in (("voice_channel_a_id", "🛡️ Defender"), ("voice_channel_b_id", "⚔️ Attacker")):
+        for vc_field, label in (("voice_channel_a_id", "🛡️"), ("voice_channel_b_id", "⚔️")):
             vc_id = match.get(vc_field)
             if not vc_id:
                 continue
             vc = guild.get_channel(int(vc_id))
             if vc:
                 try:
-                    await vc.edit(name=f"{label} · {room_code}")
+                    # Was f"{label} · {room_code}" — completely replaced the
+                    # name, silently dropping the match_id that was there
+                    # from creation (🛡️ CQ-1234 -> 🛡️ Defender · 123456).
+                    # Now appends instead of replacing, so match_id survives
+                    # for players tracking multiple channels. Found via
+                    # live testing 2026-07-17.
+                    await vc.edit(name=f"{label} {match['match_id']} · {room_code}")
                 except discord.HTTPException as e:
                     logger.warning("Failed to rename VC %s with room code for match_id=%s: %s", vc_id, match_id, e)
 

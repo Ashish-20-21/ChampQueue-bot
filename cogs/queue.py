@@ -619,10 +619,12 @@ class Queue(commands.Cog):
         # happen while skill votes are still in progress on either team —
         # that's expected and fine, the two are independent (see
         # DECISIONS.md).
+        # if is_first_share:
+        #     await self._post_match_log(match["id"], code)
+        # else:
+        #     await self._update_match_log_room_code(match["id"], code)
         if is_first_share:
             await self._post_match_log(match["id"], code)
-        else:
-            await self._update_match_log_room_code(match["id"], code)
 
     async def _post_match_log(self, match_id: int, room_code: str) -> None:
         if not config.MATCH_LOG_CHANNEL_ID:
@@ -648,57 +650,57 @@ class Queue(commands.Cog):
         )
         embed.add_field(name="Mode", value="Hardpoint", inline=True)
         embed.add_field(name="Host", value=host["ign"] if host else "—", inline=True)
-        embed.add_field(name="Room ID", value=f"```{room_code}```", inline=False)
+        #embed.add_field(name="Room ID", value=f"```{room_code}```", inline=False)   ---- as we are storing in db no need to show in log channel, but later if required we can show removing this comment and uncommenting the above line will show the room code in log channel
         embed.add_field(name="🗺️ Maps", value=maps_display, inline=False)
         embed.add_field(name="🛡️ Defender", value="\n".join(team_a) or "—", inline=True)
         embed.add_field(name="⚔️ Attacker", value="\n".join(team_b) or "—", inline=True)
         msg = await channel.send(embed=embed)
-        await adb.update_match(match_id, {"match_log_message_id": str(msg.id)})
+        # await adb.update_match(match_id, {"match_log_message_id": str(msg.id)})
 
-        # Rename both VCs to include the room code, once — not on every
-        # correction, since Discord only allows 2 name/topic edits per 10
-        # minutes per channel, and a fast +updateroomcode right after would
-        # burn that budget.
-        guild = channel.guild
-        for vc_field, label in (("voice_channel_a_id", "🛡️"), ("voice_channel_b_id", "⚔️")):
-            vc_id = match.get(vc_field)
-            if not vc_id:
-                continue
-            vc = guild.get_channel(int(vc_id))
-            if vc:
-                try:
-                    # Was f"{label} · {room_code}" — completely replaced the
-                    # name, silently dropping the match_id that was there
-                    # from creation (🛡️ CQ-1234 -> 🛡️ Defender · 123456).
-                    # Now appends instead of replacing, so match_id survives
-                    # for players tracking multiple channels. Found via
-                    # live testing 2026-07-17.
-                    await vc.edit(name=f"{label} {match['match_id']} · {room_code}")
-                except discord.HTTPException as e:
-                    logger.warning("Failed to rename VC %s with room code for match_id=%s: %s", vc_id, match_id, e)
+        # # Rename both VCs to include the room code, once — not on every
+        # # correction, since Discord only allows 2 name/topic edits per 10
+        # # minutes per channel, and a fast +updateroomcode right after would
+        # # burn that budget.
+        # guild = channel.guild
+        # for vc_field, label in (("voice_channel_a_id", "🛡️"), ("voice_channel_b_id", "⚔️")):
+        #     vc_id = match.get(vc_field)
+        #     if not vc_id:
+        #         continue
+        #     vc = guild.get_channel(int(vc_id))
+        #     if vc:
+        #         try:
+        #             # Was f"{label} · {room_code}" — completely replaced the
+        #             # name, silently dropping the match_id that was there
+        #             # from creation (🛡️ CQ-1234 -> 🛡️ Defender · 123456).
+        #             # Now appends instead of replacing, so match_id survives
+        #             # for players tracking multiple channels. Found via
+        #             # live testing 2026-07-17.
+        #             await vc.edit(name=f"{label} {match['match_id']} · {room_code}")
+        #         except discord.HTTPException as e:
+        #             logger.warning("Failed to rename VC %s with room code for match_id=%s: %s", vc_id, match_id, e)
 
-    async def _update_match_log_room_code(self, match_id: int, new_code: str) -> None:
-        """Corrects the Room ID field on an already-posted log entry
-        instead of spamming a second entry — see _post_match_log."""
-        if not config.MATCH_LOG_CHANNEL_ID:
-            return
-        match = await adb.get_match(match_id)
-        log_msg_id = match.get("match_log_message_id")
-        channel = self.bot.get_channel(config.MATCH_LOG_CHANNEL_ID)
-        if not channel or not log_msg_id:
-            return
-        try:
-            msg = await channel.fetch_message(int(log_msg_id))
-        except (discord.NotFound, discord.HTTPException):
-            return
-        if not msg.embeds:
-            return
-        embed = msg.embeds[0]
-        for i, field in enumerate(embed.fields):
-            if field.name == "Room ID":
-                embed.set_field_at(i, name="Room ID", value=f"```{new_code}``` *(corrected)*", inline=False)
-                break
-        await msg.edit(embed=embed)
+    # async def _update_match_log_room_code(self, match_id: int, new_code: str) -> None:
+    #     """Corrects the Room ID field on an already-posted log entry
+    #     instead of spamming a second entry — see _post_match_log."""
+    #     if not config.MATCH_LOG_CHANNEL_ID:
+    #         return
+    #     match = await adb.get_match(match_id)
+    #     log_msg_id = match.get("match_log_message_id")
+    #     channel = self.bot.get_channel(config.MATCH_LOG_CHANNEL_ID)
+    #     if not channel or not log_msg_id:
+    #         return
+    #     try:
+    #         msg = await channel.fetch_message(int(log_msg_id))
+    #     except (discord.NotFound, discord.HTTPException):
+    #         return
+    #     if not msg.embeds:
+    #         return
+    #     embed = msg.embeds[0]
+    #     for i, field in enumerate(embed.fields):
+    #         if field.name == "Room ID":
+    #             embed.set_field_at(i, name="Room ID", value=f"```{new_code}``` *(corrected)*", inline=False)
+    #             break
+    #     await msg.edit(embed=embed)                  ---> same as mentioned above not required rightnow, but if required we can uncomment this and show the room code in log channel
 
     @app_commands.command(name="rc", description="Share or correct the room code for your match (host only)")
     @app_commands.describe(code="The in-game room code")

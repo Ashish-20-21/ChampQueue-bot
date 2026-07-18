@@ -100,7 +100,6 @@ def ro3_verification_card(match: dict, round_data: list[dict], extractions: list
 
     for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
         results = results_by_round.get(round_number, [])
-        delta_by_ign = {row["ign"].strip().lower(): row for row in results}
 
         players = sorted(extraction.get("players", []), key=lambda p: (p.get("team"), p.get("position", 9)))
         team_lines = {"A": [], "B": []}

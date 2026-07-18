@@ -171,7 +171,21 @@ class Database:
         _start_match_flow fails partway through (e.g. Discord channel
         creation error) so the 10 players aren't permanently stranded
         outside the queue with no way back in. Only flips rows that are
-        currently 'matched' back to 'waiting', scoped to these player_ids."""
+        currently 'matched' back to 'waiting', scoped to these player_ids.
+
+        Found live 2026-07-19: if any of these players already had a
+        stale leftover 'waiting' row (e.g. from earlier test-session
+        churn that never got cleaned up), flipping matched->waiting for
+        them collides with idx_queue_entries_one_waiting_per_player and
+        the WHOLE rollback fails — the exact players this function exists
+        to protect end up stuck in 'matched' with no path back into the
+        queue, worse than the original failure it was recovering from.
+        Since this is the safety net, it needs to be defensive: clear any
+        pre-existing waiting row for these specific players first, so the
+        update can never collide."""
+        self.client.table("queue_entries").delete().in_(
+            "player_id", player_ids
+        ).eq("status", "waiting").execute()
         self.client.table("queue_entries").update({"status": "waiting"}).in_(
             "player_id", player_ids
         ).eq("status", "matched").execute()

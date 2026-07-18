@@ -54,6 +54,27 @@ MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATC
 RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
 RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
 
+# --- Correction/review system ---
+# Intake: new match_issues rows post here (OCR failures routed automatically,
+# plus anything filed via /correction-result). Outbound: resolutions get
+# logged here with the player @mention, separate from intake so the two
+# don't get mixed together in one scrolling feed.
+ISSUE_INTAKE_CHANNEL_ID = int(os.getenv("ISSUE_INTAKE_CHANNEL_ID")) if os.getenv("ISSUE_INTAKE_CHANNEL_ID") else None
+ISSUE_RESOLVED_CHANNEL_ID = int(os.getenv("ISSUE_RESOLVED_CHANNEL_ID")) if os.getenv("ISSUE_RESOLVED_CHANNEL_ID") else None
+
+# How long a host has to Approve before the sweep auto-approves for them.
+# Deliberately short (not the old 3600s) — auto-approve exists as a
+# guardrail against a host going AFK after upload, not as the normal path.
+# An open match_issues row blocks both manual and auto approval either way,
+# so filing a correction is never raced by this timer.
+APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
+APPROVAL_SWEEP_INTERVAL_SECONDS = 30  # how often the sweep checks for overdue matches
+
+# How often a host/player can re-invoke /correction-result on the same
+# match — prevents spam/duplicate filing if multiple players in the same
+# match try to flag something around the same time.
+CORRECTION_COMMAND_COOLDOWN_SECONDS = 8
+
 # How often the abandoned/completed-match channel cleanup sweep runs.
 # Independent of the 1hr cleanup delay itself — this just controls how
 # often the bot checks "is anything due yet".

@@ -52,7 +52,7 @@ class Registration(commands.Cog):
         if existing:
             await interaction.response.send_message(
                 f"You're already registered as **{existing['ign']}** (status: `{existing['status']}`). "
-                f"Use `/update-ign` if you need to change your display name.",
+                f"Contact an admin if you need your IGN updated.",
                 ephemeral=True,
             )
             return
@@ -119,14 +119,10 @@ class Registration(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="update-ign", description="Update your display IGN (your career stats stay attached to your UID)")
-    async def update_ign(self, interaction: discord.Interaction, new_ign: str):
-        player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not player:
-            await interaction.response.send_message("You're not registered yet — use `/register` first.", ephemeral=True)
-            return
-        await adb.update_ign(player["id"], new_ign)
-        await interaction.response.send_message(f"IGN updated to **{new_ign}**. Your stats and history are unaffected.", ephemeral=True)
+    # /update-ign removed — IGN changes now go through admin contact
+    # rather than self-service, per 2026-07-17 planning session.
+    # adb.update_ign(...) is left in db.py for admin tooling to call
+    # directly if a slash command for that gets built later.
 
     @app_commands.command(name="whoami", description="Check your registration status")
     async def whoami(self, interaction: discord.Interaction):

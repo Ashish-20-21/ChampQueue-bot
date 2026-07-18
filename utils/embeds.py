@@ -83,7 +83,11 @@ def ro3_verification_card(match: dict, round_data: list[dict]) -> discord.Embed:
     """Host-facing verification card: one independently readable block/map."""
     embed = discord.Embed(
         title=f"Match {match['match_id']} — RO3 Verification",
-        description="Review all three rounds. Only the Match Host can approve this result.",
+        description=(
+            "Review all three rounds. Only the Match Host can approve this result. "
+            "**MMR values below are proposed** — nothing is applied to anyone's actual "
+            "MMR or the leaderboard until Approve is clicked."
+        ),
         color=discord.Color.gold(),
     )
     for round_info in sorted(round_data, key=lambda item: item["round_number"]):

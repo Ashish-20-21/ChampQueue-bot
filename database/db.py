@@ -7,12 +7,51 @@ psycopg2/asyncpg later if you ever outgrow it.
 
 from __future__ import annotations
 import asyncio
+import logging
 import random
 import string
 from typing import Any, Optional
 
+import httpx
 from supabase import create_client, Client
 import config
+
+logger = logging.getLogger("champions_queue")
+
+# Transient transport-layer failures worth a retry — NOT application errors
+# (bad payload, schema mismatch, permission denied). Found live 2026-07-19,
+# twice in one session, hitting two different unrelated DB calls
+# (match_round_results write, then player_recent_matches read) — this is
+# a real, recurring characteristic of the Supabase connection under this
+# session's load, not a one-off fluke worth a narrow one-off fix.
+_RETRYABLE_EXCEPTIONS = (httpx.RemoteProtocolError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
+
+
+async def with_retry(coro_fn, *args, attempts: int = 3, base_delay: float = 0.5, **kwargs):
+    """Runs coro_fn(*args, **kwargs), retrying on _RETRYABLE_EXCEPTIONS only.
+    Anything else (a real application error) propagates immediately on the
+    first attempt — retrying those would just delay a failure that retrying
+    can't fix, and could mask a genuine bug behind a few seconds of silence.
+    Delay backs off linearly (0.5s, 1s) rather than instantly hammering a
+    connection that may still be recovering.
+
+    Shared across modules (match.py, validation.py, ...) rather than
+    reimplemented per-caller — the underlying fault is at the DB/transport
+    layer, so the fix belongs here, not duplicated at every call site that
+    happens to get hit by it."""
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                logger.warning(
+                    "Transient network error on attempt %d/%d for %s: %r — retrying in %.1fs",
+                    attempt + 1, attempts, getattr(coro_fn, "__name__", coro_fn), exc, base_delay * (attempt + 1),
+                )
+                await asyncio.sleep(base_delay * (attempt + 1))
+    raise last_exc
 
 
 class Database:

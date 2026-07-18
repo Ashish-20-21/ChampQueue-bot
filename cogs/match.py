@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 
 import config
 import logging
-from database.db import adb
+from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
 from utils.embeds import ro3_result_card, ro3_verification_card
 from utils.permissions import is_admin
@@ -42,38 +42,6 @@ _HILL_TIME_RE = re.compile(r"^\d+(\.\d+)?$")
 _SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
 _DISCORD_MESSAGE_LIMIT = 2000
 _DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
-
-# Transient transport-layer failures worth a retry — NOT application errors
-# (bad payload, schema mismatch, permission denied). Found live 2026-07-19:
-# an httpx.RemoteProtocolError (HTTP/2 COMPRESSION_ERROR — a connection-level
-# fault, unrelated to our request) crashed a match_round_results write
-# mid-submission. The DB operation itself had actually already succeeded
-# server-side by the time the error surfaced client-side, confirmed via the
-# log — this is exactly the class of "the network blinked, the request was
-# fine" failure a short retry is for, not a bug in our code to chase.
-_RETRYABLE_EXCEPTIONS = (httpx.RemoteProtocolError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
-
-
-async def _with_retry(coro_fn, *args, attempts: int = 3, base_delay: float = 0.5, **kwargs):
-    """Runs coro_fn(*args, **kwargs), retrying on _RETRYABLE_EXCEPTIONS only.
-    Anything else (a real application error) propagates immediately on the
-    first attempt — retrying those would just delay a failure that retrying
-    can't fix, and could mask a genuine bug behind a few seconds of silence.
-    Delay backs off linearly (0.5s, 1s) rather than instantly hammering a
-    connection that may still be recovering."""
-    last_exc = None
-    for attempt in range(attempts):
-        try:
-            return await coro_fn(*args, **kwargs)
-        except _RETRYABLE_EXCEPTIONS as exc:
-            last_exc = exc
-            if attempt < attempts - 1:
-                logger.warning(
-                    "Transient network error on attempt %d/%d for %s: %r — retrying in %.1fs",
-                    attempt + 1, attempts, getattr(coro_fn, "__name__", coro_fn), exc, base_delay * (attempt + 1),
-                )
-                await asyncio.sleep(base_delay * (attempt + 1))
-    raise last_exc
 
 
 def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ", limit: int = _DISCORD_MESSAGE_LIMIT) -> str:
@@ -382,7 +350,7 @@ class Match(commands.Cog):
 
         admin_player = await adb.get_player_by_discord_id(interaction.user.id)
         issue = await adb.resolve_match_issue(issue_id, admin_player["id"] if admin_player else None, note)
-        reporter = await adb.get_players_by_ids([issue["reported_by"]])
+        reporter = await with_retry(adb.get_players_by_ids, [issue["reported_by"]])
         reporter_discord_id = reporter[0]["discord_id"] if reporter else None
 
         # Edit the intake message in place rather than deleting it, so the
@@ -490,7 +458,7 @@ class Match(commands.Cog):
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
-        match_players = await adb.get_match_players(match["id"])
+        match_players = await with_retry(adb.get_match_players, match["id"])
         ordered_pairs, info_notes = self._reorder_pairs_by_map(maps, list(zip(extractions, attachments)))
         ordered_extractions = [pair[0] for pair in ordered_pairs]
 
@@ -501,7 +469,7 @@ class Match(commands.Cog):
         # submission's audit trail would silently disagree with its own
         # MMR calculation.
         await asyncio.gather(*(
-            _with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, player["id"], extraction,
+            with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, player["id"], extraction,
                         extraction.get("ocr_confidence"))
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
@@ -525,7 +493,7 @@ class Match(commands.Cog):
         # this wasn't stripped first. Strip it only for the DB payload; the
         # embed still gets the full row with discord_id intact via round_data.
         await asyncio.gather(*(
-            _with_retry(
+            with_retry(
                 adb.replace_match_round_results,
                 match["id"], item["round_number"],
                 [{k: v for k, v in row.items() if k != "discord_id"} for row in item["results"]],
@@ -539,14 +507,14 @@ class Match(commands.Cog):
         ))
         flags = {pid: issues for result in validations for pid, issues in result["flags"].items()}
         if flags:
-            players = {item["id"]: item for item in await adb.get_players_by_ids(list(flags))}
+            players = {item["id"]: item for item in await with_retry(adb.get_players_by_ids, list(flags))}
             summary_parts = [f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items()]
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", "Stat validation flagged: " + "; ".join(summary_parts))
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
         deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
-        await adb.update_match(match["id"], {"status": "pending_verification", "approval_deadline": deadline})
+        await with_retry(adb.update_match, match["id"], {"status": "pending_verification", "approval_deadline": deadline})
 
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit

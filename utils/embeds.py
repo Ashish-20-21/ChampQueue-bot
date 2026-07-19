@@ -93,26 +93,41 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     actually maps to. Same bug, same fix as region_leaderboard() in
     migration_007 — that one derives it in SQL since it's a set-based
     query; here it's a single row, so the existing Python function is
-    the simpler fix, no SQL duplication needed."""
+    the simpler fix, no SQL duplication needed.
+
+    Layout: 2 fields per row, FORCED via an invisible zero-width spacer
+    field after every pair. Discord's client packs inline fields
+    greedily based on available render width, not on add_field() call
+    order — three short fields (e.g. Region/MMR/MVPs) will happily share
+    one row on a wide screen even if they were added as separate pairs
+    in code. Confirmed live 2026-07-19: the "2 per row" fix in the
+    previous version still rendered as 3-then-3 on a real Discord
+    client. A spacer field with a zero-width-space value and no name
+    forces a hard row break after each real pair, which is the only
+    reliable way to control this without going non-inline (which would
+    stack everything in one column instead)."""
     rank, _ = mmr_engine.derive_rank(player["mmr"])
     embed = discord.Embed(
         title=f"{player['ign']} — {rank}",
         color=discord.Color.gold(),
     )
-    embed.add_field(name="Region", value=player.get("region", "—"), inline=True)
-    embed.add_field(name="MMR", value=f"{player['mmr']} (peak {player['peak_mmr']})", inline=True)
-    embed.add_field(name="MVPs", value=str(player["mvp_count"]), inline=True)
+
+    def _pair(name1, value1, name2, value2):
+        embed.add_field(name=name1, value=value1, inline=True)
+        embed.add_field(name=name2, value=value2, inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # forces row break
+
+    _pair("Region", player.get("region", "—"), "MMR", f"{player['mmr']} (peak {player['peak_mmr']})")
 
     deaths = player["avg_deaths"] or 0
     kd = round(player["avg_kills"] / deaths, 2) if deaths else float(player["avg_kills"])
-    embed.add_field(name="KD", value=f"{kd:.2f}", inline=True)
-    embed.add_field(name="Avg obj time", value=f"{player['avg_hill_time']}s", inline=True)
-    embed.add_field(name="Total assists", value=str(player["total_assists"]), inline=True)
+    _pair("MVPs", str(player["mvp_count"]), "KD", f"{kd:.2f}")
+
+    _pair("Avg obj time", f"{player['avg_hill_time']}s", "Total assists", str(player["total_assists"]))
 
     total = player["total_matches"]
     wr = f"{(player['wins'] / (player['wins'] + player['losses']) * 100):.1f}%" if (player['wins'] + player['losses']) else "—"
-    embed.add_field(name="Total matches", value=str(total), inline=True)
-    embed.add_field(name="Record (rounds)", value=f"{player['wins']}W - {player['losses']}L ({wr})", inline=True)
+    _pair("Total matches", str(total), "Record (rounds)", f"{player['wins']}W - {player['losses']}L ({wr})")
 
     badges = _badge_lines(player["id"], weekly)
     if badges:

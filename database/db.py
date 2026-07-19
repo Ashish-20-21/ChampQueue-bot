@@ -601,6 +601,45 @@ def _correct_match_round_result(self: Database, row_id: int, position: int, is_m
     return self.client.table("match_round_results").update(payload).eq("id", row_id).execute().data[0]
 
 
+def _replace_match_player_stats(self: Database, match_id: int, round_number: int,
+                                 stats_rows: list[dict]) -> list[dict]:
+    """Same delete-then-insert shape as replace_match_round_results —
+    naturally idempotent, safe to retry blindly. See P6 migration for
+    why this table exists: raw per-round stats were being validated in
+    _prepare_rounds and then discarded instead of persisted."""
+    self.client.table("match_player_stats").delete().eq("match_id", match_id).eq("round_number", round_number).execute()
+    if not stats_rows:
+        return []
+    payload = [{**row, "match_id": match_id, "round_number": round_number} for row in stats_rows]
+    return self.client.table("match_player_stats").insert(payload).execute().data
+
+
+def _recompute_player_career_stats(self: Database, player_id: int) -> None:
+    """Calls the Postgres function of the same name — full recompute
+    from match_player_stats + match_round_results, not an increment.
+    Called once per player (10x per match) from match.py._do_approve,
+    right after approve_ro3_match succeeds."""
+    self.client.rpc("recompute_player_career_stats", {"p_player_id": player_id}).execute()
+
+
+def _region_leaderboard(self: Database, region: str) -> list[dict]:
+    """Full region roster, MMR-ordered, no LIMIT — deliberately separate
+    from the older leaderboard() method (still used as-is by digest.py,
+    not region-scoped, top-N only). This one is for the persistent
+    leaderboard panel: everyone registered in the region, growing as
+    registration adds more, per P6's confirmed scope (2026-07-19)."""
+    return self.client.rpc("region_leaderboard", {"p_region": region}).execute().data
+
+
+def _weekly_leaders(self: Database, region: str) -> dict[str, dict]:
+    """Returns {category: {"player_id": ..., "value": ...}} for the 5
+    weekly badge categories, region-scoped, one round-trip. A category
+    can be absent from the result (e.g. top_impact with zero impact data
+    this week) — callers must handle missing keys, not assume all 5."""
+    rows = self.client.rpc("weekly_leaders", {"p_region": region}).execute().data
+    return {row["category"]: {"player_id": row["player_id"], "value": row["value"]} for row in rows}
+
+
 Database.get_players_by_ids = _get_players_by_ids
 Database.upsert_match_screenshot = _upsert_match_screenshot
 Database.replace_match_round_results = _replace_match_round_results
@@ -615,3 +654,7 @@ Database.get_overdue_pending_matches = _get_overdue_pending_matches
 Database.set_approval_deadline = _set_approval_deadline
 Database.get_match_screenshot = _get_match_screenshot
 Database.correct_match_round_result = _correct_match_round_result
+Database.replace_match_player_stats = _replace_match_player_stats
+Database.recompute_player_career_stats = _recompute_player_career_stats
+Database.region_leaderboard = _region_leaderboard
+Database.weekly_leaders = _weekly_leaders

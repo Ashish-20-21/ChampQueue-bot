@@ -19,19 +19,30 @@ def calculate_mmr_change(position: int, won: bool, is_mvp: bool) -> int:
 
 
 def derive_rank(mmr: int) -> tuple[str, str]:
-    """Map non-negative MMR to the confirmed player-facing rank tier."""
+    """Map non-negative MMR to the confirmed player-facing rank tier.
+
+    IMPORTANT: this must stay in sync BY HAND with the identical CASE
+    chain inside approve_ro3_match() in
+    database/migration_006_p6_stats_and_ranks.sql. That SQL function is
+    the one that actually writes players.current_rank / peak_rank — this
+    Python function is used for display purposes elsewhere (e.g.
+    /rank-progress) and is not itself read by the approval path. There is
+    no single source of truth at the code level; if you change one,
+    change the other in the same commit. 150-point bands, confirmed
+    2026-07-19 (was 100-point bands through P5).
+    """
     mmr = max(0, mmr)
     tiers = (
-        (1000, "Titans"),
-        (900, "Legendary2"),
-        (800, "Legendary1"),
-        (700, "Grandmaster2"),
-        (600, "Grandmaster1"),
-        (500, "Master2"),
-        (400, "Master1"),
-        (300, "PRO2"),
-        (200, "PRO1"),
-        (100, "Elite2"),
+        (1501, "Titans"),
+        (1351, "Legendary2"),
+        (1201, "Legendary1"),
+        (1051, "Grandmaster2"),
+        (901, "Grandmaster1"),
+        (751, "Master2"),
+        (601, "Master1"),
+        (451, "PRO2"),
+        (301, "PRO1"),
+        (151, "Elite2"),
         (0, "Elite1"),
     )
     for floor, tier in tiers:

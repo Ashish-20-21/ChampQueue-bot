@@ -1,5 +1,7 @@
 import discord
 
+from services import mmr_engine
+
 
 def result_card(match: dict, match_players: list[dict]) -> discord.Embed:
     winner = match.get("winner_team")
@@ -48,6 +50,73 @@ def profile_card(player: dict, achievements: list[dict]) -> discord.Embed:
         names = ", ".join(a["achievements"]["name"] for a in achievements[:8])
         more = f" (+{len(achievements) - 8} more)" if len(achievements) > 8 else ""
         embed.add_field(name="Achievements", value=names + more, inline=False)
+    return embed
+
+
+# P6: badge display names + which weekly_leaders() category key each one
+# reads. Ordered by "impressiveness" — badge_lines() below shows the
+# first 1-2 a player actually holds, so this order is what gets shown
+# when someone holds several at once.
+_WEEKLY_BADGES = (
+    ("most_mvp", "🏆 Most MVP this week"),
+    ("top_kills", "🎯 Most kills this week"),
+    ("top_obj", "🚩 Most objective time this week"),
+    ("top_impact", "⚡ Highest impact this week"),
+    ("most_matches", "🎮 Most matches played this week"),
+)
+
+
+def _badge_lines(player_id: int, weekly: dict[str, dict], cap: int = 2) -> list[str]:
+    """Returns up to `cap` badge labels this player currently holds,
+    highest-priority first (see _WEEKLY_BADGES order). A player can only
+    ever show 1-2 badges even if they top every category, by design —
+    keeps the card from getting cluttered as more categories are added
+    later."""
+    held = [label for key, label in _WEEKLY_BADGES if weekly.get(key, {}).get("player_id") == player_id]
+    return held[:cap]
+
+
+def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
+    """The renamed, locked-field-set /player-stats card (P6, confirmed
+    2026-07-19). Always sent ephemeral by the calling command — see
+    cogs/stats.py. Fields, exact locked order: Name, Rank, Region, MMR
+    (+peak), MVPs, KD, Avg hill/obj time, Total assists, Total matches,
+    Record (W-L). Badges are computed live from weekly_leaders(), not
+    stored — see migration_007.
+
+    Rank is derived from mmr_engine.derive_rank(player['mmr']), NOT read
+    from player['current_rank']. Found live 2026-07-19: current_rank is
+    only ever written by approve_ro3_match at Approve time, so any player
+    whose current mmr didn't get there via a real approval (test seeding,
+    manual DB edits, leftover values from before a tier-band change) can
+    have a stored current_rank that disagrees with what their mmr number
+    actually maps to. Same bug, same fix as region_leaderboard() in
+    migration_007 — that one derives it in SQL since it's a set-based
+    query; here it's a single row, so the existing Python function is
+    the simpler fix, no SQL duplication needed."""
+    rank, _ = mmr_engine.derive_rank(player["mmr"])
+    embed = discord.Embed(
+        title=f"{player['ign']} — {rank}",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Region", value=player.get("region", "—"), inline=True)
+    embed.add_field(name="MMR", value=f"{player['mmr']} (peak {player['peak_mmr']})", inline=True)
+    embed.add_field(name="MVPs", value=str(player["mvp_count"]), inline=True)
+
+    deaths = player["avg_deaths"] or 0
+    kd = round(player["avg_kills"] / deaths, 2) if deaths else float(player["avg_kills"])
+    embed.add_field(name="KD", value=f"{kd:.2f}", inline=True)
+    embed.add_field(name="Avg obj time", value=f"{player['avg_hill_time']}s", inline=True)
+    embed.add_field(name="Total assists", value=str(player["total_assists"]), inline=True)
+
+    total = player["total_matches"]
+    wr = f"{(player['wins'] / (player['wins'] + player['losses']) * 100):.1f}%" if (player['wins'] + player['losses']) else "—"
+    embed.add_field(name="Total matches", value=str(total), inline=True)
+    embed.add_field(name="Record (rounds)", value=f"{player['wins']}W - {player['losses']}L ({wr})", inline=True)
+
+    badges = _badge_lines(player["id"], weekly)
+    if badges:
+        embed.add_field(name="This week", value="\n".join(badges), inline=False)
     return embed
 
 

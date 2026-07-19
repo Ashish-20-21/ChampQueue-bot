@@ -492,11 +492,24 @@ class Match(commands.Cog):
         # has no such column — confirmed live via a 400 PGRST204 error when
         # this wasn't stripped first. Strip it only for the DB payload; the
         # embed still gets the full row with discord_id intact via round_data.
+        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "mmr_delta", "team")
+        _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
         await asyncio.gather(*(
             with_retry(
                 adb.replace_match_round_results,
                 match["id"], item["round_number"],
-                [{k: v for k, v in row.items() if k != "discord_id"} for row in item["results"]],
+                [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in item["results"]],
+            )
+            for item in round_data
+        ))
+        # P6: raw per-round stats, written from the same round_data that
+        # was already assembled above — no re-extraction, no second OCR
+        # pass. See migration_006_p6_stats_and_ranks.sql.
+        await asyncio.gather(*(
+            with_retry(
+                adb.replace_match_player_stats,
+                match["id"], item["round_number"],
+                [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in item["results"]],
             )
             for item in round_data
         ))
@@ -681,9 +694,30 @@ class Match(commands.Cog):
                     reasons.append(f"round {round_number}: MVP flag is missing or invalid for {row.get('ign')}")
                     continue
                 is_mvp = row["is_mvp"]
+                # damage is deliberately excluded from _INTEGER_FIELDS (see
+                # module-level NOTE) — it can be legitimately absent or
+                # non-numeric when a screenshot's scoreboard view doesn't
+                # show a Damage column. Parse it defensively here rather
+                # than assuming it already passed a digit check.
+                raw_damage = str(row.get("damage", ""))
+                damage_value = int(raw_damage) if _INTEGER_RE.fullmatch(raw_damage) else None
+                # impact, like damage, is never validated by _INTEGER_FIELDS
+                # or any regex above — parse defensively rather than assume
+                # it's always a clean number.
+                raw_impact = str(row.get("impact", ""))
+                impact_value = float(raw_impact) if _HILL_TIME_RE.fullmatch(raw_impact) else None
                 results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
                                 "mmr_delta": mmr_engine.calculate_mmr_change(position, mp["team"] == winner, is_mvp),
-                                "team": mp["team"], "discord_id": mp["players"]["discord_id"]})
+                                "team": mp["team"], "discord_id": mp["players"]["discord_id"],
+                                # Raw stats, kept alongside the MMR/position outcome so
+                                # match_player_stats can be written from this same pass
+                                # instead of re-deriving it later (P6 — see
+                                # migration_006_p6_stats_and_ranks.sql).
+                                "kills": int(row["kills"]), "deaths": int(row["deaths"]),
+                                "assists": int(row["assists"]), "damage": damage_value,
+                                "hill_time": float(row["hill_time"]),
+                                "impact": impact_value,
+                                "score": int(row["score"])})
                 seen_players.add(mp["player_id"])
                 per_team[mp["team"]] += 1
             if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
@@ -741,6 +775,26 @@ class Match(commands.Cog):
             await adb.approve_ro3_match(match_id, approved_by_id)
         except Exception as exc:
             return False, f"Approval could not be committed safely: {exc}"
+
+        # P6: career-stat recompute, one call per player in this match.
+        # Deliberately AFTER the MMR commit above and wrapped so a
+        # recompute failure never rolls back or blocks an approval that
+        # has already landed — MMR is the authoritative, already-committed
+        # outcome; career stats (record/KD/avg damage/etc.) are a
+        # best-effort derived view and can be caught up later (e.g. by
+        # re-running recompute_player_career_stats for the affected
+        # player) without needing to touch matches or MMR at all.
+        match_players = await adb.get_match_players(match_id)
+        results = await asyncio.gather(
+            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
+            return_exceptions=True,
+        )
+        for mp, result in zip(match_players, results):
+            if isinstance(result, Exception):
+                logger.exception(
+                    "recompute_player_career_stats failed for player_id=%s after match_id=%s approval",
+                    mp["player_id"], match_id, exc_info=result,
+                )
 
         match = await adb.get_match(match_id)
         await self._run_post_approval_cleanup(guild, match)

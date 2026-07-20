@@ -599,6 +599,19 @@ class Queue(commands.Cog):
             await respond("Room codes can only be shared in a match channel.")
             return
 
+        # Digits-only, no fixed length enforced — every real room code
+        # observed so far is numeric (e.g. 123465, 412563), and rejecting
+        # here up front means a mistyped letter never reaches the DB at
+        # all, avoiding the extra +updateroomcode round-trip a host would
+        # otherwise need. Deliberately not locking to an exact digit
+        # count (e.g. "must be 6") since that's not been confirmed as a
+        # hard game rule — a stricter length check can be added later if
+        # a wrong-length code ever actually shows up in practice, rather
+        # than guessed at now.
+        if not code.isdigit():
+            await respond("Room code must be numbers only — check for a typo and try again.")
+            return
+
         match_code = channel.name.upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
@@ -675,27 +688,16 @@ class Queue(commands.Cog):
         msg = await channel.send(embed=embed)
         await adb.update_match(match_id, {"match_log_message_id": str(msg.id)})
 
-        # Rename both VCs to include the room code, once — not on every
-        # correction, since Discord only allows 2 name/topic edits per 10
-        # minutes per channel, and a fast +updateroomcode right after would
-        # burn that budget.
-        guild = channel.guild
-        for vc_field, label in (("voice_channel_a_id", "🛡️"), ("voice_channel_b_id", "⚔️")):
-            vc_id = match.get(vc_field)
-            if not vc_id:
-                continue
-            vc = guild.get_channel(int(vc_id))
-            if vc:
-                try:
-                    # Was f"{label} · {room_code}" — completely replaced the
-                    # name, silently dropping the match_id that was there
-                    # from creation (🛡️ CQ-1234 -> 🛡️ Defender · 123456).
-                    # Now appends instead of replacing, so match_id survives
-                    # for players tracking multiple channels. Found via
-                    # live testing 2026-07-17.
-                    await vc.edit(name=f"{label} {match['match_id']} · {room_code}")
-                except discord.HTTPException as e:
-                    logger.warning("Failed to rename VC %s with room code for match_id=%s: %s", vc_id, match_id, e)
+        # VC rename-with-room-code loop removed entirely (was here,
+        # renaming both VCs once on first room-code share). Room code is
+        # intentionally NOT shown in VC names — see DECISIONS.md: "a
+        # permanent... public log channel showing every match's room code
+        # meant anyone browsing history could walk into someone else's
+        # ongoing match." Found live 2026-07-20 still doing this despite
+        # that decision. VCs already get their correct name (label +
+        # match_id, no code) at creation time in _start_match_flow — with
+        # the room code excluded, there's nothing left for this function
+        # to rename.
 
     async def _update_match_log_room_code(self, match_id: int, new_code: str) -> None:
         """Corrects the Room ID field on an already-posted log entry

@@ -16,3 +16,4 @@ p5_integration_summary.txt
 vision_max_tokens_fix.patch
 test_vision.py
 __pycache__/
+logs/

@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import logging.handlers
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
@@ -7,7 +9,22 @@ from discord.ext import commands
 
 import config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# File handler alongside the existing stdout one — recommended in the
+# post-P6 architecture review (§6.3) since the bot currently runs as a
+# local `python bot.py` process, not under systemd/journald, meaning
+# anything only logged to stdout is lost the moment the terminal
+# session ends or scrolls past. RotatingFileHandler caps disk usage
+# (5MB x 3 backups = 15MB max) so this can't grow unbounded. Once this
+# actually moves under systemd for real hosting, journald makes this
+# redundant (not harmful, just unnecessary) — safe to leave either way.
+os.makedirs("logs", exist_ok=True)
+_file_handler = logging.handlers.RotatingFileHandler(
+    "logs/bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                     handlers=[logging.StreamHandler(), _file_handler])
 log = logging.getLogger("champions_queue")
 
 INTENTS = discord.Intents.default()

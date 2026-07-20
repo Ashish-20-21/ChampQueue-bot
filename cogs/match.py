@@ -370,13 +370,23 @@ class Match(commands.Cog):
 
         # Edit the intake message in place rather than deleting it, so the
         # channel stays a readable history of what came in and what happened.
+        # The resolve above (line 367) already succeeded — that's the real
+        # state change. This edit is cosmetic; if it fails, log it instead
+        # of silently swallowing the failure (found live 2026-07-20 — this
+        # was a bare `except: pass`, unlike every other write-then-visual-
+        # update spot in the codebase, which logs a warning so a stale-
+        # looking intake message can be correlated back to a real cause
+        # instead of looking like an unexplained UI glitch).
         try:
             resolved_embed = original_message.embeds[0]
             resolved_embed.color = discord.Color.green()
             resolved_embed.add_field(name="Status", value=f"✅ Resolved by {interaction.user.mention}" + (f" — {note}" if note else ""))
             await original_message.edit(embed=resolved_embed, view=None)
-        except (discord.HTTPException, IndexError):
-            pass
+        except (discord.HTTPException, IndexError) as e:
+            logger.warning(
+                "resolve_match_issue: failed to update intake message for issue_id=%s (resolution already saved): %s",
+                issue_id, e,
+            )
 
         outbound_channel = self.bot.get_channel(config.ISSUE_RESOLVED_CHANNEL_ID) if config.ISSUE_RESOLVED_CHANNEL_ID else None
         if outbound_channel:

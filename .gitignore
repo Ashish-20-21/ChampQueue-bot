@@ -8,6 +8,7 @@ services/__pycache__/
 utils/__pycache__/
 venv/
 __pycache__/
+*.py[cod]
 *.pyc
 DECISIONS.md
 p5-merge-test.bundle

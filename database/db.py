@@ -198,11 +198,12 @@ class Database:
         suffix = "".join(random.choices(string.digits, k=4))
         return f"CQ-{suffix}"
 
-    def create_match(self, is_bootstrap: bool, season_id: Optional[int] = None) -> dict:
+    def create_match(self, is_bootstrap: bool, region: str, season_id: Optional[int] = None) -> dict:
         payload = {
             "match_id": self.generate_match_id(),
             "status": "forming",
             "is_bootstrap": is_bootstrap,
+            "region": region,
             "season_id": season_id,
         }
         res = self.client.table("matches").insert(payload).execute()

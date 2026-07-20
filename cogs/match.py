@@ -230,9 +230,17 @@ class SubmissionPanelView(discord.ui.View):
     @discord.ui.button(label="Submit Match Results", style=discord.ButtonStyle.primary,
                         custom_id="match_submit_panel_button")
     async def submit(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if config.RESULT_UPLOAD_CHANNEL_ID and interaction.channel_id != config.RESULT_UPLOAD_CHANNEL_ID:
+        # Region-aware as of P6: this button has no match_id yet (that's
+        # entered in the modal that follows), so it can't know which
+        # region's upload channel is the "right" one — the real
+        # enforcement happens in match_submit() once match_id resolves to
+        # an actual match row and its region is known. Here we only check
+        # that the click happened in SOME configured upload channel
+        # (either region), as a basic sanity gate, not the final say.
+        configured = [c for c in config.RESULT_UPLOAD_CHANNEL_IDS.values() if c]
+        if configured and interaction.channel_id not in configured:
             await interaction.response.send_message(
-                "Match results can only be submitted in the configured result-upload channel.",
+                "Match results can only be submitted in your region's result-upload channel.",
                 ephemeral=True,
             )
             return
@@ -244,13 +252,16 @@ class Match(commands.Cog):
         self.bot = bot
         localization.load_map_translations()
 
-    def _in_upload_channel(self, interaction: discord.Interaction) -> bool:
-        # Fail open (not block) if the env var isn't set yet, so a missing
-        # config value doesn't brick the whole command for the server —
-        # matches the AFK_CHANNEL_ID / MATCH_LOG_CHANNEL_ID no-op pattern.
-        if not config.RESULT_UPLOAD_CHANNEL_ID:
+    def _in_upload_channel(self, interaction: discord.Interaction, region: str) -> bool:
+        # Fail open (not block) if neither the new per-region var nor the
+        # legacy fallback is set, so a missing config value doesn't brick
+        # the whole command — matches the AFK_CHANNEL_ID / MATCH_LOG_CHANNEL_ID
+        # no-op pattern. Region-aware as of P6: checks against THIS match's
+        # region, not one fixed global channel — see config.py comment for why.
+        channel_id = config.RESULT_UPLOAD_CHANNEL_IDS.get(region)
+        if not channel_id:
             return True
-        return interaction.channel_id == config.RESULT_UPLOAD_CHANNEL_ID
+        return interaction.channel_id == channel_id
 
     @app_commands.command(name="correction-result", description="Host: flag a problem with this match's result before or after approval")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
@@ -277,10 +288,14 @@ class Match(commands.Cog):
             ephemeral=True,
         )
 
-    async def _approval_channel(self) -> discord.abc.Messageable | None:
-        if not config.RESULT_APPROVAL_CHANNEL_ID:
+    async def _approval_channel(self, region: str) -> discord.abc.Messageable | None:
+        # Region-aware as of P6 — see config.py comment for why upload/
+        # approval specifically needed splitting while match-log/AFK/issue
+        # channels did not.
+        channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(region)
+        if not channel_id:
             return None
-        return self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID)
+        return self.bot.get_channel(channel_id)
 
     @app_commands.command(name="match-submit-post", description="Post the persistent match-results submission panel in this channel")
     @app_commands.checks.has_role(config.ADMIN_ROLE_ID)
@@ -380,18 +395,26 @@ class Match(commands.Cog):
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
                            screenshot_1: discord.Attachment, screenshot_2: discord.Attachment,
                            screenshot_3: discord.Attachment):
-        if not self._in_upload_channel(interaction):
-            channel_mention = f"<#{config.RESULT_UPLOAD_CHANNEL_ID}>"
+        # Region-aware as of P6: the channel check needs to know WHICH
+        # region's upload channel is correct, which means the match has to
+        # be fetched first — this is a deliberate reorder from the
+        # pre-P6 version, which checked the channel before knowing the
+        # match at all (harmless when there was only one global channel,
+        # broken once upload channels split by region).
+        match = await adb.get_match_by_code(match_id)
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+
+        if not self._in_upload_channel(interaction, match["region"]):
+            channel_id = config.RESULT_UPLOAD_CHANNEL_IDS.get(match["region"])
+            channel_mention = f"<#{channel_id}>" if channel_id else "your region's result-upload channel"
             await interaction.response.send_message(
                 f"Match results can only be submitted in {channel_mention}.", ephemeral=True
             )
             return
 
-        match = await adb.get_match_by_code(match_id)
         player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not match:
-            await interaction.response.send_message("Match not found.", ephemeral=True)
-            return
         if match.get("status") != "awaiting_result":
             if match["status"] in ("pending_verification", "awaiting_review", "completed"):
                 await interaction.response.send_message(
@@ -532,14 +555,14 @@ class Match(commands.Cog):
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit
         # happened to run.
-        approval_channel = await self._approval_channel()
+        approval_channel = await self._approval_channel(match["region"])
         if approval_channel is None:
             # Fail safe rather than fail silent — the match is validly at
             # pending_verification in the DB, but nobody can see the card
             # to approve it until this env var is set. Tell the uploader.
             await interaction.followup.send(
-                "Scoreboards accepted, but RESULT_APPROVAL_CHANNEL_ID isn't configured — "
-                "an admin needs to set it before this match can be approved.",
+                f"Scoreboards accepted, but the {match['region']} approval channel isn't configured — "
+                "an admin needs to set RESULT_APPROVAL_CHANNEL_ID_EAST/WEST before this match can be approved.",
                 ephemeral=True,
             )
             return
@@ -801,14 +824,21 @@ class Match(commands.Cog):
         return True, "approved"
 
     async def approve_result(self, interaction: discord.Interaction, match_id: int):
-        if config.RESULT_APPROVAL_CHANNEL_ID and interaction.channel_id != config.RESULT_APPROVAL_CHANNEL_ID:
+        # Region-aware as of P6 — same reorder as match_submit: fetch the
+        # match first so its region is known before checking the channel.
+        match = await adb.get_match(match_id)
+        if not match:
+            await interaction.response.send_message("This result is no longer awaiting host approval.", ephemeral=True)
+            return
+
+        approval_channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(match["region"])
+        if approval_channel_id and interaction.channel_id != approval_channel_id:
             await interaction.response.send_message(
-                "This result can only be approved in the configured result-approval channel.", ephemeral=True
+                "This result can only be approved in your region's result-approval channel.", ephemeral=True
             )
             return
-        match = await adb.get_match(match_id)
         player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not match or match.get("status") != "pending_verification":
+        if match.get("status") != "pending_verification":
             await interaction.response.send_message("This result is no longer awaiting host approval.", ephemeral=True)
             return
         if not player or match.get("room_code_shared_by") != player["id"]:
@@ -857,7 +887,8 @@ class Match(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-            approval_channel = self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID) if config.RESULT_APPROVAL_CHANNEL_ID else None
+            approval_channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(match["region"])
+            approval_channel = self.bot.get_channel(approval_channel_id) if approval_channel_id else None
             if approval_channel:
                 try:
                     await approval_channel.send(

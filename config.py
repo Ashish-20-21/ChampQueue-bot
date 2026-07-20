@@ -45,14 +45,39 @@ AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID")
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
 # --- P5: result upload + approval channels ---
-# Two separate channels by design: upload channel takes /match-submit (and
-# the persistent "Submit Match Results" button) only; approval channel is
-# where the host-facing verification card and the final result card are
-# posted, regardless of which channel the submission happened from. Same
-# optional-at-import pattern as AFK/MATCH_LOG above — features no-op with a
-# clear rejection message until these are set, bot doesn't crash on boot.
-RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
-RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
+# Region-aware as of P6 (2026-07-19) — found live: East/West are role-gated
+# so a player in one region literally cannot see the other's channels. A
+# single global RESULT_UPLOAD_CHANNEL_ID meant one entire region could
+# never run /match-submit at all — not a display bug, a hard block on the
+# core pipeline. Fixed by keying off the match's own `region` column
+# (every match already has one) instead of one fixed channel ID.
+#
+# MATCH_LOG_CHANNEL_ID / AFK_CHANNEL_ID / ISSUE_INTAKE_CHANNEL_ID /
+# ISSUE_RESOLVED_CHANNEL_ID deliberately stay single/general channels —
+# all four are bot-push-only (the bot posts an update, no player runs a
+# command from inside them), so a shared channel visible to both regions
+# is correct there, not a gap. Only upload + approval needed splitting,
+# because those are the two where a player/host must run a command from
+# inside the specific channel.
+RESULT_UPLOAD_CHANNEL_ID_EAST = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID_EAST")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID_EAST") else None
+RESULT_UPLOAD_CHANNEL_ID_WEST = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID_WEST")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID_WEST") else None
+RESULT_APPROVAL_CHANNEL_ID_EAST = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID_EAST")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID_EAST") else None
+RESULT_APPROVAL_CHANNEL_ID_WEST = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID_WEST")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID_WEST") else None
+
+RESULT_UPLOAD_CHANNEL_IDS = {"East": RESULT_UPLOAD_CHANNEL_ID_EAST, "West": RESULT_UPLOAD_CHANNEL_ID_WEST}
+RESULT_APPROVAL_CHANNEL_IDS = {"East": RESULT_APPROVAL_CHANNEL_ID_EAST, "West": RESULT_APPROVAL_CHANNEL_ID_WEST}
+
+# Deprecated single-channel fallback — kept ONLY so an existing .env from
+# before this change doesn't silently break on deploy (old var still sets
+# both regions to the same channel until you migrate to the _EAST/_WEST
+# pair above). Remove this block once RESULT_UPLOAD_CHANNEL_ID_EAST/WEST
+# are both actually set in your .env.
+_legacy_upload = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
+_legacy_approval = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
+if _legacy_upload and not (RESULT_UPLOAD_CHANNEL_ID_EAST or RESULT_UPLOAD_CHANNEL_ID_WEST):
+    RESULT_UPLOAD_CHANNEL_IDS = {"East": _legacy_upload, "West": _legacy_upload}
+if _legacy_approval and not (RESULT_APPROVAL_CHANNEL_ID_EAST or RESULT_APPROVAL_CHANNEL_ID_WEST):
+    RESULT_APPROVAL_CHANNEL_IDS = {"East": _legacy_approval, "West": _legacy_approval}
 
 # --- Correction/review system ---
 # Intake: new match_issues rows post here (OCR failures routed automatically,

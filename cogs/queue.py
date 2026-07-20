@@ -10,7 +10,7 @@ from discord.ext import commands, tasks
 
 import config
 from database.db import db, adb
-from services import matchmaking, reputation
+from services import matchmaking, mmr_engine, reputation
 from utils.permissions import admin_only
 
 logger = logging.getLogger("champions_queue")
@@ -155,12 +155,19 @@ def make_queue_embed(region: str, current_queue: list[dict]) -> discord.Embed:
     for idx, p in enumerate(current_queue, 1):
         player_info = p["players"]
         ign = player_info.get("ign", "Unknown")
-        mmr = player_info.get("mmr", 1000)
-        rank = player_info.get("current_rank")
-        division = player_info.get("current_division")
+        mmr = player_info.get("mmr", 150)  # matches players.mmr's default (150 as of P6)
+        # Rank derived live from mmr, not read from player_info's stored
+        # current_rank/current_division — that column only updates at
+        # match-approval time and can silently disagree with what mmr
+        # actually maps to (test-seeded rows, manual DB edits, or any
+        # player who hasn't been through a real approval since the tier
+        # bands last changed). Found live 2026-07-19 — see
+        # utils/embeds.py's player_stats_card docstring for the full
+        # writeup; same fix applied here since the queue panel is one of
+        # the most-viewed surfaces in the bot.
+        rank, _ = mmr_engine.derive_rank(mmr)
 
-        rank_str = f" [{rank} {division}]" if rank else ""
-        player_lines.append(f"`{idx:02d}` **{ign}**{rank_str} — MMR: {mmr}")
+        player_lines.append(f"`{idx:02d}` **{ign}** [{rank}] — MMR: {mmr}")
 
     names = "\n".join(player_lines) if player_lines else "*No players in queue. Be the first to join!*"
 
@@ -447,7 +454,7 @@ class Queue(commands.Cog):
         team_b = [players[1], players[3], players[5], players[7], players[9]]  # Attacker
 
         # Create match (no captains assigned)
-        match = await adb.create_match(is_bootstrap=bootstrap)
+        match = await adb.create_match(is_bootstrap=bootstrap, region=region)
         await adb.update_match(match["id"], {
             "room_code_shared_by": host_player_id
         })

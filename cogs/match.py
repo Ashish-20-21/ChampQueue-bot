@@ -15,7 +15,7 @@ import config
 import logging
 from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
-from utils.embeds import ro3_result_card, ro3_verification_card
+from utils.embeds import ro3_verification_card
 from utils.permissions import is_admin
 
 logger = logging.getLogger(__name__)
@@ -844,14 +844,25 @@ class Match(commands.Cog):
         if not player or match.get("room_code_shared_by") != player["id"]:
             await interaction.response.send_message("Only the Match Host can approve this result.", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         success, message = await self._do_approve(interaction.guild, match_id, player["id"])
         if not success:
             await interaction.followup.send(message, ephemeral=True)
             return
-        match = await adb.get_match(match_id)
-        match_players, round_results = await asyncio.gather(adb.get_match_players(match_id), adb.get_match_round_results(match_id))
-        await interaction.followup.send(embed=ro3_result_card(match, match_players, round_results, match.get("map_pool") or []))
+        # Private confirmation only — no public post to the channel.
+        # Live feedback 2026-07-20: the previous version posted a public
+        # result card (map/winner/MVP per round) right after every
+        # approval, which the host found unnecessarily long even after
+        # already being slimmed down once. Matches the auto-approve
+        # sweep's existing behavior exactly — that path has never posted
+        # anything to the channel, only silently calls _do_approve and
+        # moves on. MMR/rank/record are all already correct in the DB
+        # and on the leaderboard the moment this line runs; the
+        # leaderboard panel just needs a Reload click to show it.
+        await interaction.followup.send(
+            "🏁 GG — result's locked in! Head to the leaderboard and hit Reload to see the updated standings.",
+            ephemeral=True,
+        )
 
     @tasks.loop(seconds=config.APPROVAL_SWEEP_INTERVAL_SECONDS)
     async def approval_sweep(self):

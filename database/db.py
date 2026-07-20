@@ -298,15 +298,9 @@ class Database:
             q = q.eq("team", team)
         return q.execute().data
 
-    def cast_map_vote(self, match_id: int, player_id: int, map_name: str) -> dict:
-        res = self.client.table("map_votes").upsert(
-            {"match_id": match_id, "player_id": player_id, "map": map_name},
-            on_conflict="match_id,player_id",
-        ).execute()
-        return res.data[0]
-
-    def get_map_votes(self, match_id: int) -> list[dict]:
-        return self.client.table("map_votes").select("*").eq("match_id", match_id).execute().data
+    # cast_map_vote / get_map_votes removed — confirmed dead (zero call
+    # sites anywhere), consistent with the no-map-vote decision. See
+    # migration_009_drop_map_votes.sql for the paired schema drop.
 
     # ------------------------------------------------------------------
     # REPUTATION

@@ -42,7 +42,7 @@ async def is_bootstrap_match(player_ids: list[int]) -> bool:
 def _performance_score(player: dict) -> float:
     """Single composite score used ONLY for balancing/captain selection —
     not the same thing as MMR, though MMR is the dominant input."""
-    mmr = player.get("mmr", 1000)
+    mmr = player.get("mmr", 150)  # matches players.mmr's default (150 as of P6, see migration_006_p6_full.sql)
     win_rate = 0.0
     total = player.get("total_matches", 0)
     if total > 0:
@@ -85,39 +85,24 @@ async def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], boot
                                n: int = 3) -> list[str]:
     """
     Pick n candidate maps for the vote. In bootstrap mode: pure random.
-    In analysis mode: avoid maps where the historical win rate for either
-    team's current roster is heavily lopsided (best-effort — depends on
-    match history existing per map, which needs a map-level aggregate;
-    for now this uses a simple heuristic over match_players + matches
-    and can be swapped for a proper materialized view once volume is
-    high enough to justify it).
+
+    Analysis mode is TEMPORARILY DISABLED (falls back to the same random
+    pick as bootstrap) — found live 2026-07-20, crashing every match once
+    a roster crosses BOOTSTRAP_MATCH_THRESHOLD: this queried matches.map
+    and matches.winner_team, both pre-RO3 columns that don't exist on the
+    live schema anymore (maps live in matches.map_pool as an array now;
+    there's no single-match winner_team since RO3 counts wins/losses at
+    the round level — see recompute_player_career_stats in
+    migration_006_p6_full.sql for the correct current pattern). This
+    function was apparently never actually exercised until a real roster
+    crossed the bootstrap threshold for the first time tonight.
+
+    Real fix (not done here — this is a stop-the-bleeding fix, not a
+    rebuild) needs rewriting the balance heuristic against
+    match_round_results + matches.map_pool instead of the dead columns.
+    Flagged as real follow-up work, not silently deferred — random
+    selection is a safe, correct fallback in the meantime (bootstrap
+    mode already proves random is an acceptable map-pick strategy), just
+    not the smarter balanced pick that was originally intended here.
     """
-    if bootstrap:
-        return random.sample(config.HARDPOINT_MAPS, k=min(n, len(config.HARDPOINT_MAPS)))
-
-    # Analysis mode: rank maps by how "balanced" recent history has been
-    # for these specific players, lowest historical MMR-swing-per-map first.
-    scored: list[tuple[str, float]] = []
-    for map_name in config.HARDPOINT_MAPS:
-        res = await asyncio.to_thread(
-            lambda map_name=map_name: (
-                db.client.table("matches")
-                .select("id, winner_team, match_players(player_id, team)")
-                .eq("map", map_name)
-                .eq("status", "completed")
-                .execute()
-            )
-        )
-        relevant = [
-            m for m in res.data
-            if any(mp["player_id"] in team_a_ids or mp["player_id"] in team_b_ids for mp in m.get("match_players", []))
-        ]
-        if not relevant:
-            scored.append((map_name, 0.0))  # no data = neutral, still eligible
-            continue
-        a_wins = sum(1 for m in relevant if m["winner_team"] == "A")
-        skew = abs(a_wins - (len(relevant) - a_wins)) / len(relevant)
-        scored.append((map_name, skew))
-
-    scored.sort(key=lambda x: x[1])  # most balanced first
-    return [m for m, _ in scored[:n]]
+    return random.sample(config.HARDPOINT_MAPS, k=min(n, len(config.HARDPOINT_MAPS)))

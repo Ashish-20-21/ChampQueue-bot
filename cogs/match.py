@@ -309,18 +309,31 @@ class Match(commands.Cog):
             view=SubmissionPanelView(self),
         )
 
-    @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
-    async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
-        match = await adb.get_match_by_code(match_id)
-        player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not match or match["status"] != "awaiting_room":
-            await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
-            return
-        if not player or match.get("room_code_shared_by") != player["id"]:
-            await interaction.response.send_message("Only the Match Host can share the room code.", ephemeral=True)
-            return
-        await adb.update_match(match["id"], {"room_code": code, "status": "awaiting_result"})
-        await interaction.response.send_message(f"Room code for **{match_id}** set. Play all three rounds, then upload the scoreboards.")
+    # REMOVED 2026-07-29: /match-roomcode was a pre-/rc prototype that
+    # never got wired to _post_match_log (cogs/queue.py) — using it left
+    # room_code + status correctly set in the DB, but silently produced
+    # NO match-log channel entry, unlike /rc which does both in one write.
+    # It also required the host to type the match_id by hand instead of
+    # reading it off the channel name, so a typo failed with a generic
+    # "Match not found" instead of ever reaching the log-post step.
+    # /rc (cogs/queue.py) is the supported command going forward —
+    # confirmed on CQ-2063: /rc posted the match-log entry correctly.
+    # Kept here commented out (not deleted) for traceability; safe to
+    # delete outright once confirmed nothing in prod still calls
+    # /match-roomcode.
+    #
+    # @app_commands.command(name="match-roomcode", description="Share the in-game room code for a match")
+    # async def match_roomcode(self, interaction: discord.Interaction, match_id: str, code: str):
+    #     match = await adb.get_match_by_code(match_id)
+    #     player = await adb.get_player_by_discord_id(interaction.user.id)
+    #     if not match or match["status"] != "awaiting_room":
+    #         await interaction.response.send_message("Match not found or not awaiting a room code.", ephemeral=True)
+    #         return
+    #     if not player or match.get("room_code_shared_by") != player["id"]:
+    #         await interaction.response.send_message("Only the Match Host can share the room code.", ephemeral=True)
+    #         return
+    #     await adb.update_match(match["id"], {"room_code": code, "status": "awaiting_result"})
+    #     await interaction.response.send_message(f"Room code for **{match_id}** set. Play all three rounds, then upload the scoreboards.")
 
     async def _route_to_review(self, match: dict, player_id: int | None, reason: str, technical_detail: str) -> None:
         """Every failure path funnels through here: match status flips to
@@ -695,6 +708,25 @@ class Match(commands.Cog):
             if not score_match or score_match.group(1) == score_match.group(2):
                 reasons.append(f"round {round_number}: final score is unreadable")
                 continue
+            # Winner/loser is resolved from the OCR's own screen-position
+            # grouping (row["team"], "top group = A" per the vision prompt),
+            # NOT from match_players.team. match_players.team is a static
+            # letter fixed once at bootstrap purely for the Discord
+            # Defender/Attacker display label — it has no guaranteed
+            # relationship to which physical lobby side a player actually
+            # sits on in a given round. Hardpoint has no real attack/defense
+            # mechanic (both teams do the same thing), so nothing is lost by
+            # not enforcing that mapping: this way a genuine in-game seating
+            # mix-up (whole 5-player group loaded onto the "wrong" color)
+            # resolves correctly on its own, instead of failing every player
+            # in the round with a false "team mismatch". Confirmed further:
+            # the post-match "Match Details" screen shows each viewer's own
+            # team as blue regardless of physical side (observer-relative),
+            # so screen color was never a reliable signal to begin with —
+            # only the true spectator view shows real Defender/Attacker
+            # sides. See DECISIONS.md for the accepted tradeoff (a 1-2
+            # player crossover, as opposed to a whole-group swap, is not
+            # detectable by this check).
             winner = "A" if int(score_match.group(1)) > int(score_match.group(2)) else "B"
             results: list[dict] = []
             seen_players: set[int] = set()
@@ -710,8 +742,9 @@ class Match(commands.Cog):
                 if mp["player_id"] in seen_players:
                     reasons.append(f"round {round_number}: duplicate OCR player {row.get('ign')}")
                     continue
-                if row.get("team") != mp["team"]:
-                    reasons.append(f"round {round_number}: team mismatch for {row.get('ign')}")
+                round_team = row.get("team")
+                if round_team not in ("A", "B"):
+                    reasons.append(f"round {round_number}: unreadable team grouping for {row.get('ign')!r}")
                     continue
                 invalid = [field for field in _INTEGER_FIELDS if not _INTEGER_RE.fullmatch(str(row.get(field, "")))]
                 if not _HILL_TIME_RE.fullmatch(str(row.get("hill_time", ""))):
@@ -740,8 +773,8 @@ class Match(commands.Cog):
                 raw_impact = str(row.get("impact", ""))
                 impact_value = float(raw_impact) if _HILL_TIME_RE.fullmatch(raw_impact) else None
                 results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
-                                "mmr_delta": mmr_engine.calculate_mmr_change(position, mp["team"] == winner, is_mvp),
-                                "team": mp["team"], "discord_id": mp["players"]["discord_id"],
+                                "mmr_delta": mmr_engine.calculate_mmr_change(position, round_team == winner, is_mvp),
+                                "team": round_team, "discord_id": mp["players"]["discord_id"],
                                 # Raw stats, kept alongside the MMR/position outcome so
                                 # match_player_stats can be written from this same pass
                                 # instead of re-deriving it later (P6 — see
@@ -752,7 +785,7 @@ class Match(commands.Cog):
                                 "impact": impact_value,
                                 "score": int(row["score"])})
                 seen_players.add(mp["player_id"])
-                per_team[mp["team"]] += 1
+                per_team[round_team] += 1
             if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
                 reasons.append(f"round {round_number}: scoreboard does not contain one valid row for every match player")
             for team in ("A", "B"):

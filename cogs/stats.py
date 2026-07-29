@@ -157,19 +157,32 @@ class Stats(commands.Cog):
         await interaction.channel.send(embed=embed, view=view)
         await interaction.followup.send("Force-refreshed the leaderboard with the latest data.", ephemeral=True)
 
-    @app_commands.command(name="compare-last-match", description="Compare your latest match to the one before it")
-    async def compare_last_match(self, interaction: discord.Interaction):
-        player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not player:
-            await interaction.response.send_message("You're not registered.", ephemeral=True)
-            return
-        history = await adb.player_recent_matches(player["id"], limit=2)
-        completed = [h for h in history if h.get("matches", {}).get("status") == "completed"]
-        if len(completed) < 2:
-            await interaction.response.send_message("You need at least 2 completed matches to compare.", ephemeral=True)
-            return
-        latest, previous = completed[0], completed[1]
-        await interaction.response.send_message(embed=comparison_embed(player["ign"], previous, latest))
+    # Disabled 2026-07-30: redundant with /player-stats and the
+    # leaderboard, and its strict status == "completed" filter (line
+    # was `[h for h in history if h.get("matches", {}).get("status") ==
+    # "completed"]`) meant it almost always returned "You need at least
+    # 2 completed matches to compare" given current approval friction —
+    # looked broken/stale to players even though the underlying query
+    # was working as designed. Kept commented rather than deleted in
+    # case this is revisited later (e.g. widened to also count
+    # pending_verification/awaiting_review matches, same as this
+    # session's provisional-stats work — but that would need
+    # comparison_embed's MMR Change field to handle a match with no
+    # mmr_change yet, since that's only written by approve_ro3_match).
+    #
+    # @app_commands.command(name="compare-last-match", description="Compare your latest match to the one before it")
+    # async def compare_last_match(self, interaction: discord.Interaction):
+    #     player = await adb.get_player_by_discord_id(interaction.user.id)
+    #     if not player:
+    #         await interaction.response.send_message("You're not registered.", ephemeral=True)
+    #         return
+    #     history = await adb.player_recent_matches(player["id"], limit=2)
+    #     completed = [h for h in history if h.get("matches", {}).get("status") == "completed"]
+    #     if len(completed) < 2:
+    #         await interaction.response.send_message("You need at least 2 completed matches to compare.", ephemeral=True)
+    #         return
+    #     latest, previous = completed[0], completed[1]
+    #     await interaction.response.send_message(embed=comparison_embed(player["ign"], previous, latest))
 
     @app_commands.command(name="rank-progress", description="See your progress toward the next rank/division")
     async def rank_progress(self, interaction: discord.Interaction):
@@ -180,7 +193,8 @@ class Stats(commands.Cog):
         tier, division = mmr_engine.derive_rank(player["mmr"])
         await interaction.response.send_message(
             f"**{player['ign']}** — {tier} {division} — {player['mmr']} MMR\n"
-            f"(Peak: {player['peak_rank']} at {player['peak_mmr']} MMR)"
+            f"(Peak: {player['peak_rank']} at {player['peak_mmr']} MMR)",
+            ephemeral=True,
         )
 
     @app_commands.command(name="achievements", description="View your earned achievements")

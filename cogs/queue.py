@@ -155,7 +155,7 @@ def make_queue_embed(queue_key: str, current_queue: list[dict]) -> discord.Embed
     for idx, p in enumerate(current_queue, 1):
         player_info = p["players"]
         ign = player_info.get("ign", "Unknown")
-        mmr = player_info.get("mmr", 150)  # matches players.mmr's default (150 as of P6)
+        mmr = player_info.get("mmr", 200)  # matches players.mmr's default (200 as of 2026-07-30 global-transition reset)
         # Rank derived live from mmr, not read from player_info's stored
         # current_rank/current_division — that column only updates at
         # match-approval time and can silently disagree with what mmr

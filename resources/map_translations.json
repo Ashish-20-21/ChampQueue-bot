@@ -1,8 +1,36 @@
 {
-    "COMBINE": ["KOMBINE"],
-    "HACIENDA": ["Ù‡Ø§Ø³ÛŒÙ†Ø¯Ø§"],
-    "ARSENAL": ["CEPHANELÄ°K", "ÐÐ Ð¡Ð•ÐÐÐ›", "ARSENALE"],
-    "TAKEOFF": ["ØªÙŠÙƒ Ø£ÙˆÙ", "RAMPA"],
-    "SUMMIT": ["Ø³Ø§Ù…ÛŒØª", "ZÄ°RVE"],
-    "HARDPOINT": ["Ø§Ù„Ù†Ù‚Ø·Ø© Ø§Ù„Ù…ØªÙ†Ù‚Ù„Ø©", "PUNTO CALIENTE", "ZORLU NOKTA", "ÐžÐŸÐžÐ ÐÐ«Ð™ ÐŸÐ£ÐÐšÐ¢", "ZONA DE CONFLITO", "STELLUNG", "POSTAZIONE", "POINT STRATÃ‰GIQUE"]
+    "COMBINE": [
+        "KOMBINE"
+    ],
+    "HACIENDA": [
+        "\u0647\u0627\u0633\u06cc\u0646\u062f\u0627",
+        "HACIENDA"
+    ],
+    "ARSENAL": [
+        "ARSENAL",
+        "CEPHANEL\u0130K",
+        "\u0410\u0420\u0421\u0415\u041d\u0410\u041b",
+        "ARSENALE"
+    ],
+    "TAKEOFF": [
+        "\u062a\u064a\u0643 \u0623\u0648\u0641",
+        "RAMPA",
+        "TAKEOFF"
+    ],
+    "SUMMIT": [
+        "\u0633\u0627\u0645\u06cc\u062a",
+        "Z\u0130RVE",
+        "SUMMIT"
+    ],
+    "HARDPOINT": [
+        "\u0627\u0644\u0646\u0642\u0637\u0629 \u0627\u0644\u0645\u062a\u0646\u0642\u0644\u0629",
+        "PUNTO CALIENTE",
+        "ZORLU NOKTA",
+        "\u041e\u041f\u041e\u0420\u041d\u042b\u0419 \u041f\u0423\u041d\u041a\u0422",
+        "ZONA DE CONFLITO",
+        "STELLUNG",
+        "POSTAZIONE",
+        "POINT STRAT\u00c9GIQUE",
+        "HARDPOINT"
+    ]
 }

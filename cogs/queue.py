@@ -880,8 +880,6 @@ class Queue(commands.Cog):
 
 async def setup(bot: commands.Bot):
     cog = Queue(bot)
-async def setup(bot: commands.Bot):
-    cog = Queue(bot)
     await bot.add_cog(cog)
     cog.cleanup_sweep.start()
     for queue_key in config.QUEUE_KEYS:

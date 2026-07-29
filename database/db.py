@@ -24,7 +24,18 @@ logger = logging.getLogger("champions_queue")
 # (match_round_results write, then player_recent_matches read) — this is
 # a real, recurring characteristic of the Supabase connection under this
 # session's load, not a one-off fluke worth a narrow one-off fix.
-_RETRYABLE_EXCEPTIONS = (httpx.RemoteProtocolError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
+_RETRYABLE_EXCEPTIONS = (
+    httpx.RemoteProtocolError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError,
+    # 2026-07-29: confirmed live during smoke testing — httpcore's HTTP/2
+    # state machine occasionally throws "Received pseudo-header in
+    # trailer" followed by a KeyError in its own stream cleanup, when
+    # several requests fire in quick succession (e.g. the concurrent
+    # recompute_player_career_stats calls added this session). This is a
+    # transport-layer flake surfaced via httpx's "local" framing-error
+    # class, not a real application-level protocol violation — safe to
+    # retry same as RemoteProtocolError.
+    httpx.LocalProtocolError,
+)
 
 
 async def with_retry(coro_fn, *args, attempts: int = 3, base_delay: float = 0.5, **kwargs):

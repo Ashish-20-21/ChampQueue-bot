@@ -100,11 +100,40 @@ def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ", limit:
     return text
 
 
-class HostApprovalView(discord.ui.View):
-    def __init__(self, cog: "Match", match_id: int):
-        super().__init__(timeout=3600)
-        self.cog = cog
+class HostApprovalButton(discord.ui.DynamicItem[discord.ui.Button], template=r"host_approve:(?P<match_id>[0-9]+)"):
+    """Fix 2026-07-29: was a plain View button with timeout=3600 and no
+    custom_id — died after 1hr in-memory OR instantly on any bot restart,
+    since it was never registered via bot.add_view(). Discord kept
+    rendering the button but nothing was listening, producing a silent
+    client-side "didn't respond in time" with zero server-side log trace.
+
+    Same DynamicItem fix as IssueResolveButton above: custom_id embeds
+    match_id and gets regex-matched, so this stays clickable indefinitely
+    regardless of how long the bot has been running or how many restarts
+    happened in between. Registered once, generically, in setup() below."""
+
+    def __init__(self, match_id: int):
+        super().__init__(
+            discord.ui.Button(label="Approve Result", style=discord.ButtonStyle.success, custom_id=f"host_approve:{match_id}")
+        )
         self.match_id = match_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["match_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("Match")
+        await cog.approve_result(interaction, self.match_id)
+
+
+class HostApprovalView(discord.ui.View):
+    """Thin wrapper so call sites can keep doing view=HostApprovalView(cog, match_id)
+    without needing to know about DynamicItem internals."""
+
+    def __init__(self, cog: "Match", match_id: int):
+        super().__init__(timeout=None)
+        self.add_item(HostApprovalButton(match_id))
 
     @discord.ui.button(label="Approve Result", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -300,7 +329,7 @@ class Match(commands.Cog):
         return interaction.channel_id == config.RESULT_UPLOAD_CHANNEL_ID
 
     @app_commands.command(name="correction-result", description="Host: flag a problem with this match's result before or after approval")
-    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
+    @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)")
     @app_commands.checks.cooldown(1, config.CORRECTION_COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.channel_id))
     async def correction_result(self, interaction: discord.Interaction, match_id: str):
         match = await adb.get_match_by_code(normalize_match_code(match_id))
@@ -449,7 +478,7 @@ class Match(commands.Cog):
         await interaction.followup.send("Marked resolved.", ephemeral=True)
 
     @app_commands.command(name="match-submit", description="Host upload of all three RO3 scoreboard screenshots")
-    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")
+    @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
                            screenshot_1: discord.Attachment, screenshot_2: discord.Attachment,
                            screenshot_3: discord.Attachment):
@@ -1021,4 +1050,5 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(cog)
     bot.add_view(SubmissionPanelView(cog))
     bot.add_dynamic_items(IssueResolveButton)
+    bot.add_dynamic_items(HostApprovalButton) 
     cog.approval_sweep.start()

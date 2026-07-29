@@ -880,7 +880,21 @@ class Queue(commands.Cog):
 
 async def setup(bot: commands.Bot):
     cog = Queue(bot)
+async def setup(bot: commands.Bot):
+    cog = Queue(bot)
     await bot.add_cog(cog)
     cog.cleanup_sweep.start()
     for queue_key in config.QUEUE_KEYS:
-        bot.add_view(RegionQueueView(queue_key, cog))
+        # Fix 2026-07-29: every runtime call site (handle_join,
+        # handle_leave, handle_start_match, _start_match_flow) calls
+        # update_view_state() right after constructing/reusing a view —
+        # this boot-time registration was the one path that skipped it.
+        # If a queue already had >=10 waiting players at the moment the
+        # bot restarted, the freshly-registered view's start_match_button
+        # was never re-added as a child, even though Discord still showed
+        # the old message with the button rendered. Click -> dead
+        # interaction -> silent "didn't respond in time", zero logs.
+        view = RegionQueueView(queue_key, cog)
+        current_queue = await adb.queue_current(queue_key=queue_key)
+        await view.update_view_state(current_queue)
+        bot.add_view(view)

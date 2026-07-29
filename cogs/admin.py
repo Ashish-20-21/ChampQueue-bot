@@ -238,6 +238,29 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(name="admin-recompute-stats", description="[Admin] Force-refresh a player's career stats right now (no waiting for their next match)")
+    @admin_only()
+    async def recompute_stats(self, interaction: discord.Interaction, user: discord.Member):
+        # Manual escape hatch for the provisional-stats reform (2026-07-29,
+        # migration_011). Normally a player's career numbers refresh
+        # automatically the next time any of their matches reaches
+        # pending_verification or completed — this just lets an admin
+        # force that refresh immediately after a manual match_player_stats/
+        # match_round_results DB fix, without needing the player to queue
+        # again first. Does not touch MMR — that's still admin-adjust-mmr
+        # or a direct query, unchanged.
+        player = await adb.get_player_by_discord_id(user.id)
+        if not player:
+            await interaction.response.send_message(f"{user.mention} isn't registered.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await adb.recompute_player_career_stats(player["id"])
+        except Exception as exc:
+            await interaction.followup.send(f"Recompute failed: {exc}", ephemeral=True)
+            return
+        await interaction.followup.send(f"Stats recomputed for **{player['ign']}** — check `/player-stats`.", ephemeral=True)
+
     @approve.error
     @reject.error
     @review_queue.error
@@ -246,6 +269,7 @@ class Admin(commands.Cog):
     @adjust_reputation.error
     @adjust_mmr.error
     @scrap_match.error
+    @recompute_stats.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(str(error), ephemeral=True)

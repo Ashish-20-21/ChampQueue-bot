@@ -104,13 +104,16 @@ class HostApprovalButton(discord.ui.DynamicItem[discord.ui.Button], template=r"h
     """Fix 2026-07-29: was a plain View button with timeout=3600 and no
     custom_id — died after 1hr in-memory OR instantly on any bot restart,
     since it was never registered via bot.add_view(). Discord kept
-    rendering the button but nothing was listening, producing a silent
-    client-side "didn't respond in time" with zero server-side log trace.
+    rendering the button (component state persists on Discord's side)
+    but nothing was listening, producing a silent client-side "didn't
+    respond in time" with zero server-side log trace.
 
     Same DynamicItem fix as IssueResolveButton above: custom_id embeds
     match_id and gets regex-matched, so this stays clickable indefinitely
     regardless of how long the bot has been running or how many restarts
-    happened in between. Registered once, generically, in setup() below."""
+    happened in between. Registered once, generically, in setup() below —
+    no per-match bot.add_view() call needed, and no re-registration on
+    restart needed either."""
 
     def __init__(self, match_id: int):
         super().__init__(
@@ -129,15 +132,14 @@ class HostApprovalButton(discord.ui.DynamicItem[discord.ui.Button], template=r"h
 
 class HostApprovalView(discord.ui.View):
     """Thin wrapper so call sites can keep doing view=HostApprovalView(cog, match_id)
-    without needing to know about DynamicItem internals."""
+    without needing to know about DynamicItem internals — same pattern as
+    IssueResolveView below. cog param kept for call-site compatibility
+    (unused internally now; the DynamicItem resolves its own cog via
+    interaction.client.get_cog at callback time)."""
 
     def __init__(self, cog: "Match", match_id: int):
         super().__init__(timeout=None)
         self.add_item(HostApprovalButton(match_id))
-
-    @discord.ui.button(label="Approve Result", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self.cog.approve_result(interaction, self.match_id)
 
 
 class IssueResolveModal(discord.ui.Modal, title="Resolve Issue"):
@@ -607,16 +609,20 @@ class Match(commands.Cog):
 
         round_data, review_reasons = self._prepare_rounds(match_players, maps, ordered_extractions)
 
-        if review_reasons:
-            screenshot_links = "\n".join(f"Round {i}: {pair[1].url}" for i, pair in enumerate(ordered_pairs, start=1))
-            technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
-            await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
-            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
-            return
-
-        # Each valid round is individually queryable immediately. These are
-        # provisional records only: the approval RPC is the sole place that
-        # can ever mutate players.mmr.
+        # Reform 2026-07-29: previously any non-empty review_reasons caused
+        # an early return here, before either DB write below ever ran —
+        # meaning a SINGLE bad round (e.g. one map-name misread) discarded
+        # every other round's fully-valid data too. Confirmed live: a real
+        # match with one bad round and two clean rounds wrote zero rows to
+        # match_player_stats/match_round_results. Fix: write whichever
+        # rounds _prepare_rounds marked "clean" (see its docstring) FIRST,
+        # unconditionally, then still route to review below if needed —
+        # the bad round(s) simply contribute nothing until corrected, the
+        # good round(s) are no longer held hostage by them. MMR is
+        # UNCHANGED: mmr_delta values are written here same as before, but
+        # they still cannot affect players.mmr until approve_ro3_match
+        # actually commits — this write is the same "provisional record"
+        # it always was, just no longer gated on the WHOLE match validating.
         #
         # NOTE: results rows carry "discord_id" for the verification embed's
         # @mentions (ro3_verification_card below), but match_round_results
@@ -625,25 +631,49 @@ class Match(commands.Cog):
         # embed still gets the full row with discord_id intact via round_data.
         _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "mmr_delta", "team")
         _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
-        await asyncio.gather(*(
-            with_retry(
-                adb.replace_match_round_results,
-                match["id"], item["round_number"],
-                [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in item["results"]],
+        clean_rounds = [item for item in round_data if item["clean"]]
+        if clean_rounds:
+            await asyncio.gather(*(
+                with_retry(
+                    adb.replace_match_round_results,
+                    match["id"], item["round_number"],
+                    [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in item["results"]],
+                )
+                for item in clean_rounds
+            ))
+            # P6: raw per-round stats, written from the same round_data that
+            # was already assembled above — no re-extraction, no second OCR
+            # pass. See migration_006_p6_stats_and_ranks.sql.
+            await asyncio.gather(*(
+                with_retry(
+                    adb.replace_match_player_stats,
+                    match["id"], item["round_number"],
+                    [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in item["results"]],
+                )
+                for item in clean_rounds
+            ))
+            # Same fire-and-forget pattern as _do_approve's post-approval
+            # recompute — a partial (clean-rounds-only) write should still
+            # surface on /player-stats right away rather than waiting for
+            # the whole match to eventually clear review. Never blocks or
+            # fails the submission itself.
+            recompute_results = await asyncio.gather(
+                *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
+                return_exceptions=True,
             )
-            for item in round_data
-        ))
-        # P6: raw per-round stats, written from the same round_data that
-        # was already assembled above — no re-extraction, no second OCR
-        # pass. See migration_006_p6_stats_and_ranks.sql.
-        await asyncio.gather(*(
-            with_retry(
-                adb.replace_match_player_stats,
-                match["id"], item["round_number"],
-                [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in item["results"]],
-            )
-            for item in round_data
-        ))
+            for mp, result in zip(match_players, recompute_results):
+                if isinstance(result, Exception):
+                    logger.exception(
+                        "recompute_player_career_stats (provisional, partial-clean-rounds) failed for "
+                        "player_id=%s after match_id=%s submission", mp["player_id"], match["id"], exc_info=result,
+                    )
+
+        if review_reasons:
+            screenshot_links = "\n".join(f"Round {i}: {pair[1].url}" for i, pair in enumerate(ordered_pairs, start=1))
+            technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
+            await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
+            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+            return
 
         validations = await asyncio.gather(*(
             validation.validate_submission(match["id"], extraction)
@@ -659,6 +689,29 @@ class Match(commands.Cog):
 
         deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
         await with_retry(adb.update_match, match["id"], {"status": "pending_verification", "approval_deadline": deadline})
+
+        # Reform 2026-07-29: career stats (K/D, matches played, avg damage,
+        # etc.) are now visible on /player-stats as soon as OCR passes and
+        # a match reaches pending_verification — not gated on host/sweep
+        # approval anymore. See migration_011_provisional_stats.sql for
+        # the read-path change this depends on. MMR/rank are UNCHANGED —
+        # still only committed by approve_ro3_match inside _do_approve().
+        # Same fire-and-forget pattern as that call site: a recompute
+        # failure here must never block or fail the submission itself.
+        # (This runs again here even though the clean-rounds block above
+        # may have already recomputed once — harmless, same idempotent
+        # full-aggregate function, just cheap redundancy on the all-clean
+        # happy path rather than added complexity to skip it.)
+        recompute_results = await asyncio.gather(
+            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
+            return_exceptions=True,
+        )
+        for mp, result in zip(match_players, recompute_results):
+            if isinstance(result, Exception):
+                logger.exception(
+                    "recompute_player_career_stats (provisional, pending_verification) failed for "
+                    "player_id=%s after match_id=%s submission", mp["player_id"], match["id"], exc_info=result,
+                )
 
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit
@@ -780,6 +833,7 @@ class Match(commands.Cog):
         rounds: list[dict] = []
         reasons: list[str] = []
         for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
+            reasons_before_this_round = len(reasons)
             resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
             if resolved_map != announced_map.upper():
                 raw_map = extraction.get("map")
@@ -876,7 +930,24 @@ class Match(commands.Cog):
             for team in ("A", "B"):
                 if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
                     reasons.append(f"round {round_number}: Team {team} must have exactly one game-provided MVP")
-            rounds.append({"round_number": round_number, "map_name": announced_map, "final_score": score, "results": results})
+            rounds.append({
+                "round_number": round_number, "map_name": announced_map, "final_score": score, "results": results,
+                # Reform 2026-07-29: a round is "clean" only if nothing in
+                # THIS round's own checks (map, score, per-player OCR
+                # fields, roster completeness, MVP count) added a reason —
+                # a different round's problems don't affect this flag.
+                # match_submit uses this to write clean rounds to
+                # match_player_stats/match_round_results even when the
+                # overall match still needs admin review, instead of the
+                # old all-or-nothing behavior that discarded every round's
+                # data (including fully valid ones) whenever any single
+                # round had a problem. See migration_011 for the read-side
+                # change this depends on. MMR is UNCHANGED by this — a
+                # round's mmr_delta still only gets committed by
+                # approve_ro3_match, which still requires full manual/auto
+                # approval of the whole match regardless of this flag.
+                "clean": len(reasons) == reasons_before_this_round,
+            })
         return rounds, reasons
 
     async def _run_post_approval_cleanup(self, guild: discord.Guild | None, match: dict) -> None:
@@ -1050,5 +1121,5 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(cog)
     bot.add_view(SubmissionPanelView(cog))
     bot.add_dynamic_items(IssueResolveButton)
-    bot.add_dynamic_items(HostApprovalButton) 
+    bot.add_dynamic_items(HostApprovalButton)
     cog.approval_sweep.start()

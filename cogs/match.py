@@ -16,12 +16,41 @@ import logging
 from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
 from utils.embeds import ro3_verification_card
-from utils.permissions import is_admin
+from utils.permissions import admin_only, is_admin
 
 logger = logging.getLogger(__name__)
 
 
 _INTEGER_FIELDS = ("position", "kills", "deaths", "assists", "score")
+
+def normalize_match_code(raw: str) -> str:
+    """Accepts whatever a user actually types for a match code and
+    normalizes it to the canonical CQ-XXXX format (uppercase, hyphen,
+    digits only) before it's used in a DB lookup. Added 2026-07-29 —
+    found live: users frequently forgot the CQ- prefix, used lowercase,
+    or dropped the hyphen ("1324", "cq1324", "cq-1324"), got an exact-
+    match failure with no clear next step, and had to re-attempt the
+    whole upload. Rather than pre-filling a hint (Discord slash-command
+    string options don't support a default value, only modals do —
+    see MatchSubmitModal below), this normalizes on the receiving end so
+    ANY reasonable variant of the code works on the first try, regardless
+    of entry point (modal, /match-submit, /match-correction all funnel
+    through this). Strips everything except letters/digits, then
+    re-assembles as CQ-<digits> — so "cq1324", "1324", " CQ-1324 ",
+    "Cq1324" all normalize to "CQ-1324". If the result doesn't look like
+    a valid code (no digits at all), returns the cleaned-but-unprefixed
+    input as-is so get_match_by_code's "not found" error still fires
+    with a sensible value rather than masking a genuinely malformed
+    input as a lookup miss."""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", raw or "").upper()
+    if cleaned.startswith("CQ"):
+        cleaned = cleaned[2:]
+    digits = re.sub(r"[^0-9]", "", cleaned)
+    if not digits:
+        return raw.strip()  # nothing digit-like — let the "not found" path handle it
+    return f"CQ-{digits}"
+
+
 # NOTE: "damage" deliberately excluded. mmr_engine.calculate_mmr_change() is
 # position-table based (position + won + is_mvp only) and never reads damage —
 # requiring it here was a leftover from the old win/loss-average MMR engine.
@@ -201,11 +230,20 @@ class MatchSubmitModal(discord.ui.Modal, title="Submit Match Results"):
     """Modal opened from the persistent panel button. Discord modals can't
     take file attachments, so this only collects the match ID and then
     points the host at /match-submit for the actual 3-screenshot upload —
-    see Match.start_submission below for why this two-step exists."""
+    see Match.start_submission below for why this two-step exists.
+
+    2026-07-29: default="CQ-" pre-fills the prefix so the user's cursor
+    lands right after it and they only type the number — found live that
+    users frequently forgot the prefix or typed it lowercase/without the
+    hyphen. Whatever they end up submitting is also normalized via
+    normalize_match_code() as a second layer, so even if they clear the
+    default and type something else entirely (e.g. just "1324"), it still
+    resolves correctly instead of failing on an exact-format mismatch."""
 
     match_id_input = discord.ui.TextInput(
         label="Match ID",
         placeholder="e.g. CQ-0001",
+        default="CQ-",
         required=True,
         max_length=16,
     )
@@ -215,7 +253,7 @@ class MatchSubmitModal(discord.ui.Modal, title="Submit Match Results"):
         self.cog = cog
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.start_submission(interaction, self.match_id_input.value.strip())
+        await self.cog.start_submission(interaction, normalize_match_code(self.match_id_input.value))
 
 
 class SubmissionPanelView(discord.ui.View):
@@ -230,17 +268,15 @@ class SubmissionPanelView(discord.ui.View):
     @discord.ui.button(label="Submit Match Results", style=discord.ButtonStyle.primary,
                         custom_id="match_submit_panel_button")
     async def submit(self, interaction: discord.Interaction, _: discord.ui.Button):
-        # Region-aware as of P6: this button has no match_id yet (that's
-        # entered in the modal that follows), so it can't know which
-        # region's upload channel is the "right" one — the real
-        # enforcement happens in match_submit() once match_id resolves to
-        # an actual match row and its region is known. Here we only check
-        # that the click happened in SOME configured upload channel
-        # (either region), as a basic sanity gate, not the final say.
-        configured = [c for c in config.RESULT_UPLOAD_CHANNEL_IDS.values() if c]
-        if configured and interaction.channel_id not in configured:
+        # Unified 2026-07-29: was region-aware (checked against either
+        # region's upload channel, since this button has no match_id yet
+        # and can't resolve a specific match's region). Now there's only
+        # ONE upload channel for all 4 queues, so this is a plain
+        # single-value check — no per-match resolution needed at all,
+        # here or in match_submit() below.
+        if config.RESULT_UPLOAD_CHANNEL_ID and interaction.channel_id != config.RESULT_UPLOAD_CHANNEL_ID:
             await interaction.response.send_message(
-                "Match results can only be submitted in your region's result-upload channel.",
+                "Match results can only be submitted in the result-upload channel.",
                 ephemeral=True,
             )
             return
@@ -252,22 +288,22 @@ class Match(commands.Cog):
         self.bot = bot
         localization.load_map_translations()
 
-    def _in_upload_channel(self, interaction: discord.Interaction, region: str) -> bool:
-        # Fail open (not block) if neither the new per-region var nor the
-        # legacy fallback is set, so a missing config value doesn't brick
-        # the whole command — matches the AFK_CHANNEL_ID / MATCH_LOG_CHANNEL_ID
-        # no-op pattern. Region-aware as of P6: checks against THIS match's
-        # region, not one fixed global channel — see config.py comment for why.
-        channel_id = config.RESULT_UPLOAD_CHANNEL_IDS.get(region)
-        if not channel_id:
+    def _in_upload_channel(self, interaction: discord.Interaction) -> bool:
+        # Fail open (not block) if RESULT_UPLOAD_CHANNEL_ID isn't set, so a
+        # missing config value doesn't brick the whole command — matches
+        # the AFK_CHANNEL_ID / MATCH_LOG_CHANNEL_ID no-op pattern. Unified
+        # 2026-07-29: was per-region (took a region str, looked it up in
+        # RESULT_UPLOAD_CHANNEL_IDS). Now a single fixed channel for all
+        # 4 queues — no per-match region lookup needed.
+        if not config.RESULT_UPLOAD_CHANNEL_ID:
             return True
-        return interaction.channel_id == channel_id
+        return interaction.channel_id == config.RESULT_UPLOAD_CHANNEL_ID
 
     @app_commands.command(name="correction-result", description="Host: flag a problem with this match's result before or after approval")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
     @app_commands.checks.cooldown(1, config.CORRECTION_COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.channel_id))
     async def correction_result(self, interaction: discord.Interaction, match_id: str):
-        match = await adb.get_match_by_code(match_id)
+        match = await adb.get_match_by_code(normalize_match_code(match_id))
         player = await adb.get_player_by_discord_id(interaction.user.id)
         if not match:
             await interaction.response.send_message("Match not found.", ephemeral=True)
@@ -288,17 +324,16 @@ class Match(commands.Cog):
             ephemeral=True,
         )
 
-    async def _approval_channel(self, region: str) -> discord.abc.Messageable | None:
-        # Region-aware as of P6 — see config.py comment for why upload/
-        # approval specifically needed splitting while match-log/AFK/issue
-        # channels did not.
-        channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(region)
-        if not channel_id:
+    async def _approval_channel(self) -> discord.abc.Messageable | None:
+        # Unified 2026-07-29 — was per-region (took a region str). One
+        # approval channel for all 4 queues now, same reasoning as
+        # _in_upload_channel above.
+        if not config.RESULT_APPROVAL_CHANNEL_ID:
             return None
-        return self.bot.get_channel(channel_id)
+        return self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID)
 
     @app_commands.command(name="match-submit-post", description="Post the persistent match-results submission panel in this channel")
-    @app_commands.checks.has_role(config.ADMIN_ROLE_ID)
+    @admin_only()
     async def match_submit_post(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             embed=discord.Embed(
@@ -418,20 +453,20 @@ class Match(commands.Cog):
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
                            screenshot_1: discord.Attachment, screenshot_2: discord.Attachment,
                            screenshot_3: discord.Attachment):
-        # Region-aware as of P6: the channel check needs to know WHICH
-        # region's upload channel is correct, which means the match has to
-        # be fetched first — this is a deliberate reorder from the
-        # pre-P6 version, which checked the channel before knowing the
-        # match at all (harmless when there was only one global channel,
-        # broken once upload channels split by region).
+        # Unified 2026-07-29: was region-aware (had to fetch the match
+        # first to know which region's channel was correct). Now there's
+        # one upload channel for all 4 queues, so the channel check no
+        # longer depends on match state at all — kept after the match
+        # fetch anyway since "match not found" should still win as the
+        # more specific error when both are wrong.
+        match_id = normalize_match_code(match_id)
         match = await adb.get_match_by_code(match_id)
         if not match:
             await interaction.response.send_message("Match not found.", ephemeral=True)
             return
 
-        if not self._in_upload_channel(interaction, match["region"]):
-            channel_id = config.RESULT_UPLOAD_CHANNEL_IDS.get(match["region"])
-            channel_mention = f"<#{channel_id}>" if channel_id else "your region's result-upload channel"
+        if not self._in_upload_channel(interaction):
+            channel_mention = f"<#{config.RESULT_UPLOAD_CHANNEL_ID}>" if config.RESULT_UPLOAD_CHANNEL_ID else "the result-upload channel"
             await interaction.response.send_message(
                 f"Match results can only be submitted in {channel_mention}.", ephemeral=True
             )
@@ -450,9 +485,20 @@ class Match(commands.Cog):
                     ephemeral=True,
                 )
             return
-        if not player or match.get("room_code_shared_by") != player["id"]:
-            await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
-            return
+
+        # Unified 2026-07-29: admin-upload-on-host's-behalf exception. If
+        # the room code sharer can't upload themselves (afk, crashed,
+        # phone died, whatever), an admin (or HOD — same ADMIN_ROLE_IDS
+        # set, see utils/permissions.py) can upload for them instead.
+        # is_admin() is checked FIRST as an explicit bypass — the
+        # host-identity check below is completely skipped for admins,
+        # not weakened, so this never accidentally loosens who counts as
+        # "the host" for a non-admin uploader.
+        uploader_is_admin = is_admin(interaction)
+        if not uploader_is_admin:
+            if not player or match.get("room_code_shared_by") != player["id"]:
+                await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
+                return
 
         attachments = (screenshot_1, screenshot_2, screenshot_3)
         for attachment in attachments:
@@ -471,7 +517,16 @@ class Match(commands.Cog):
 
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
-            await self._submit_body(interaction, match, player, maps, attachments)
+            # Unified 2026-07-29: uploaded_by on match_screenshots now
+            # stores the Discord user ID of whoever actually clicked
+            # submit — the host's ID in the normal case, or the admin's
+            # ID when the admin-upload exception above was used. This is
+            # deliberately interaction.user.id, NOT player["id"] — an
+            # admin uploading on the host's behalf may have no players
+            # row at all, and match_screenshots.uploaded_by no longer has
+            # an FK to players(id) (see migration_010), so there's no
+            # reason to force it through the player lookup anymore.
+            await self._submit_body(interaction, match, player, maps, attachments, interaction.user.id)
         except Exception as exc:
             # Safety net for anything NOT already caught by the specific
             # try/excepts inside _submit_body (OCR failure, validation
@@ -492,7 +547,8 @@ class Match(commands.Cog):
             )
 
     async def _submit_body(self, interaction: discord.Interaction, match: dict, player: dict | None,
-                            maps: list[str], attachments: tuple[discord.Attachment, ...]) -> None:
+                            maps: list[str], attachments: tuple[discord.Attachment, ...],
+                            uploader_discord_id: int) -> None:
         payloads = await asyncio.gather(*(attachment.read() for attachment in attachments))
         try:
             extractions = await asyncio.gather(*(
@@ -515,7 +571,7 @@ class Match(commands.Cog):
         # submission's audit trail would silently disagree with its own
         # MMR calculation.
         await asyncio.gather(*(
-            with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, player["id"], extraction,
+            with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, uploader_discord_id, extraction,
                         extraction.get("ocr_confidence"))
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
@@ -578,14 +634,14 @@ class Match(commands.Cog):
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit
         # happened to run.
-        approval_channel = await self._approval_channel(match["region"])
+        approval_channel = await self._approval_channel()
         if approval_channel is None:
             # Fail safe rather than fail silent — the match is validly at
             # pending_verification in the DB, but nobody can see the card
             # to approve it until this env var is set. Tell the uploader.
             await interaction.followup.send(
-                f"Scoreboards accepted, but the {match['region']} approval channel isn't configured — "
-                "an admin needs to set RESULT_APPROVAL_CHANNEL_ID_EAST/WEST before this match can be approved.",
+                "Scoreboards accepted, but the approval channel isn't configured — "
+                "an admin needs to set RESULT_APPROVAL_CHANNEL_ID before this match can be approved.",
                 ephemeral=True,
             )
             return
@@ -867,17 +923,19 @@ class Match(commands.Cog):
         return True, "approved"
 
     async def approve_result(self, interaction: discord.Interaction, match_id: int):
-        # Region-aware as of P6 — same reorder as match_submit: fetch the
-        # match first so its region is known before checking the channel.
+        # Unified 2026-07-29: was region-aware (fetched the match first
+        # to know which region's channel to check against). One approval
+        # channel for all 4 queues now, so this is a plain fixed check —
+        # still fetching the match first since "no longer awaiting
+        # approval" should win as the more specific error either way.
         match = await adb.get_match(match_id)
         if not match:
             await interaction.response.send_message("This result is no longer awaiting host approval.", ephemeral=True)
             return
 
-        approval_channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(match["region"])
-        if approval_channel_id and interaction.channel_id != approval_channel_id:
+        if config.RESULT_APPROVAL_CHANNEL_ID and interaction.channel_id != config.RESULT_APPROVAL_CHANNEL_ID:
             await interaction.response.send_message(
-                "This result can only be approved in your region's result-approval channel.", ephemeral=True
+                "This result can only be approved in the result-approval channel.", ephemeral=True
             )
             return
         player = await adb.get_player_by_discord_id(interaction.user.id)
@@ -941,8 +999,9 @@ class Match(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-            approval_channel_id = config.RESULT_APPROVAL_CHANNEL_IDS.get(match["region"])
-            approval_channel = self.bot.get_channel(approval_channel_id) if approval_channel_id else None
+            # Unified 2026-07-29: was per-region lookup — one approval
+            # channel for all 4 queues now.
+            approval_channel = self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID) if config.RESULT_APPROVAL_CHANNEL_ID else None
             if approval_channel:
                 try:
                     await approval_channel.send(

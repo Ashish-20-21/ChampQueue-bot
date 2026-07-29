@@ -150,7 +150,7 @@ class SkillVoteView(discord.ui.View):
         return button
 
 
-def make_queue_embed(region: str, current_queue: list[dict]) -> discord.Embed:
+def make_queue_embed(queue_key: str, current_queue: list[dict]) -> discord.Embed:
     player_lines = []
     for idx, p in enumerate(current_queue, 1):
         player_info = p["players"]
@@ -172,8 +172,8 @@ def make_queue_embed(region: str, current_queue: list[dict]) -> discord.Embed:
     names = "\n".join(player_lines) if player_lines else "*No players in queue. Be the first to join!*"
 
     embed = discord.Embed(
-        title=f"🛡️ Champion's Queue — {region.upper()} Region",
-        description=f"Join the competitive matchmaking lobby for the **{region.upper()}** region.",
+        title=f"🛡️ Champion's Queue — {queue_key.replace('_', '/')}",
+        description=f"Join the competitive matchmaking lobby for the **{queue_key.replace('_', '/')}** queue.",
         color=discord.Color.from_rgb(88, 101, 242)
     )
     embed.add_field(name=f"👥 Active Queue ({len(current_queue)}/10)", value=names, inline=False)
@@ -182,15 +182,19 @@ def make_queue_embed(region: str, current_queue: list[dict]) -> discord.Embed:
 
 
 class RegionQueueView(discord.ui.View):
-    def __init__(self, region: str, cog: Queue):
+    # Class name kept as RegionQueueView (not renamed to QueueKeyView) to
+    # minimize diff surface across bot.py's persistent-view re-registration
+    # on restart — it's one of 4 identical views, one per queue_key, same
+    # pattern as before, just no longer tied to players.region.
+    def __init__(self, queue_key: str, cog: Queue):
         super().__init__(timeout=None)
-        self.region = region
+        self.queue_key = queue_key
         self.cog = cog
 
         self.join_button = discord.ui.Button(
             label="Join Queue",
             style=discord.ButtonStyle.success,
-            custom_id=f"join_queue_{region}"
+            custom_id=f"join_queue_{queue_key}"
         )
         self.join_button.callback = self.join_callback
         self.add_item(self.join_button)
@@ -198,7 +202,7 @@ class RegionQueueView(discord.ui.View):
         self.leave_button = discord.ui.Button(
             label="Leave Queue",
             style=discord.ButtonStyle.danger,
-            custom_id=f"leave_queue_{region}"
+            custom_id=f"leave_queue_{queue_key}"
         )
         self.leave_button.callback = self.leave_callback
         self.add_item(self.leave_button)
@@ -206,7 +210,7 @@ class RegionQueueView(discord.ui.View):
         self.start_match_button = discord.ui.Button(
             label="Start Match",
             style=discord.ButtonStyle.primary,
-            custom_id=f"start_match_{region}"
+            custom_id=f"start_match_{queue_key}"
         )
         self.start_match_button.callback = self.start_match_callback
 
@@ -219,64 +223,67 @@ class RegionQueueView(discord.ui.View):
                 self.remove_item(self.start_match_button)
 
     async def join_callback(self, interaction: discord.Interaction):
-        await self.cog.handle_join(interaction, self.region, self)
+        await self.cog.handle_join(interaction, self.queue_key, self)
 
     async def leave_callback(self, interaction: discord.Interaction):
-        await self.cog.handle_leave(interaction, self.region, self)
+        await self.cog.handle_leave(interaction, self.queue_key, self)
 
     async def start_match_callback(self, interaction: discord.Interaction):
-        await self.cog.handle_start_match(interaction, self.region, self)
+        await self.cog.handle_start_match(interaction, self.queue_key, self)
 
 
 class Queue(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Per-region locks, not one shared lock — a match forming in East
-        # should never block Join/Leave clicks in West. See the 10062
-        # "Unknown interaction" bug write-up in DECISIONS.md for why this
-        # matters: the old single lock, combined with handle_start_match
+        # Per-queue locks, not one shared lock — a match forming in one
+        # queue should never block Join/Leave clicks in another. See the
+        # 10062 "Unknown interaction" bug write-up in DECISIONS.md for why
+        # this matters: a single lock, combined with handle_start_match
         # holding it through the whole skill-vote wait, starved unrelated
         # button clicks past Discord's 3-second interaction-ack window.
-        self._locks: dict[str, asyncio.Lock] = {"East": asyncio.Lock(), "West": asyncio.Lock()}
+        # Unified 2026-07-29: was 2 locks (East/West) keyed by region;
+        # now 4 locks keyed by config.QUEUE_KEYS, since the 4 physical
+        # queues are what actually need independent locking — region
+        # never did (it was only ever a proxy for queue membership).
+        self._locks: dict[str, asyncio.Lock] = {key: asyncio.Lock() for key in config.QUEUE_KEYS}
 
     def cog_unload(self):
         self.cleanup_sweep.cancel()
 
-    @app_commands.command(name="queue-post", description="Post the persistent queue panel for a specific region")
-    @app_commands.describe(region="The competitive region (East, West)")
+    @app_commands.command(name="queue-post", description="Post the persistent queue panel for a specific queue")
+    @app_commands.describe(queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)")
+    @app_commands.choices(queue=[
+        app_commands.Choice(name="EU / AF", value="EU_AF"),
+        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
+        app_commands.Choice(name="India / ME", value="INDIA_ME"),
+        app_commands.Choice(name="Japan", value="JAPAN"),
+    ])
     @admin_only()
-    async def queue_post(self, interaction: discord.Interaction, region: str):
-        region_norm = region.capitalize()
-        if region_norm not in ["East", "West"]:
-            await interaction.response.send_message(
-                "Invalid region. Please specify either 'East' or 'West'.", ephemeral=True
-            )
-            return
-
+    async def queue_post(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
+        queue_key = queue.value
         await interaction.response.defer(thinking=True)
-        current_queue = await adb.queue_current(region=region_norm)
-        view = RegionQueueView(region_norm, self)
+        current_queue = await adb.queue_current(queue_key=queue_key)
+        view = RegionQueueView(queue_key, self)
         await view.update_view_state(current_queue)
 
-        embed = make_queue_embed(region_norm, current_queue)
+        embed = make_queue_embed(queue_key, current_queue)
         await interaction.channel.send(embed=embed, view=view)
-        await interaction.followup.send(f"Successfully posted the persistent queue panel for **{region_norm}**.", ephemeral=True)
+        await interaction.followup.send(f"Successfully posted the persistent queue panel for **{queue.name}**.", ephemeral=True)
 
-    @app_commands.command(name="queue-status", description="See who's currently in queue for a region")
-    @app_commands.describe(region="The competitive region (East, West)")
-    async def queue_status(self, interaction: discord.Interaction, region: str):
-        region_norm = region.capitalize()
-        if region_norm not in ["East", "West"]:
-            await interaction.response.send_message(
-                "Invalid region. Please specify either 'East' or 'West'.", ephemeral=True
-            )
-            return
-
-        current = await adb.queue_current(region=region_norm)
+    @app_commands.command(name="queue-status", description="See who's currently in queue")
+    @app_commands.describe(queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)")
+    @app_commands.choices(queue=[
+        app_commands.Choice(name="EU / AF", value="EU_AF"),
+        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
+        app_commands.Choice(name="India / ME", value="INDIA_ME"),
+        app_commands.Choice(name="Japan", value="JAPAN"),
+    ])
+    async def queue_status(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
+        current = await adb.queue_current(queue_key=queue.value)
         names = ", ".join(p["players"]["ign"] for p in current) or "empty"
-        await interaction.response.send_message(f"**{region_norm} Queue ({len(current)}/10):** {names}")
+        await interaction.response.send_message(f"**{queue.name} Queue ({len(current)}/10):** {names}")
 
-    async def handle_join(self, interaction: discord.Interaction, region: str, view: RegionQueueView):
+    async def handle_join(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
         # Defer FIRST, before any DB round trip — same fix as SkillVoteView
         # above. Under concurrent clicks (queue filling up), the sequential
         # get_player_by_discord_id + queue_current + queue_join round trips
@@ -294,20 +301,23 @@ class Queue(commands.Cog):
             await interaction.followup.send(f"Your registration is `{player['status']}`, not approved yet.", ephemeral=True)
             return
 
-        if player.get("region") != region:
-            await interaction.followup.send(
-                f"Your registered region is **{player.get('region')}**. You cannot join the **{region}** queue.",
-                ephemeral=True
-            )
-            return
+        # Unified 2026-07-29: the players.region == queue_key gate is
+        # REMOVED here — that was the whole point of the unification.
+        # A player's registered region is informational only now; any
+        # approved player can join any of the 4 queues regardless of
+        # what they picked at registration. Discord's own role-gated
+        # channel visibility (managed outside this bot, via the dynamo
+        # role-sync bot) is what determines which queue channels a
+        # player can even see in the first place — this handler doesn't
+        # need to re-enforce that at the DB layer.
 
         eligible, reason = reputation.is_queue_eligible(player)
         if not eligible:
             await interaction.followup.send(reason, ephemeral=True)
             return
 
-        async with self._locks[region]:
-            current_queue = await adb.queue_current(region=region)
+        async with self._locks[queue_key]:
+            current_queue = await adb.queue_current(queue_key=queue_key)
             if len(current_queue) >= 10:
                 await interaction.followup.send(
                     "Queue is full (10/10) — a match is about to start. Try again in a moment.",
@@ -315,14 +325,14 @@ class Queue(commands.Cog):
                 )
                 return
 
-            entry = await adb.queue_join(player["id"])
+            entry = await adb.queue_join(player["id"], queue_key)
             if entry is None:
                 await interaction.followup.send("You're already in the queue.", ephemeral=True)
                 return
 
-            current_queue = await adb.queue_current(region=region)
+            current_queue = await adb.queue_current(queue_key=queue_key)
             await view.update_view_state(current_queue)
-            embed = make_queue_embed(region, current_queue)
+            embed = make_queue_embed(queue_key, current_queue)
             # DB write above already succeeded — that's the source of
             # truth. This is just the visual ack; fall back to a log entry
             # instead of an unhandled exception if the interaction token
@@ -333,7 +343,7 @@ class Queue(commands.Cog):
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:
                 logger.warning("handle_join: edit_original_response failed for player_id=%s (join already saved): %s", player["id"], e)
 
-    async def handle_leave(self, interaction: discord.Interaction, region: str, view: RegionQueueView):
+    async def handle_leave(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
         # Defer first — see handle_join above for why.
         await interaction.response.defer()
 
@@ -342,23 +352,23 @@ class Queue(commands.Cog):
             await interaction.followup.send("You're not registered.", ephemeral=True)
             return
 
-        async with self._locks[region]:
-            current_queue = await adb.queue_current(region=region)
+        async with self._locks[queue_key]:
+            current_queue = await adb.queue_current(queue_key=queue_key)
             in_queue = any(p["player_id"] == player["id"] for p in current_queue)
             if not in_queue:
                 await interaction.followup.send("You're not in the queue.", ephemeral=True)
                 return
 
             await adb.queue_leave(player["id"])
-            current_queue = await adb.queue_current(region=region)
+            current_queue = await adb.queue_current(queue_key=queue_key)
             await view.update_view_state(current_queue)
-            embed = make_queue_embed(region, current_queue)
+            embed = make_queue_embed(queue_key, current_queue)
             try:
                 await interaction.edit_original_response(embed=embed, view=view)
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:
                 logger.warning("handle_leave: edit_original_response failed for player_id=%s (leave already saved): %s", player["id"], e)
 
-    async def handle_start_match(self, interaction: discord.Interaction, region: str, view: RegionQueueView):
+    async def handle_start_match(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
         # Defer first, before the get_player_by_discord_id / queue_current /
         # lock-wait chain below — same fix as handle_join/handle_leave.
         await interaction.response.defer(ephemeral=True)
@@ -368,12 +378,12 @@ class Queue(commands.Cog):
             await interaction.followup.send("You're not registered.", ephemeral=True)
             return
 
-        async with self._locks[region]:
-            current_queue = await adb.queue_current(region=region)
+        async with self._locks[queue_key]:
+            current_queue = await adb.queue_current(queue_key=queue_key)
             if len(current_queue) < 10:
                 await interaction.followup.send("The queue no longer has 10 players.", ephemeral=True)
                 await view.update_view_state(current_queue)
-                embed = make_queue_embed(region, current_queue)
+                embed = make_queue_embed(queue_key, current_queue)
                 await interaction.message.edit(embed=embed, view=view)
                 return
 
@@ -405,17 +415,17 @@ class Queue(commands.Cog):
             await adb.queue_mark_matched(player_ids)
 
             # Reset the persistent queue panel message back to current queue state (minus the matched 10)
-            remaining_queue = await adb.queue_current(region=region)
-            new_view = RegionQueueView(region, self)
+            remaining_queue = await adb.queue_current(queue_key=queue_key)
+            new_view = RegionQueueView(queue_key, self)
             await new_view.update_view_state(remaining_queue)
-            new_embed = make_queue_embed(region, remaining_queue)
+            new_embed = make_queue_embed(queue_key, remaining_queue)
             await interaction.message.edit(embed=new_embed, view=new_view)
             # Lock released here — everything below (channel creation, the
             # skill-vote views) is slow, and the 10 players are already
             # marked matched + off the queue panel, so there's nothing left
             # for the lock to protect. Holding it through this used to
-            # freeze Join/Leave for this whole region (worse: for BOTH
-            # regions, before the per-region split above) — see
+            # freeze Join/Leave for this whole queue (worse: for ALL 4
+            # queues, before the per-queue_key split existed) — see
             # DECISIONS.md for the 10062 write-up.
 
         # Spawn the match creation and setup. Everything past this point
@@ -425,11 +435,11 @@ class Queue(commands.Cog):
         # leaving them stranded in a dead 'forming' match with no path
         # back into the queue.
         try:
-            await self._start_match_flow(interaction, players_list, player["id"], region)
+            await self._start_match_flow(interaction, players_list, player["id"], queue_key)
             await interaction.followup.send("Match started successfully!", ephemeral=True)
         except Exception:
             logger.exception(
-                f"_start_match_flow failed for region={region}, host_player_id={player['id']}. "
+                f"_start_match_flow failed for queue_key={queue_key}, host_player_id={player['id']}. "
                 f"Rolling back {len(player_ids)} players to 'waiting'."
             )
             await adb.queue_mark_waiting(player_ids)
@@ -439,7 +449,7 @@ class Queue(commands.Cog):
                 ephemeral=True,
             )
 
-    async def _start_match_flow(self, interaction: discord.Interaction, players: list[dict], host_player_id: int, region: str):
+    async def _start_match_flow(self, interaction: discord.Interaction, players: list[dict], host_player_id: int, queue_key: str):
         channel = interaction.channel
         player_ids = [p["id"] for p in players]
         bootstrap = await matchmaking.is_bootstrap_match(player_ids)
@@ -454,7 +464,7 @@ class Queue(commands.Cog):
         team_b = [players[1], players[3], players[5], players[7], players[9]]  # Attacker
 
         # Create match (no captains assigned)
-        match = await adb.create_match(is_bootstrap=bootstrap, region=region)
+        match = await adb.create_match(is_bootstrap=bootstrap, queue_key=queue_key)
         await adb.update_match(match["id"], {
             "room_code_shared_by": host_player_id
         })
@@ -466,14 +476,21 @@ class Queue(commands.Cog):
 
         guild = channel.guild
         category = channel.category
-        admin_role = guild.get_role(config.ADMIN_ROLE_ID)
+        # Unified 2026-07-29: was a single admin_role lookup. Now loops
+        # over every role in ADMIN_ROLE_IDS (HOD + admin team all get
+        # identical visibility into match channels) — see
+        # utils/permissions.py's is_admin() for the same set used
+        # elsewhere. Missing/invalid role IDs are silently skipped
+        # (guild.get_role returns None) rather than raising, consistent
+        # with the old single-role "if admin_role:" fail-open pattern.
+        admin_roles = [r for r in (guild.get_role(rid) for rid in config.ADMIN_ROLE_IDS) if r]
 
         # Private text channel overwrites
         overwrites_text = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
         }
-        if admin_role:
+        for admin_role in admin_roles:
             overwrites_text[admin_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
         for p in players:
             member = guild.get_member(int(p["discord_id"]))
@@ -491,7 +508,7 @@ class Queue(commands.Cog):
             guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
         }
-        if admin_role:
+        for admin_role in admin_roles:
             overwrites_vc_a[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
         for p in team_a:
             member = guild.get_member(int(p["discord_id"]))
@@ -509,7 +526,7 @@ class Queue(commands.Cog):
             guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
         }
-        if admin_role:
+        for admin_role in admin_roles:
             overwrites_vc_b[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
         for p in team_b:
             member = guild.get_member(int(p["discord_id"]))
@@ -536,7 +553,7 @@ class Queue(commands.Cog):
 
         # Post team embed
         embed_teams = discord.Embed(
-            title=f"Match {match['match_id']} — Teams Formed ({region.upper()})",
+            title=f"Match {match['match_id']} — Teams Formed ({queue_key.replace('_', '/')})",
             color=discord.Color.blue()
         )
         embed_teams.add_field(name="🛡️ Team Defender", value="\n".join(p["ign"] for p in team_a), inline=True)
@@ -567,8 +584,8 @@ class Queue(commands.Cog):
         await text_channel.send(
             f"{mentions}\n\n"
             f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
-            f"Host {host_mention}: share the room code here with `+roomcode<code>` "
-            f"(or `/rc <code>`). Made a typo? Use `+updateroomcode<code>` to correct it.\n"
+            f"Host {host_mention}: share the room code here with `+rc<code>` "
+            f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n"
             f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."
         )
 
@@ -585,16 +602,17 @@ class Queue(commands.Cog):
 
     async def _handle_room_code_share(self, message_or_interaction, channel: discord.TextChannel,
                                         author_id: int, code: str, respond, allow_overwrite: bool = True) -> None:
-        """Shared logic for +roomcode / +updateroomcode / the /rc slash
-        alias — same host-privilege check, same DB write, same match-log
-        post either way. `respond` is a callable(str) that sends feedback
-        back through whichever entry point was used.
+        """Shared logic for +rc / +urc / the /rc slash command — same
+        host-privilege check, same DB write, same match-log post either
+        way. `respond` is a callable(str) that sends feedback back
+        through whichever entry point was used. (Text-command prefixes
+        renamed 2026-07-29 from +roomcode/+updateroomcode to +rc/+urc.)
 
-        allow_overwrite=False (the +roomcode text-command case) refuses to
+        allow_overwrite=False (the +rc text-command case) refuses to
         change an already-set code — that mistake used to be silent and
-        is exactly what +updateroomcode exists to require explicit intent
-        for. /rc keeps allow_overwrite=True since it's documented as a
-        single share-or-correct command."""
+        is exactly what +urc exists to require explicit intent for. /rc
+        (the slash command) keeps allow_overwrite=True since it's
+        documented as a single share-or-correct command."""
         if not channel.name.startswith("cq-"):
             await respond("Room codes can only be shared in a match channel.")
             return
@@ -626,8 +644,8 @@ class Queue(commands.Cog):
         is_first_share = match.get("room_code") is None
         if not is_first_share and not allow_overwrite:
             await respond(
-                f"A room code is already set for this match. Use `+updateroomcode{code}` "
-                f"if you need to correct it — `+roomcode` won't overwrite an existing one."
+                f"A room code is already set for this match. Use `+urc{code}` "
+                f"if you need to correct it — `+rc` won't overwrite an existing one."
             )
             return
 
@@ -748,13 +766,16 @@ class Queue(commands.Cog):
         content = message.content.strip()
         code = None
         is_update = False
-        # Order matters: "+updateroomcode" also starts with "+room" if you
-        # check loosely, so the more specific prefix is checked first.
-        if content.lower().startswith("+updateroomcode"):
-            code = content[len("+updateroomcode"):].strip()
+        # Unified 2026-07-29: renamed from +roomcode/+updateroomcode to
+        # +rc/+urc per the unified-server text-command shortening. Neither
+        # prefix is a substring/prefix of the other ("+urc" doesn't start
+        # with "+rc"), but the more-specific check is still done first as
+        # defensive practice, consistent with the old ordering rationale.
+        if content.lower().startswith("+urc"):
+            code = content[len("+urc"):].strip()
             is_update = True
-        elif content.lower().startswith("+roomcode"):
-            code = content[len("+roomcode"):].strip()
+        elif content.lower().startswith("+rc"):
+            code = content[len("+rc"):].strip()
 
         if not code:
             return
@@ -762,10 +783,10 @@ class Queue(commands.Cog):
         async def respond(text: str):
             await message.channel.send(text, delete_after=5 if "Only the match host" in text else None)
 
-        # +roomcode is first-share only — a typo'd re-send with the wrong
+        # +rc is first-share only — a typo'd re-send with the wrong
         # prefix used to silently overwrite an already-set code, which is
-        # exactly the mistake +updateroomcode exists to require intent
-        # for. Found live 2026-07-18.
+        # exactly the mistake +urc exists to require intent for. Found
+        # live 2026-07-18 (originally as +roomcode/+updateroomcode).
         await self._handle_room_code_share(message, message.channel, message.author.id, code, respond, allow_overwrite=is_update)
 
 
@@ -817,8 +838,12 @@ class Queue(commands.Cog):
             color=discord.Color.orange(),
         )
         embed.set_footer(text="No automatic action taken. Requires admin review — see /admin-scrap-match.")
-        admin_role = interaction.guild.get_role(config.ADMIN_ROLE_ID) if interaction.guild else None
-        content = admin_role.mention if admin_role else None
+        # Unified 2026-07-29: was a single admin_role mention. Now pings
+        # every role in ADMIN_ROLE_IDS so any admin (or HOD) gets
+        # notified, not just whoever held the old single role.
+        admin_roles = [interaction.guild.get_role(rid) for rid in config.ADMIN_ROLE_IDS] if interaction.guild else []
+        admin_roles = [r for r in admin_roles if r]
+        content = " ".join(r.mention for r in admin_roles) if admin_roles else None
         await afk_channel.send(content=content, embed=embed)
 
     @tasks.loop(minutes=config.CLEANUP_SWEEP_INTERVAL_MINUTES)
@@ -857,5 +882,5 @@ async def setup(bot: commands.Bot):
     cog = Queue(bot)
     await bot.add_cog(cog)
     cog.cleanup_sweep.start()
-    for region in ["East", "West"]:
-        bot.add_view(RegionQueueView(region, cog))
+    for queue_key in config.QUEUE_KEYS:
+        bot.add_view(RegionQueueView(queue_key, cog))

@@ -122,7 +122,14 @@ class Database:
     # ------------------------------------------------------------------
     # QUEUE
     # ------------------------------------------------------------------
-    def queue_join(self, player_id: int) -> Optional[dict]:
+    def queue_join(self, player_id: int, queue_key: str) -> Optional[dict]:
+        # Unified 2026-07-29: queue_key is which of the 4 physical queues
+        # this join is for — set from the button the player clicked, NOT
+        # from players.region (that's now purely informational, see
+        # config.py's REGIONS vs QUEUE_KEYS comment). A player is still
+        # only allowed one active 'waiting' row at a time regardless of
+        # which queue it's in — that invariant is unchanged, just no
+        # longer tied to their registered region.
         existing = (
             self.client.table("queue_entries")
             .select("*")
@@ -133,7 +140,7 @@ class Database:
         if existing.data:
             return None  # already in queue
         res = self.client.table("queue_entries").insert(
-            {"player_id": player_id, "status": "waiting"}
+            {"player_id": player_id, "status": "waiting", "queue_key": queue_key}
         ).execute()
         return res.data[0]
 
@@ -142,13 +149,19 @@ class Database:
             "player_id", player_id
         ).eq("status", "waiting").execute()
 
-    def queue_current(self, region: Optional[str] = None) -> list[dict]:
-        """Pass region to scope the queue to one region only — required for
-        the region-scoped queue flow (East/West ping issue, see
-        SPRINT_PLAN.md §region). Filtered client-side on the already-joined
-        players.region rather than in the query itself, since queue volume
-        at any moment is at most a few dozen rows — a second round-trip or
-        a fragile nested-table filter isn't worth it at this scale."""
+    def queue_current(self, queue_key: Optional[str] = None) -> list[dict]:
+        """Pass queue_key to scope to one of the 4 physical queues — this
+        is the ping-throughput split (EU/AF, NA/Latam, India/ME, Japan),
+        kept for matchmaking reasons only. Unified 2026-07-29: this used
+        to filter on the joined players.region (registered region doubled
+        as queue membership). Now filters on queue_entries.queue_key
+        directly, which is set at join time from the button clicked —
+        decoupled from the player's registered region entirely, so a
+        player can queue in any of the 4 regardless of what they picked
+        at registration. Filtered client-side rather than in the query
+        itself, since queue volume at any moment is at most a few dozen
+        rows — a second round-trip or a fragile nested-table filter isn't
+        worth it at this scale (same reasoning as the original)."""
         res = (
             self.client.table("queue_entries")
             .select("*, players(*)")
@@ -157,8 +170,8 @@ class Database:
             .execute()
         )
         rows = res.data
-        if region is not None:
-            rows = [r for r in rows if r.get("players", {}).get("region") == region]
+        if queue_key is not None:
+            rows = [r for r in rows if r.get("queue_key") == queue_key]
         return rows
 
     def queue_mark_matched(self, player_ids: list[int]) -> None:
@@ -198,12 +211,24 @@ class Database:
         suffix = "".join(random.choices(string.digits, k=4))
         return f"CQ-{suffix}"
 
-    def create_match(self, is_bootstrap: bool, region: str, season_id: Optional[int] = None) -> dict:
+    def create_match(self, is_bootstrap: bool, queue_key: str, season_id: Optional[int] = None) -> dict:
+        # Unified 2026-07-29: matches.region is still NOT NULL (migration_008)
+        # and matches_region_check still requires a valid value, so we keep
+        # writing queue_key's value into region too — it's one of the 4 new
+        # values (EU_AF/NA_LATAM/INDIA_ME/JAPAN), which the widened
+        # migration_010 constraint accepts. region is otherwise dead: no
+        # downstream code (upload/approval channel, leaderboard, match-log)
+        # reads matches.region anymore — queue_key is what's actually used
+        # for per-queue provenance/debugging. Kept in sync rather than
+        # dropped so a future report/query against matches.region for
+        # historical reasons doesn't silently get nulls for every match
+        # created after this change.
         payload = {
             "match_id": self.generate_match_id(),
             "status": "forming",
             "is_bootstrap": is_bootstrap,
-            "region": region,
+            "region": queue_key,
+            "queue_key": queue_key,
             "season_id": season_id,
         }
         res = self.client.table("matches").insert(payload).execute()
@@ -496,6 +521,13 @@ def _get_players_by_ids(self: Database, player_ids: list[int]) -> list[dict]:
 def _upsert_match_screenshot(self: Database, match_id: int, round_number: int,
                               image_url: str, uploaded_by: int, raw_extraction: dict,
                               ocr_confidence: float | None = None) -> dict:
+    """uploaded_by: as of migration_010 (2026-07-29) this is the Discord
+    user ID of whoever actually submitted the screenshots — the host in
+    the normal case, or an admin's Discord ID when the admin-upload
+    exception was used (see cogs/match.py's match_submit). No longer FK'd
+    to players(id), since an uploading admin may not have a players row
+    at all. Pre-migration rows still contain players.id values; there's
+    no rewrite of historical data, only the constraint changed."""
     payload = {"match_id": match_id, "round_number": round_number, "image_url": image_url,
                "uploaded_by": uploaded_by, "raw_extraction": raw_extraction,
                "ocr_confidence": ocr_confidence}
@@ -617,21 +649,29 @@ def _recompute_player_career_stats(self: Database, player_id: int) -> None:
     self.client.rpc("recompute_player_career_stats", {"p_player_id": player_id}).execute()
 
 
-def _region_leaderboard(self: Database, region: str) -> list[dict]:
-    """Full region roster, MMR-ordered, no LIMIT — deliberately separate
-    from the older leaderboard() method (still used as-is by digest.py,
-    not region-scoped, top-N only). This one is for the persistent
-    leaderboard panel: everyone registered in the region, growing as
-    registration adds more, per P6's confirmed scope (2026-07-19)."""
-    return self.client.rpc("region_leaderboard", {"p_region": region}).execute().data
+def _region_leaderboard(self: Database) -> list[dict]:
+    """Full roster, MMR-ordered, no LIMIT — deliberately separate from the
+    older leaderboard() method (still used as-is by digest.py, top-N only).
+    This one is for the persistent leaderboard panel: everyone approved,
+    growing as registration adds more.
+
+    Unified 2026-07-29: was region-scoped (p_region arg) as of P6. Now
+    global across all 4 queues/regions per the unified-region decision —
+    see migration_010_unified_region_queue.sql for the RPC body change.
+    Function/method name kept as-is (not renamed to e.g. global_leaderboard)
+    to minimize the diff; only the signature lost its argument."""
+    return self.client.rpc("region_leaderboard", {}).execute().data
 
 
-def _weekly_leaders(self: Database, region: str) -> dict[str, dict]:
+def _weekly_leaders(self: Database) -> dict[str, dict]:
     """Returns {category: {"player_id": ..., "value": ...}} for the 5
-    weekly badge categories, region-scoped, one round-trip. A category
-    can be absent from the result (e.g. top_impact with zero impact data
-    this week) — callers must handle missing keys, not assume all 5."""
-    rows = self.client.rpc("weekly_leaders", {"p_region": region}).execute().data
+    weekly badge categories, one round-trip. A category can be absent from
+    the result (e.g. top_impact with zero impact data this week) —
+    callers must handle missing keys, not assume all 5.
+
+    Unified 2026-07-29: was region-scoped (p_region arg) as of P6. Now
+    global — see migration_010_unified_region_queue.sql."""
+    rows = self.client.rpc("weekly_leaders", {}).execute().data
     return {row["category"]: {"player_id": row["player_id"], "value": row["value"]} for row in rows}
 
 

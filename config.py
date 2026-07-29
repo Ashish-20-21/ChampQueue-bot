@@ -10,7 +10,11 @@ Required env vars (put these in a .env file, see .env.example):
     ANTHROPIC_API_KEY          required if VISION_PROVIDER=anthropic
     OPENAI_API_KEY             required if VISION_PROVIDER=openai
     QWEN_API_KEY               required if VISION_PROVIDER=qwen
-    ADMIN_ROLE_ID              Discord role ID allowed to approve players / review flagged matches
+    ADMIN_ROLE_IDS             Comma-separated Discord role IDs allowed to approve players,
+                               review flagged matches, and (as of the unified-region launch)
+                               upload scoreboards on a host's behalf. Multiple roles supported
+                               so HOD + admin team all carry identical full admin power — see
+                               DECISIONS.md 2026-07-29. Example: "111111111,222222222"
     GUILD_ID                   Discord server (guild) ID the bot operates in
 """
 
@@ -33,7 +37,16 @@ def _require(name: str) -> str:
 # --- Discord ---
 DISCORD_BOT_TOKEN = _require("DISCORD_BOT_TOKEN")
 GUILD_ID = int(_require("GUILD_ID"))
-ADMIN_ROLE_ID = int(_require("ADMIN_ROLE_ID"))
+
+# Unified 2026-07-29: was a single ADMIN_ROLE_ID. HOD + admin team both need
+# identical full admin power (approve/reject players, force-approve matches,
+# AND — new as of this change — upload scoreboards on a host's behalf), so
+# this is now a set of role IDs rather than one. Comma-separated in .env;
+# whitespace around commas is stripped so "111, 222" and "111,222" both work.
+# Old single-role .env files break loudly here (KeyError on ADMIN_ROLE_ID
+# elsewhere) rather than silently — see migration/deploy notes in DECISIONS.md
+# for the required .env rename from ADMIN_ROLE_ID to ADMIN_ROLE_IDS.
+ADMIN_ROLE_IDS = {int(x.strip()) for x in _require("ADMIN_ROLE_IDS").split(",") if x.strip()}
 
 # --- P4: AFK reporting + match-log channel ---
 # Both channels are created manually in Discord (bot doesn't create them) —
@@ -44,40 +57,39 @@ ADMIN_ROLE_ID = int(_require("ADMIN_ROLE_ID"))
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
-# --- P5: result upload + approval channels ---
-# Region-aware as of P6 (2026-07-19) — found live: East/West are role-gated
-# so a player in one region literally cannot see the other's channels. A
-# single global RESULT_UPLOAD_CHANNEL_ID meant one entire region could
-# never run /match-submit at all — not a display bug, a hard block on the
-# core pipeline. Fixed by keying off the match's own `region` column
-# (every match already has one) instead of one fixed channel ID.
-#
-# MATCH_LOG_CHANNEL_ID / AFK_CHANNEL_ID / ISSUE_INTAKE_CHANNEL_ID /
-# ISSUE_RESOLVED_CHANNEL_ID deliberately stay single/general channels —
-# all four are bot-push-only (the bot posts an update, no player runs a
-# command from inside them), so a shared channel visible to both regions
-# is correct there, not a gap. Only upload + approval needed splitting,
-# because those are the two where a player/host must run a command from
-# inside the specific channel.
-RESULT_UPLOAD_CHANNEL_ID_EAST = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID_EAST")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID_EAST") else None
-RESULT_UPLOAD_CHANNEL_ID_WEST = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID_WEST")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID_WEST") else None
-RESULT_APPROVAL_CHANNEL_ID_EAST = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID_EAST")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID_EAST") else None
-RESULT_APPROVAL_CHANNEL_ID_WEST = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID_WEST")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID_WEST") else None
+# --- Unified global region + 4-queue matchmaking (2026-07-29) ---
+# Server moved to one unified show with four ticket-counter queues, kept
+# separate for matchmaking throughput / ping reasons only. Everything
+# downstream of "a match happened" collapses into ONE pool: one upload
+# channel, one approval channel, one match-log (already was), one
+# leaderboard. QUEUE_KEYS is the source of truth for which 4 queues
+# exist — used for queue-post buttons, per-queue locks, and validating
+# /queue-post's region argument. This is DELIBERATELY separate from
+# players.region (see REGIONS below) — queue_key is "which physical
+# queue is this match/entry in", region is "informational label the
+# player picked at registration", and the whole point of this change is
+# that the two no longer have to match.
+QUEUE_KEYS = ["EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 
-RESULT_UPLOAD_CHANNEL_IDS = {"East": RESULT_UPLOAD_CHANNEL_ID_EAST, "West": RESULT_UPLOAD_CHANNEL_ID_WEST}
-RESULT_APPROVAL_CHANNEL_IDS = {"East": RESULT_APPROVAL_CHANNEL_ID_EAST, "West": RESULT_APPROVAL_CHANNEL_ID_WEST}
+# Registration-time region label. Informational only as of this change —
+# never read by queue/match/channel logic. Old East/West values are left
+# alone in the DB (see migration_010) and intentionally still valid here
+# so nothing chokes on historical data; only NEW registrations should use
+# the 4 new values going forward.
+REGIONS = ["East", "West", "EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 
-# Deprecated single-channel fallback — kept ONLY so an existing .env from
-# before this change doesn't silently break on deploy (old var still sets
-# both regions to the same channel until you migrate to the _EAST/_WEST
-# pair above). Remove this block once RESULT_UPLOAD_CHANNEL_ID_EAST/WEST
-# are both actually set in your .env.
-_legacy_upload = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
-_legacy_approval = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
-if _legacy_upload and not (RESULT_UPLOAD_CHANNEL_ID_EAST or RESULT_UPLOAD_CHANNEL_ID_WEST):
-    RESULT_UPLOAD_CHANNEL_IDS = {"East": _legacy_upload, "West": _legacy_upload}
-if _legacy_approval and not (RESULT_APPROVAL_CHANNEL_ID_EAST or RESULT_APPROVAL_CHANNEL_ID_WEST):
-    RESULT_APPROVAL_CHANNEL_IDS = {"East": _legacy_approval, "West": _legacy_approval}
+# --- P5/P6: result upload + approval channels ---
+# Unified 2026-07-29 — was per-region (_EAST/_WEST dict) as of P6, keyed
+# off the match's own `region` column. That split existed only because
+# East/West were role-gated into separate channel visibility; the new
+# unified-region design explicitly wants ONE upload channel and ONE
+# approval channel for all 4 queues, so the per-region dict is gone.
+# If RESULT_UPLOAD_CHANNEL_ID / RESULT_APPROVAL_CHANNEL_ID aren't set,
+# the features that need them no-op with a log warning (same fail-open
+# pattern as AFK_CHANNEL_ID / MATCH_LOG_CHANNEL_ID above) rather than
+# crashing the bot on boot.
+RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
+RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
 
 # --- Correction/review system ---
 # Intake: new match_issues rows post here (OCR failures routed automatically,

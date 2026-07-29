@@ -7,7 +7,14 @@ from discord.ext import commands
 import config
 from database.db import adb
 
-VALID_REGIONS = ["East", "West"]
+# Unified 2026-07-29: was ["East", "West"]. Now the 4 new region labels —
+# informational only, never a matchmaking gate (see config.py's REGIONS vs
+# QUEUE_KEYS comment, and cogs/queue.py's handle_join, which no longer
+# checks this against the queue a player joins). Old East/West rows in
+# the DB are left as-is per decision with Noiceee_pro 2026-07-29 — this
+# list intentionally does NOT include them, since /register should only
+# ever offer the new 4 going forward.
+VALID_REGIONS = ["EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 COD_UID_PATTERN = re.compile(r"^\d{19}$")  # exactly 19 digits, numeric only
 
 
@@ -19,12 +26,14 @@ class Registration(commands.Cog):
     @app_commands.describe(
         cod_uid="Your COD Mobile UID — 19 digits, exactly as shown in-game",
         ign="Your current in-game name",
-        region="Your competitive region",
+        region="Your region (informational — doesn't restrict which queue you can join)",
         organization="Your organization, if any (optional)",
     )
     @app_commands.choices(region=[
-        app_commands.Choice(name="East", value="East"),
-        app_commands.Choice(name="West", value="West"),
+        app_commands.Choice(name="EU / AF", value="EU_AF"),
+        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
+        app_commands.Choice(name="India / ME", value="INDIA_ME"),
+        app_commands.Choice(name="Japan", value="JAPAN"),
     ])
     async def register(self, interaction: discord.Interaction, cod_uid: str, ign: str,
                         region: str, organization: str | None = None):
@@ -115,7 +124,8 @@ class Registration(commands.Cog):
         await adb.approve_player(player["id"], approved_by="auto")
         await interaction.response.send_message(
             f"You're registered and approved, **{ign}**! (UID `{cod_uid}`, region `{region}`) "
-            f"You can head to your region's queue channel and join now.",
+            f"You can head to any of the queue channels and join now — your region is just a "
+            f"label for us, it doesn't limit which queue you can play in.",
             ephemeral=True,
         )
 

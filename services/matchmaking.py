@@ -42,7 +42,7 @@ async def is_bootstrap_match(player_ids: list[int]) -> bool:
 def _performance_score(player: dict) -> float:
     """Single composite score used ONLY for balancing/captain selection —
     not the same thing as MMR, though MMR is the dominant input."""
-    mmr = player.get("mmr", 150)  # matches players.mmr's default (150 as of P6, see migration_006_p6_full.sql)
+    mmr = player.get("mmr", 200)  # matches players.mmr's default (200 as of 2026-07-30 global-transition reset, see migration_012)
     win_rate = 0.0
     total = player.get("total_matches", 0)
     if total > 0:

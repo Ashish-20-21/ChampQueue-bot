@@ -23,26 +23,30 @@ def derive_rank(mmr: int) -> tuple[str, str]:
 
     IMPORTANT: this must stay in sync BY HAND with the identical CASE
     chain inside approve_ro3_match() in
-    database/migration_006_p6_stats_and_ranks.sql. That SQL function is
-    the one that actually writes players.current_rank / peak_rank — this
-    Python function is used for display purposes elsewhere (e.g.
-    /rank-progress) and is not itself read by the approval path. There is
-    no single source of truth at the code level; if you change one,
-    change the other in the same commit. 150-point bands, confirmed
-    2026-07-19 (was 100-point bands through P5).
+    database/migration_006_p6_full.sql (superseded by
+    migration_012_rank_band_widen_and_global_reset.sql as of
+    2026-07-30). That SQL function is the one that actually writes
+    players.current_rank / peak_rank — this Python function is used for
+    display purposes elsewhere (e.g. /rank-progress) and is not itself
+    read by the approval path. There is no single source of truth at
+    the code level; if you change one, change the other in the same
+    commit. 200-point bands, confirmed 2026-07-30 (was 150-point bands
+    through the unified-region-test session; 100-point bands through
+    P5) — widened as part of the esports -> global transition, alongside
+    a one-time reset of every existing player's MMR to 200.
     """
     mmr = max(0, mmr)
     tiers = (
-        (1501, "Titans"),
-        (1351, "Legendary2"),
-        (1201, "Legendary1"),
-        (1051, "Grandmaster2"),
-        (901, "Grandmaster1"),
-        (751, "Master2"),
-        (601, "Master1"),
-        (451, "PRO2"),
-        (301, "PRO1"),
-        (151, "Elite2"),
+        (2001, "Titans"),
+        (1801, "Legendary2"),
+        (1601, "Legendary1"),
+        (1401, "Grandmaster2"),
+        (1201, "Grandmaster1"),
+        (1001, "Master2"),
+        (801, "Master1"),
+        (601, "PRO2"),
+        (401, "PRO1"),
+        (201, "Elite2"),
         (0, "Elite1"),
     )
     for floor, tier in tiers:

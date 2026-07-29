@@ -442,8 +442,8 @@ class Match(commands.Cog):
         # defer-first pattern already used correctly in match_submit.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        admin_player = await adb.get_player_by_discord_id(interaction.user.id)
-        issue = await adb.resolve_match_issue(issue_id, admin_player["id"] if admin_player else None, note)
+        admin_player = await with_retry(adb.get_player_by_discord_id, interaction.user.id)
+        issue = await with_retry(adb.resolve_match_issue, issue_id, admin_player["id"] if admin_player else None, note)
         reporter = await with_retry(adb.get_players_by_ids, [issue["reported_by"]])
         reporter_discord_id = reporter[0]["discord_id"] if reporter else None
 

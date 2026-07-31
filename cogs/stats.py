@@ -131,6 +131,43 @@ class Stats(commands.Cog):
         # intended behavior.
         await interaction.response.send_message(embed=player_stats_card(player, weekly), ephemeral=True)
 
+    @app_commands.command(name="who-nickname", description="Find a player's mention/tag by their in-game name (IGN)")
+    @app_commands.describe(ign="The exact IGN to search for (not case-sensitive)")
+    async def who_nickname(self, interaction: discord.Interaction, ign: str):
+        # Added 2026-07-29 — real problem found live: players in VC
+        # couldn't tag teammates by IGN, since Discord usernames rarely
+        # match IGN and most players don't have Developer Mode enabled to
+        # grab a raw ID. This is the lookup half of the fix; the other
+        # half (utils/nicknames.py's sync_nickname) sets the server
+        # NICKNAME to the IGN at approval time, so Discord's own native
+        # @-mention autocomplete should cover most cases going forward —
+        # this command exists for anyone whose nickname sync hasn't run
+        # yet, failed silently (missing bot permission — see
+        # sync_nickname's docstring), or who just prefers a direct lookup.
+        matches = await adb.get_players_by_ign(ign.strip())
+
+        if not matches:
+            await interaction.response.send_message(
+                f"No approved player found with IGN `{ign}`. Check the spelling — this is an exact match, not fuzzy.",
+                ephemeral=True,
+            )
+            return
+
+        if len(matches) == 1:
+            p = matches[0]
+            await interaction.response.send_message(f"**{p['ign']}** → <@{p['discord_id']}>", ephemeral=True)
+            return
+
+        # Multiple players share this exact IGN (rare, but ign has no
+        # unique constraint — see get_players_by_ign's docstring). Show
+        # all of them rather than silently guessing which one the caller
+        # meant — a wrong guess here means tagging the wrong person.
+        lines = "\n".join(f"**{p['ign']}** → <@{p['discord_id']}> (UID `{p['cod_uid']}`)" for p in matches)
+        await interaction.response.send_message(
+            f"Multiple players found with IGN `{ign}` — use their UID to tell them apart:\n{lines}",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="leaderboard-post", description="Post the persistent unified leaderboard panel")
     @admin_only()
     async def leaderboard_post(self, interaction: discord.Interaction):

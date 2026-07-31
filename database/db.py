@@ -84,6 +84,29 @@ class Database:
         res = self.client.table("players").select("*").eq("id", player_id).execute()
         return res.data[0] if res.data else None
 
+    def get_players_by_ign(self, ign: str) -> list[dict]:
+        """Case-insensitive EXACT match on ign — added 2026-07-29 for
+        /who-nickname (players tagging each other by IGN in VC, since
+        Discord usernames rarely match IGN and most players don't have
+        Developer Mode to grab a raw ID). Returns a list, not a single
+        row: ign has no unique constraint in the schema (deliberately —
+        IGNs are mutable, a uniqueness constraint would block a normal
+        in-game rename if two players' old/new names ever briefly
+        collided), so a shared IGN is possible even if rare. Callers
+        must handle 0, 1, or multiple results — see cogs/stats.py's
+        who_nickname command for the disambiguation-list behavior.
+
+        % and _ are escaped before the ilike call — PostgREST's ilike
+        treats both as wildcards (any-chars / single-char), and real
+        IGNs can legitimately contain underscores, so an unescaped
+        search for "Xo_Beast" would also match "Xo.Beast" or "XoABeast",
+        which is a false positive, not a fuzzy-match feature anyone
+        asked for. Escaping keeps this a true exact-except-for-case
+        match."""
+        escaped = ign.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        res = self.client.table("players").select("*").ilike("ign", escaped).eq("status", "approved").execute()
+        return res.data
+
     def create_player(self, discord_id: str, cod_uid: str, ign: str, region: str,
                        organization: Optional[str] = None) -> dict:
         payload = {

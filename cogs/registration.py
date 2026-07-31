@@ -6,6 +6,7 @@ from discord.ext import commands
 
 import config
 from database.db import adb
+from utils.nicknames import sync_nickname
 
 # Unified 2026-07-29: was ["East", "West"]. Now the 4 new region labels —
 # informational only, never a matchmaking gate (see config.py's REGIONS vs
@@ -122,6 +123,10 @@ class Registration(commands.Cog):
             raise
 
         await adb.approve_player(player["id"], approved_by="auto")
+        # Fire-and-forget: a failed nickname sync (missing permission,
+        # role hierarchy) never blocks registration — see utils/nicknames.py.
+        if isinstance(interaction.user, discord.Member):
+            await sync_nickname(interaction.user, ign)
         await interaction.response.send_message(
             f"You're registered and approved, **{ign}**! (UID `{cod_uid}`, region `{region}`) "
             f"You can head to any of the queue channels and join now — your region is just a "

@@ -261,6 +261,71 @@ class Admin(commands.Cog):
             return
         await interaction.followup.send(f"Stats recomputed for **{player['ign']}** — check `/player-stats`.", ephemeral=True)
 
+    @app_commands.command(name="admin-recompute-stats-bulk", description="[Admin] Force-refresh career stats for up to 10 players at once")
+    @app_commands.describe(
+        user1="Player 1", user2="Player 2", user3="Player 3", user4="Player 4", user5="Player 5",
+        user6="Player 6", user7="Player 7", user8="Player 8", user9="Player 9", user10="Player 10",
+    )
+    @admin_only()
+    async def recompute_stats_bulk(
+        self, interaction: discord.Interaction,
+        user1: discord.Member, user2: discord.Member | None = None, user3: discord.Member | None = None,
+        user4: discord.Member | None = None, user5: discord.Member | None = None, user6: discord.Member | None = None,
+        user7: discord.Member | None = None, user8: discord.Member | None = None, user9: discord.Member | None = None,
+        user10: discord.Member | None = None,
+    ):
+        # Batch version of /admin-recompute-stats, added 2026-07-29 —
+        # doing this one-by-one after a bulk DB fix was time-consuming
+        # for the admin. Only user1 is required; the rest are optional
+        # so this works for anywhere from 1 to 10 players in one call.
+        # Discord slash commands cap at 25 options and have no native
+        # array/list parameter type, so 10 named optional discord.Member
+        # slots is the standard pattern for "up to N of the same thing"
+        # — same reasoning as why /match-submit takes 3 separate
+        # attachment parameters instead of a list.
+        #
+        # Deliberately sequential, not gathered concurrently: each
+        # recompute is a real RPC call, and processing one-by-one means
+        # a single player's failure is isolated and reported by name
+        # instead of asyncio.gather's default all-or-nothing exception
+        # behavior silently obscuring which specific player failed.
+        candidates = [user1, user2, user3, user4, user5, user6, user7, user8, user9, user10]
+        users = [u for u in candidates if u is not None]
+
+        # Duplicate mentions (admin fat-fingering the same user into two
+        # slots) would just mean a harmless double-recompute — de-dupe
+        # by id anyway so the summary counts and error list stay clean.
+        seen_ids = set()
+        deduped = []
+        for u in users:
+            if u.id not in seen_ids:
+                seen_ids.add(u.id)
+                deduped.append(u)
+        users = deduped
+
+        await interaction.response.defer(ephemeral=True)
+
+        succeeded, failed, not_registered = [], [], []
+        for u in users:
+            player = await adb.get_player_by_discord_id(u.id)
+            if not player:
+                not_registered.append(u.mention)
+                continue
+            try:
+                await adb.recompute_player_career_stats(player["id"])
+                succeeded.append(player["ign"])
+            except Exception as exc:
+                failed.append(f"{player['ign']} ({exc})")
+
+        lines = [f"Recomputed **{len(succeeded)}/{len(users)}** players."]
+        if succeeded:
+            lines.append("✅ " + ", ".join(succeeded))
+        if failed:
+            lines.append("❌ Failed: " + "; ".join(failed))
+        if not_registered:
+            lines.append("⚠️ Not registered: " + ", ".join(not_registered))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
     @approve.error
     @reject.error
     @review_queue.error
@@ -270,6 +335,7 @@ class Admin(commands.Cog):
     @adjust_mmr.error
     @scrap_match.error
     @recompute_stats.error
+    @recompute_stats_bulk.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(str(error), ephemeral=True)

@@ -582,8 +582,30 @@ class Queue(commands.Cog):
             title=f"Match {match['match_id']} — Teams Formed ({queue_key.replace('_', '/')})",
             color=discord.Color.blue()
         )
-        embed_teams.add_field(name="🛡️ Team Defender", value="\n".join(p["ign"] for p in team_a), inline=True)
-        embed_teams.add_field(name="⚔️ Team Attacker", value="\n".join(p["ign"] for p in team_b), inline=True)
+        # Roster-display fix (2026-08-08): players couldn't tell who's who
+        # in voice chat, since Discord usernames rarely match IGNs. A
+        # sync_nickname feature (writing IGN into the Discord server
+        # nickname) was built, tested, then deliberately reverted — real
+        # ongoing maintenance cost (re-sync on every IGN change, bot-role
+        # hierarchy dependency) for a problem solvable at display time
+        # instead. This is that display-time fix: IGN and the real
+        # <@discord_id> mention stacked on two lines per player, not
+        # combined onto one. A single combined line ("IGN — @mention")
+        # was tried and rejected — Discord mentions render at whatever
+        # length the person's actual username is, which routinely pushes
+        # a combined line past mobile width and wraps mid-mention. Stacked
+        # lines can't wrap unpredictably since IGN alone is short and the
+        # mention is a single atomic pill either way.
+        embed_teams.add_field(
+            name="🛡️ Team Defender",
+            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_a),
+            inline=True,
+        )
+        embed_teams.add_field(
+            name="⚔️ Team Attacker",
+            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_b),
+            inline=True,
+        )
         # Mode footer intentionally not shown to players — bootstrap is an
         # internal matchmaking detail, not player-facing info. Still stored
         # on the match row (is_bootstrap) for later analysis.
@@ -606,9 +628,15 @@ class Queue(commands.Cog):
         embed_maps.set_footer(text="Round 1: Map 1 | Round 2: Map 2 | Round 3: Map 3")
         await text_channel.send(embed=embed_maps)
 
-        mentions = " ".join(f"<@{p['discord_id']}>" for p in players)
+        # NOTE (2026-08-08): redundant re-ping of all 10 players removed —
+        # they're already individually tagged in the "Teams Formed" embed
+        # posted just above (each IGN is followed by their <@mention> on
+        # its own line, per the roster-display fix). Kept here, commented,
+        # in case we want to reintroduce a single combined ping or change
+        # the notification format later.
+        # mentions = " ".join(f"<@{p['discord_id']}>" for p in players)
         await text_channel.send(
-            f"{mentions}\n\n"
+            # f"{mentions}\n\n"
             f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
             f"Host {host_mention}: share the room code here with `+rc<code>` "
             f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n"

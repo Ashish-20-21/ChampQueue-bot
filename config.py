@@ -91,6 +91,15 @@ REGIONS = ["East", "West", "EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
 RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
 
+# --- Priority fixes: admin IGN-change channel ---
+# 2026-08-08: players frequently change their in-game name after queueing
+# (sometimes mid-match), and OCR/roster mismatches were traced back to this
+# more than once. registration.py deliberately dropped self-service
+# /update-ign (see its own comment) in favor of admin-only correction here.
+# Same fail-open pattern as above: if unset, /admin-ign-change works from
+# any channel rather than crashing the bot on boot.
+IGN_CHANGE_CHANNEL_ID = int(os.getenv("IGN_CHANGE_CHANNEL_ID")) if os.getenv("IGN_CHANGE_CHANNEL_ID") else None
+
 # --- Correction/review system ---
 # Intake: new match_issues rows post here (OCR failures routed automatically,
 # plus anything filed via /correction-result). Outbound: resolutions get

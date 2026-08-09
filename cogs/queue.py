@@ -81,7 +81,15 @@ class SkillVoteView(discord.ui.View):
             # round trips alone can exceed 3s even though nothing is
             # actually broken. defer() is a single fast Discord-side call
             # with no DB dependency, so it wins that race every time.
-            await interaction.response.defer()
+            #
+            # ephemeral=True: if the later edit_original_response ever fails
+            # (stale token under load — see the 5th-voter race note below),
+            # a non-ephemeral defer makes Discord render a public red
+            # "interaction failed" to the player even though their vote was
+            # saved. Ephemeral keeps any failure quiet and consistent with
+            # the followup fallback. Fix 2026-07-30 after a live report of
+            # exactly this on the team-completing (5th) vote.
+            await interaction.response.defer(ephemeral=True)
 
             player = await adb.get_player_by_discord_id(interaction.user.id)
             if not player or player["id"] not in self.team_player_ids:
@@ -114,25 +122,43 @@ class SkillVoteView(discord.ui.View):
             button.disabled = True
             button.label = f"{skill} ✓ ({player['ign']})"
 
-            # Once the whole team (5/5) has picked, flush the batch in one
-            # bulk write instead of waiting for the view timeout. This is
-            # the actual optimization: 5 individual writes collapsed to 1.
-            if len(self.voted_player_ids) >= len(self.team_player_ids):
-                await self._flush_votes()
-
-            # This visual update can still fail on a stale/expired
-            # interaction token in rare cases, which would otherwise
-            # leave the player thinking their vote didn't register even
-            # though the in-memory pick (and, once flushed, the DB write)
-            # already happened. Fall back to a plain confirmation message
-            # so they always know their pick locked in correctly.
+            # Update the player's UI FIRST, before any DB write. Fix
+            # 2026-07-30: previously, when this click was the 5th (team-
+            # completing) vote, _flush_votes() ran inline HERE — a real
+            # Supabase round-trip inserted between the defer and the
+            # response edit. Under concurrent load (pool contention while
+            # 8-10 players click at once) that extra latency could push
+            # edit_original_response past its valid token window, so it
+            # threw and the player saw "interaction failed" even though
+            # their vote was saved. The 5th voter did strictly more work
+            # in the critical path than voters 1-4, making them
+            # structurally the one who fails. Now the UI edit happens
+            # first (fast, no DB), and the flush moves after it.
+            edit_failed = False
             try:
                 await interaction.edit_original_response(view=self)
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+                edit_failed = True
                 logger.warning(
-                    "SkillVoteView: edit_original_response failed for player_id=%s, skill=%s (vote already recorded): %s",
+                    "SkillVoteView: edit_original_response failed for player_id=%s, skill=%s (vote will still be recorded): %s",
                     player["id"], skill, e,
                 )
+
+            # Now flush to the DB, AFTER the player's UI has already been
+            # answered — the player is never waiting on this write, so its
+            # latency can no longer break their interaction response. Once
+            # the whole team (5/5) has picked, this is the single bulk
+            # write that collapses 5 individual writes into 1; otherwise
+            # the pending votes wait for the next completing click or the
+            # on_timeout fallback.
+            if len(self.voted_player_ids) >= len(self.team_player_ids):
+                await self._flush_votes()
+
+            # Only if the visual update actually failed do we send the
+            # plain-text confirmation fallback, so the player still knows
+            # their pick locked in even though the button display didn't
+            # refresh on their end.
+            if edit_failed:
                 try:
                     await interaction.followup.send(
                         f"Your pick (**{skill}**) is locked in — your vote was saved successfully "
@@ -556,8 +582,30 @@ class Queue(commands.Cog):
             title=f"Match {match['match_id']} — Teams Formed ({queue_key.replace('_', '/')})",
             color=discord.Color.blue()
         )
-        embed_teams.add_field(name="🛡️ Team Defender", value="\n".join(p["ign"] for p in team_a), inline=True)
-        embed_teams.add_field(name="⚔️ Team Attacker", value="\n".join(p["ign"] for p in team_b), inline=True)
+        # Roster-display fix (2026-08-08): players couldn't tell who's who
+        # in voice chat, since Discord usernames rarely match IGNs. A
+        # sync_nickname feature (writing IGN into the Discord server
+        # nickname) was built, tested, then deliberately reverted — real
+        # ongoing maintenance cost (re-sync on every IGN change, bot-role
+        # hierarchy dependency) for a problem solvable at display time
+        # instead. This is that display-time fix: IGN and the real
+        # <@discord_id> mention stacked on two lines per player, not
+        # combined onto one. A single combined line ("IGN — @mention")
+        # was tried and rejected — Discord mentions render at whatever
+        # length the person's actual username is, which routinely pushes
+        # a combined line past mobile width and wraps mid-mention. Stacked
+        # lines can't wrap unpredictably since IGN alone is short and the
+        # mention is a single atomic pill either way.
+        embed_teams.add_field(
+            name="🛡️ Team Defender",
+            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_a),
+            inline=True,
+        )
+        embed_teams.add_field(
+            name="⚔️ Team Attacker",
+            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_b),
+            inline=True,
+        )
         # Mode footer intentionally not shown to players — bootstrap is an
         # internal matchmaking detail, not player-facing info. Still stored
         # on the match row (is_bootstrap) for later analysis.
@@ -580,9 +628,15 @@ class Queue(commands.Cog):
         embed_maps.set_footer(text="Round 1: Map 1 | Round 2: Map 2 | Round 3: Map 3")
         await text_channel.send(embed=embed_maps)
 
-        mentions = " ".join(f"<@{p['discord_id']}>" for p in players)
+        # NOTE (2026-08-08): redundant re-ping of all 10 players removed —
+        # they're already individually tagged in the "Teams Formed" embed
+        # posted just above (each IGN is followed by their <@mention> on
+        # its own line, per the roster-display fix). Kept here, commented,
+        # in case we want to reintroduce a single combined ping or change
+        # the notification format later.
+        # mentions = " ".join(f"<@{p['discord_id']}>" for p in players)
         await text_channel.send(
-            f"{mentions}\n\n"
+            # f"{mentions}\n\n"
             f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
             f"Host {host_mention}: share the room code here with `+rc<code>` "
             f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n"

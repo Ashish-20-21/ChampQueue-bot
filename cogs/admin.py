@@ -187,6 +187,39 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(name="admin-ign-change", description="[Admin] Change a player's IGN — use when they've renamed after registering/queueing")
+    @admin_only()
+    async def ign_change(self, interaction: discord.Interaction, user: discord.Member, new_ign: str):
+        # Restricted to a dedicated channel, same fail-open-if-unset pattern
+        # as RESULT_UPLOAD/APPROVAL_CHANNEL_ID — see config.py.
+        if config.IGN_CHANGE_CHANNEL_ID and interaction.channel_id != config.IGN_CHANGE_CHANNEL_ID:
+            await interaction.response.send_message(
+                f"This only works in <#{config.IGN_CHANGE_CHANNEL_ID}>.", ephemeral=True,
+            )
+            return
+
+        player = await adb.get_player_by_discord_id(user.id)
+        if not player:
+            await interaction.response.send_message(f"{user.mention} hasn't registered.", ephemeral=True)
+            return
+
+        old_ign = player["ign"]
+        cleaned_new_ign = new_ign.strip()
+        if not cleaned_new_ign:
+            await interaction.response.send_message("New IGN can't be empty.", ephemeral=True)
+            return
+        if cleaned_new_ign == old_ign:
+            await interaction.response.send_message(f"**{old_ign}** is already their IGN — nothing to change.", ephemeral=True)
+            return
+
+        # No history table by design (2026-08-08 decision) — this message
+        # IS the audit trail, hence public in-channel rather than ephemeral.
+        await adb.update_ign(player["id"], cleaned_new_ign)
+        await interaction.response.send_message(
+            f"IGN changed: **{old_ign}** → **{cleaned_new_ign}**  ({user.mention}) — by {interaction.user.mention}\n"
+            f"-# {user.mention}, run `/player-stats` to confirm.",
+        )
+
     @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after 1hr")
     @admin_only()
     async def scrap_match(self, interaction: discord.Interaction, match_id: str, reason: str):
@@ -268,6 +301,7 @@ class Admin(commands.Cog):
     @force_approve.error
     @adjust_reputation.error
     @adjust_mmr.error
+    @ign_change.error
     @scrap_match.error
     @recompute_stats.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):

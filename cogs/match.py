@@ -456,8 +456,19 @@ class Match(commands.Cog):
         # update spot in the codebase, which logs a warning so a stale-
         # looking intake message can be correlated back to a real cause
         # instead of looking like an unexplained UI glitch).
+        match_label = "your match"  # fallback if the embed is ever missing/malformed
         try:
             resolved_embed = original_message.embeds[0]
+            # The intake embed's title always starts "Match CQ-XXXX — ..."
+            # (see line 245/417 where it's created) — pull the code back
+            # out of it rather than a fresh adb.get_match() round-trip;
+            # this embed is already fetched and about to be edited anyway,
+            # so re-querying the DB for data already sitting in memory
+            # would be pure waste. split(" ", 2) survives either of the
+            # two title variants ("needs review" / "host-filed correction
+            # request") since both share the same "Match CQ-XXXX — " prefix.
+            if resolved_embed.title and resolved_embed.title.startswith("Match "):
+                match_label = f"**{resolved_embed.title.split(' ', 2)[1]}**"
             resolved_embed.color = discord.Color.green()
             resolved_embed.add_field(name="Status", value=f"✅ Resolved by {interaction.user.mention}" + (f" — {note}" if note else ""))
             await original_message.edit(embed=resolved_embed, view=None)
@@ -470,9 +481,15 @@ class Match(commands.Cog):
         outbound_channel = self.bot.get_channel(config.ISSUE_RESOLVED_CHANNEL_ID) if config.ISSUE_RESOLVED_CHANNEL_ID else None
         if outbound_channel:
             mention = f"<@{reporter_discord_id}>" if reporter_discord_id else "player"
+            # More specific than the old generic "reviewed and sorted":
+            # names the actual match, and surfaces the admin's note (if
+            # one was left) so the player knows WHAT was fixed, not just
+            # that something was.
+            note_suffix = f" — {note}" if note else ""
             try:
                 await outbound_channel.send(
-                    f"✅ {mention} — your match report's been reviewed and sorted. Leaderboard's up to date. Thanks for flagging it!"
+                    f"✅ {mention} — {match_label} has been reviewed and resolved{note_suffix}. "
+                    f"The leaderboard is up to date. Thanks for the report!"
                 )
             except discord.HTTPException:
                 pass
@@ -1045,24 +1062,31 @@ class Match(commands.Cog):
         if not player or match.get("room_code_shared_by") != player["id"]:
             await interaction.response.send_message("Only the Match Host can approve this result.", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        # thinking=True, no ephemeral — Discord locks the ephemeral state
+        # at defer time, not per-followup.send() call. The earlier fix
+        # (below) only removed ephemeral=True from the success message
+        # itself, but this defer was still forcing every followup on this
+        # interaction private regardless — confirmed live 2026-08-08, the
+        # "public" message still showed "Only you can see this". Matches
+        # the same non-ephemeral defer already used correctly in
+        # admin.py's force_approve for the identical public-confirmation
+        # case. The failure path two lines below still explicitly passes
+        # ephemeral=True on its own send() call, so it's unaffected by
+        # this change and stays private either way.
+        await interaction.response.defer(thinking=True)
         success, message = await self._do_approve(interaction.guild, match_id, player["id"])
         if not success:
             await interaction.followup.send(message, ephemeral=True)
             return
-        # Private confirmation only — no public post to the channel.
-        # Live feedback 2026-07-20: the previous version posted a public
-        # result card (map/winner/MVP per round) right after every
-        # approval, which the host found unnecessarily long even after
-        # already being slimmed down once. Matches the auto-approve
-        # sweep's existing behavior exactly — that path has never posted
-        # anything to the channel, only silently calls _do_approve and
-        # moves on. MMR/rank/record are all already correct in the DB
-        # and on the leaderboard the moment this line runs; the
-        # leaderboard panel just needs a Reload click to show it.
+        # Public confirmation, same channel/audience as the auto-approve
+        # sweep's message just below (admins/mods in RESULT_APPROVAL_
+        # CHANNEL_ID) — deliberately reversed from the 2026-07-20 private
+        # version. That change made sense for what it removed (a long
+        # per-round result card); it shouldn't have also made the short
+        # confirmation itself invisible to the moderators sharing this
+        # channel, who have no other signal that a result just cleared.
         await interaction.followup.send(
-            "🏁 GG — result's locked in! Head to the leaderboard and hit Reload to see the updated standings.",
-            ephemeral=True,
+            f"✅ Match **{match['match_id']}** approved by host — leaderboard is up to date.",
         )
 
     @tasks.loop(seconds=config.APPROVAL_SWEEP_INTERVAL_SECONDS)

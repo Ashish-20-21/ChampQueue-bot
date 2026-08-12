@@ -82,9 +82,15 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
 
 
 async def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], bootstrap: bool,
-                               n: int = 3) -> list[str]:
+                               n: int = 1) -> list[str]:
     """
     Pick n candidate maps for the vote. In bootstrap mode: pure random.
+
+    RO1 (2026-08): default n changed from 3 to 1 - Global now plays a
+    single Hardpoint round per match, not three. The call site in
+    queue.py's _start_match_flow() passes n=1 explicitly either way,
+    but the default is kept consistent with actual usage rather than
+    left pointing at the old RO3 value.
 
     Analysis mode is TEMPORARILY DISABLED (falls back to the same random
     pick as bootstrap) — found live 2026-07-20, crashing every match once

@@ -614,7 +614,11 @@ class Queue(commands.Cog):
         # Map selection and announcement (no vote)
         team_a_ids = {p["id"] for p in team_a}
         team_b_ids = {p["id"] for p in team_b}
-        maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=3)
+        # RO1 (2026-08): n=1 instead of n=3 - one Hardpoint round per
+        # match now, not three. map_pool stays a 1-element array
+        # (["Summit"]), not a string - indexed [0] below rather than
+        # changing the column type, per the RO1 migration plan.
+        maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=1)
         await adb.update_match(match["id"], {
             "map_pool": maps,
             "status": "awaiting_room"
@@ -622,10 +626,9 @@ class Queue(commands.Cog):
 
         embed_maps = discord.Embed(
             title="🗺️ Map Selection",
-            description=f"Map chosen are: **{maps[0]}**, **{maps[1]}**, **{maps[2]}**",
+            description=f"Map: **{maps[0]}**",
             color=discord.Color.gold()
         )
-        embed_maps.set_footer(text="Round 1: Map 1 | Round 2: Map 2 | Round 3: Map 3")
         await text_channel.send(embed=embed_maps)
 
         # NOTE (2026-08-08): redundant re-ping of all 10 players removed —

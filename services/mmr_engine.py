@@ -1,4 +1,4 @@
-"""Position-table MMR calculation for one RO3 round."""
+"""Position-table MMR calculation for one match (RO1: one round per match)."""
 
 from __future__ import annotations
 
@@ -22,12 +22,14 @@ def derive_rank(mmr: int) -> tuple[str, str]:
     """Map non-negative MMR to the confirmed player-facing rank tier.
 
     IMPORTANT: this must stay in sync BY HAND with the identical CASE
-    chain inside approve_ro3_match() in
-    database/migration_006_p6_full.sql (superseded by
-    migration_012_rank_band_widen_and_global_reset.sql as of
-    2026-07-30). That SQL function is the one that actually writes
-    players.current_rank / peak_rank — this Python function is used for
-    display purposes elsewhere (e.g. /rank-progress) and is not itself
+    chain inside approve_match() in
+    database/migration_014_ro1.sql (carried over verbatim from
+    migration_012_rank_band_widen_and_global_reset.sql's
+    approve_ro3_match — only the row-count assertion changed for RO1,
+    the CASE chain itself is untouched). That SQL function is the one
+    that actually writes players.current_rank / peak_rank — this
+    Python function is used for display purposes elsewhere (e.g.
+    /rank-progress) and is not itself
     read by the approval path. There is no single source of truth at
     the code level; if you change one, change the other in the same
     commit. 200-point bands, confirmed 2026-07-30 (was 150-point bands

@@ -220,20 +220,3 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         inline=False,
     )
     return embed
-
-
-def ro3_result_card(match: dict, match_players: list[dict], round_results: list[dict], maps: list[str]) -> discord.Embed:
-    """Final result with visible per-round MMR components and match totals."""
-    embed = discord.Embed(title=f"Match {match['match_id']} — Result", color=discord.Color.green())
-    by_player: dict[int, list[dict]] = {}
-    for row in round_results:
-        by_player.setdefault(row["player_id"], []).append(row)
-    names = {mp["player_id"]: mp["players"]["ign"] for mp in match_players}
-    for player_id, rows in sorted(by_player.items(), key=lambda item: names.get(item[0], "")):
-        lines = []
-        for row in sorted(rows, key=lambda item: item["round_number"]):
-            bonus = " (+5 MVP)" if row.get("is_mvp") else ""
-            lines.append(f"{maps[row['round_number'] - 1]} — {row['mmr_delta']:+d}{bonus}")
-        total = sum(row["mmr_delta"] for row in rows)
-        embed.add_field(name=names.get(player_id, f"Player {player_id}"), value="\n".join(lines) + f"\n**Total: {total:+d} MMR**", inline=False)
-    return embed

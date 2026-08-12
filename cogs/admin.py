@@ -58,7 +58,7 @@ class Admin(commands.Cog):
         lines = [f"`{m['match_id']}` — maps: {', '.join(m.get('map_pool') or []) or '—'} — created {m['created_at']}" for m in res.data]
         await interaction.response.send_message("**Matches awaiting review:**\n" + "\n".join(lines), ephemeral=True)
 
-    @app_commands.command(name="admin-correct-round", description="[Admin] Correct one player's position/MVP for a single round (RO1: only round 1 is meaningful for new matches)")
+    @app_commands.command(name="admin-correct-round", description="[Admin] Correct one player's position/MVP for a round")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", round_number="Which round (always 1 for new RO1 matches; 1-3 kept for old RO3 matches)",
                             user="The player to correct", position="New position (1-5) — leave blank to keep current",
                             is_mvp="New MVP flag — leave blank to keep current")

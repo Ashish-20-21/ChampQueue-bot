@@ -559,6 +559,16 @@ def _get_match_round_results(self: Database, match_id: int) -> list[dict]:
     return self.client.table("match_round_results").select("*").eq("match_id", match_id).order("round_number").execute().data
 
 
+def _approve_match(self: Database, match_id: int, approved_by: int) -> list[dict]:
+    return self.client.rpc("approve_match", {"p_match_id": match_id, "p_approved_by": approved_by}).execute().data
+
+
+# Backward-compat Python binding, mirrors the SQL-level alias
+# (migration_014_ro1.sql) -- kept so a missed call-site rename in
+# match.py during the RO1 conversion fails loudly via the *old*
+# RPC's own 10-row assertion, not via a Python AttributeError before
+# ever reaching Supabase. Safe to remove once a repo-wide grep for
+# `approve_ro3_match` in cogs/ confirms zero remaining callers.
 def _approve_ro3_match(self: Database, match_id: int, approved_by: int) -> list[dict]:
     return self.client.rpc("approve_ro3_match", {"p_match_id": match_id, "p_approved_by": approved_by}).execute().data
 
@@ -656,7 +666,7 @@ def _recompute_player_career_stats(self: Database, player_id: int) -> None:
     """Calls the Postgres function of the same name — full recompute
     from match_player_stats + match_round_results, not an increment.
     Called once per player (10x per match) from match.py._do_approve,
-    right after approve_ro3_match succeeds."""
+    right after approve_match succeeds."""
     self.client.rpc("recompute_player_career_stats", {"p_player_id": player_id}).execute()
 
 
@@ -690,7 +700,8 @@ Database.get_players_by_ids = _get_players_by_ids
 Database.upsert_match_screenshot = _upsert_match_screenshot
 Database.replace_match_round_results = _replace_match_round_results
 Database.get_match_round_results = _get_match_round_results
-Database.approve_ro3_match = _approve_ro3_match
+Database.approve_match = _approve_match
+Database.approve_ro3_match = _approve_ro3_match  # backward-compat, see comment above
 Database.has_open_issue = _has_open_issue
 Database.create_match_issue = _create_match_issue
 Database.resolve_match_issue = _resolve_match_issue

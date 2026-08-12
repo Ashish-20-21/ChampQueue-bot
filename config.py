@@ -191,10 +191,11 @@ RANK_TIERS = ["Elite", "PRO", "Master", "Grandmaster", "Legendary", "Titans"]
 RANK_DIVISIONS = ["II", "I"]
 
 # --- Official competitive Hardpoint maps ---
-# 3 of these are picked per match (see matchmaking.pick_map_candidates) and
-# assigned one-per-round for the Ro3 — there is NO player vote on this list,
-# it's announced as a fixed embed ("Map chosen are: X, Y, Z"). See
-# cogs/queue.py's map announcement step and matches.map_pool in the schema.
+# 1 of these is picked per match (see matchmaking.pick_map_candidates) —
+# there is NO player vote on this list, it's announced as a fixed embed
+# ("Map: X"). See cogs/queue.py's map announcement step and
+# matches.map_pool in the schema (still stored as a 1-element array,
+# not a plain string — see migration_014_ro1.sql).
 HARDPOINT_MAPS = [
     "Summit",
     "Hacienda",

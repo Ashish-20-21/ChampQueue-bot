@@ -163,57 +163,62 @@ def comparison_embed(ign: str, previous: dict, latest: dict) -> discord.Embed:
     return embed
 
 
-def ro3_verification_card(match: dict, round_data: list[dict], extractions: list[dict], maps: list[str]) -> discord.Embed:
-    """Host-facing verification card. Shows the actual per-round stats
-    (K/D/A, Impact, MVP) a host can visually compare against their own
+def verification_card(match: dict, round_data: list[dict], extraction: dict, map_name: str) -> discord.Embed:
+    """Host-facing verification card. Shows the actual stats (K/D/A,
+    Impact, MVP) a host can visually compare against their own
     screenshot — not MMR deltas as the primary content. MMR moves to a
-    compact one-line summary at the bottom of each round instead, since
-    a bare list of +N MMR values gives the host nothing to verify against;
-    the raw stats are what catches an OCR misread. See DECISIONS.md
+    compact one-line summary at the bottom instead, since a bare list
+    of +N MMR values gives the host nothing to verify against; the raw
+    stats are what catches an OCR misread. See DECISIONS.md
     (2026-07-18 planning session) for why this replaced the earlier
-    MMR-only version."""
+    MMR-only version.
+
+    RO1 (2026-08): de-looped from the original 3-round ro3_verification_card
+    — one round, one screenshot, one field instead of a 3-round loop.
+    Signature changed from (round_data, extractions: list, maps: list)
+    to (round_data, extraction: single dict, map_name: single str) to
+    match. round_data is still the list _prepare_round returns (one
+    item, but kept as a list since callers/round_data shape elsewhere
+    in match.py still expect list-of-dicts)."""
     embed = discord.Embed(
-        title=f"Match {match['match_id']} — RO3 Verification",
+        title=f"Match {match['match_id']} — Verification",
         description=(
-            "Review all three rounds against your own screenshots. Only the Match Host can approve. "
+            "Review the round against your own screenshot. Only the Match Host can approve. "
             "**MMR values are proposed** — nothing is applied until Approve is clicked."
         ),
         color=discord.Color.gold(),
     )
-    results_by_round = {item["round_number"]: item["results"] for item in round_data}
+    results = round_data[0]["results"] if round_data else []
 
-    for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
-        results = results_by_round.get(round_number, [])
-
-        players = sorted(extraction.get("players", []), key=lambda p: (p.get("team"), p.get("position", 9)))
-        team_lines = {"A": [], "B": []}
-        for p in players:
-            ign = str(p.get("ign") or "?")
-            kda = f"{p.get('kills', '?')}/{p.get('deaths', '?')}/{p.get('assists', '?')}"
-            impact = p.get("impact")
-            impact_str = str(impact) if impact is not None else "—"
-            mvp = "  MVP" if p.get("is_mvp") else ""
-            team_lines.setdefault(p.get("team"), []).append(
-                f"{p.get('position', '?')}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
-            )
-
-        block = f"Team A\n```\n{chr(10).join(team_lines.get('A', [])) or '(no readable rows)'}\n```\n" \
-                f"Team B\n```\n{chr(10).join(team_lines.get('B', [])) or '(no readable rows)'}\n```"
-
-        mmr_line = ""
-        if results:
-            team_a_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
-                (r for r in results if r["team"] == "A"), key=lambda r: r["position"]))
-            team_b_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
-                (r for r in results if r["team"] == "B"), key=lambda r: r["position"]))
-            mmr_line = f"\n*MMR (proposed): A {team_a_deltas}  ·  B {team_b_deltas}*"
-
-        final_score = extraction.get("final_score") or "—"
-        embed.add_field(
-            name=f"Round {round_number} — {announced_map} ({final_score})",
-            value=block + mmr_line,
-            inline=False,
+    players = sorted(extraction.get("players", []), key=lambda p: (p.get("team"), p.get("position", 9)))
+    team_lines = {"A": [], "B": []}
+    for p in players:
+        ign = str(p.get("ign") or "?")
+        kda = f"{p.get('kills', '?')}/{p.get('deaths', '?')}/{p.get('assists', '?')}"
+        impact = p.get("impact")
+        impact_str = str(impact) if impact is not None else "—"
+        mvp = "  MVP" if p.get("is_mvp") else ""
+        team_lines.setdefault(p.get("team"), []).append(
+            f"{p.get('position', '?')}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
         )
+
+    block = f"Team A\n```\n{chr(10).join(team_lines.get('A', [])) or '(no readable rows)'}\n```\n" \
+            f"Team B\n```\n{chr(10).join(team_lines.get('B', [])) or '(no readable rows)'}\n```"
+
+    mmr_line = ""
+    if results:
+        team_a_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
+            (r for r in results if r["team"] == "A"), key=lambda r: r["position"]))
+        team_b_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
+            (r for r in results if r["team"] == "B"), key=lambda r: r["position"]))
+        mmr_line = f"\n*MMR (proposed): A {team_a_deltas}  ·  B {team_b_deltas}*"
+
+    final_score = extraction.get("final_score") or "—"
+    embed.add_field(
+        name=f"{map_name} ({final_score})",
+        value=block + mmr_line,
+        inline=False,
+    )
     return embed
 
 

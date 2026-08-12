@@ -15,7 +15,7 @@ import config
 import logging
 from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
-from utils.embeds import ro3_verification_card
+from utils.embeds import verification_card
 from utils.permissions import admin_only, is_admin
 
 logger = logging.getLogger(__name__)
@@ -369,7 +369,7 @@ class Match(commands.Cog):
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="Submit Match Results",
-                description="Match Host: click below after all three RO3 rounds are played.",
+                description="Match Host: click below after the match is played.",
                 color=discord.Color.blurple(),
             ),
             view=SubmissionPanelView(self),
@@ -496,11 +496,10 @@ class Match(commands.Cog):
 
         await interaction.followup.send("Marked resolved.", ephemeral=True)
 
-    @app_commands.command(name="match-submit", description="Host upload of all three RO3 scoreboard screenshots")
-    @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)", screenshot_1="Round 1 scoreboard", screenshot_2="Round 2 scoreboard", screenshot_3="Round 3 scoreboard")
+    @app_commands.command(name="match-submit", description="Host upload of the match scoreboard screenshot")
+    @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)", screenshot="Match scoreboard")
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
-                           screenshot_1: discord.Attachment, screenshot_2: discord.Attachment,
-                           screenshot_3: discord.Attachment):
+                           screenshot: discord.Attachment):
         # Unified 2026-07-29: was region-aware (had to fetch the match
         # first to know which region's channel was correct). Now there's
         # one upload channel for all 4 queues, so the channel check no
@@ -548,18 +547,18 @@ class Match(commands.Cog):
                 await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
                 return
 
-        attachments = (screenshot_1, screenshot_2, screenshot_3)
+        attachments = (screenshot,)
         for attachment in attachments:
             if not (attachment.content_type or "").startswith("image/"):
-                await interaction.response.send_message("All three uploads must be image files.", ephemeral=True)
+                await interaction.response.send_message("The upload must be an image file.", ephemeral=True)
                 return
             if attachment.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
                 await interaction.response.send_message("Each image must be within the configured upload limit.", ephemeral=True)
                 return
 
         maps = match.get("map_pool") or []
-        if len(maps) != 3:
-            await self._route_to_review(match, player["id"] if player else None, "result_issue", "match has no valid three-map announcement (map_pool missing or incomplete)")
+        if len(maps) != 1:
+            await self._route_to_review(match, player["id"] if player else None, "result_issue", "match has no valid map announcement (map_pool missing or incomplete)")
             await interaction.response.send_message(self._friendly_review_message(), ephemeral=True)
             return
 
@@ -581,7 +580,7 @@ class Match(commands.Cog):
             # failure, etc.) — an unhandled crash here should never leave
             # the player staring at "thinking..." forever with silence.
             # Found live 2026-07-18: a return-value mismatch in
-            # _prepare_rounds crashed match_submit with zero notification
+            # _prepare_round crashed match_submit with zero notification
             # to anyone, player or admin.
             logger.exception("match_submit: unhandled exception for match_id=%s", match_id)
             try:
@@ -609,22 +608,22 @@ class Match(commands.Cog):
             return
 
         match_players = await with_retry(adb.get_match_players, match["id"])
-        ordered_pairs, info_notes = self._reorder_pairs_by_map(maps, list(zip(extractions, attachments)))
+        # RO1 (2026-08): _reorder_pairs_by_map deleted - nothing to
+        # reorder with a single screenshot. ordered_pairs is just the
+        # one (extraction, attachment) pair, kept as a list so the
+        # gather/enumerate calls below stay unchanged in shape.
+        ordered_pairs = list(zip(extractions, attachments))
         ordered_extractions = [pair[0] for pair in ordered_pairs]
 
-        # Preserve the raw OCR audit record for every submitted screenshot,
-        # even when one of them cannot safely be accepted. Uses the
-        # reordered pairs so the stored round_number always matches what
-        # _prepare_rounds actually used for MMR — otherwise a reordered
-        # submission's audit trail would silently disagree with its own
-        # MMR calculation.
+        # Preserve the raw OCR audit record for the submitted screenshot.
         await asyncio.gather(*(
             with_retry(adb.upsert_match_screenshot, match["id"], number, attachment.url, uploader_discord_id, extraction,
                         extraction.get("ocr_confidence"))
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
 
-        round_data, review_reasons = self._prepare_rounds(match_players, maps, ordered_extractions)
+        round_data, review_reasons = self._prepare_round(match_players, maps[0], ordered_extractions[0])
+        round_data = [round_data]
 
         # Reform 2026-07-29: previously any non-empty review_reasons caused
         # an early return here, before either DB write below ever ran —
@@ -632,17 +631,17 @@ class Match(commands.Cog):
         # every other round's fully-valid data too. Confirmed live: a real
         # match with one bad round and two clean rounds wrote zero rows to
         # match_player_stats/match_round_results. Fix: write whichever
-        # rounds _prepare_rounds marked "clean" (see its docstring) FIRST,
+        # rounds _prepare_round marked "clean" (see its docstring) FIRST,
         # unconditionally, then still route to review below if needed —
         # the bad round(s) simply contribute nothing until corrected, the
         # good round(s) are no longer held hostage by them. MMR is
         # UNCHANGED: mmr_delta values are written here same as before, but
-        # they still cannot affect players.mmr until approve_ro3_match
+        # they still cannot affect players.mmr until approve_match
         # actually commits — this write is the same "provisional record"
         # it always was, just no longer gated on the WHOLE match validating.
         #
         # NOTE: results rows carry "discord_id" for the verification embed's
-        # @mentions (ro3_verification_card below), but match_round_results
+        # @mentions (verification_card below), but match_round_results
         # has no such column — confirmed live via a 400 PGRST204 error when
         # this wasn't stripped first. Strip it only for the DB payload; the
         # embed still gets the full row with discord_id intact via round_data.
@@ -686,8 +685,8 @@ class Match(commands.Cog):
                     )
 
         if review_reasons:
-            screenshot_links = "\n".join(f"Round {i}: {pair[1].url}" for i, pair in enumerate(ordered_pairs, start=1))
-            technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshots:\n{screenshot_links}"
+            screenshot_links = "\n".join(pair[1].url for pair in ordered_pairs)
+            technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshot:\n{screenshot_links}"
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
@@ -712,7 +711,7 @@ class Match(commands.Cog):
         # a match reaches pending_verification — not gated on host/sweep
         # approval anymore. See migration_011_provisional_stats.sql for
         # the read-path change this depends on. MMR/rank are UNCHANGED —
-        # still only committed by approve_ro3_match inside _do_approve().
+        # still only committed by approve_match inside _do_approve().
         # Same fire-and-forget pattern as that call site: a recompute
         # failure here must never block or fail the submission itself.
         # (This runs again here even though the clean-rounds block above
@@ -744,10 +743,9 @@ class Match(commands.Cog):
                 ephemeral=True,
             )
             return
-        await approval_channel.send(embed=ro3_verification_card(match, round_data, ordered_extractions, maps), view=HostApprovalView(self, match["id"]))
-        note_suffix = f" ({'; '.join(info_notes)})" if info_notes else ""
+        await approval_channel.send(embed=verification_card(match, round_data, ordered_extractions[0], maps[0]), view=HostApprovalView(self, match["id"]))
         await interaction.followup.send(
-            f"Submitted. Check {approval_channel.mention} to approve once you've verified the rounds.{note_suffix}",
+            f"Submitted. Check {approval_channel.mention} to approve once you've verified the result.",
             ephemeral=True,
         )
 
@@ -761,14 +759,14 @@ class Match(commands.Cog):
         match = await adb.get_match_by_code(match_id)
         player = await adb.get_player_by_discord_id(interaction.user.id)
         if not match or match.get("status") != "awaiting_result":
-            await interaction.response.send_message("Match not found or not awaiting its three scoreboards.", ephemeral=True)
+            await interaction.response.send_message("Match not found or not awaiting its scoreboard.", ephemeral=True)
             return
         if not player or match.get("room_code_shared_by") != player["id"]:
-            await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
+            await interaction.response.send_message("Only the Match Host can upload the scoreboard.", ephemeral=True)
             return
         await interaction.response.send_message(
             f"Match **{match_id}** confirmed. Now run `/match-submit match_id:{match_id}` "
-            f"in this channel and attach all three round screenshots to that command.",
+            f"in this channel and attach the scoreboard screenshot to that command.",
             ephemeral=True,
         )
 
@@ -814,158 +812,131 @@ class Match(commands.Cog):
         return None, f"ambiguous — could be {display}"
 
     @staticmethod
-    def _reorder_pairs_by_map(maps: list[str], pairs: list[tuple[dict, "discord.Attachment"]]) -> tuple[list[tuple[dict, "discord.Attachment"]], list[str]]:
-        """Hosts upload 3 screenshots in whatever order they have the files
-        open, not necessarily the announced round order. Since each
-        extraction already carries its own detected map name, match each
-        (extraction, attachment) pair to the round whose announced map it
-        resolves to, rather than trusting attachment slot position.
-
-        Falls back to the original (positional) order — with no info note
-        — whenever map-based matching can't be done confidently: a map
-        that doesn't resolve to anything in the announced pool, two
-        screenshots resolving to the same map, or an announced map with no
-        matching screenshot at all. In those cases the existing per-round
-        map-mismatch check in _prepare_rounds will still catch and report
-        the problem — this function only handles the *good* case of
-        "right maps, wrong order" transparently.
+    def _prepare_round(match_players: list[dict], announced_map: str, extraction: dict) -> tuple[dict, list[str]]:
+        """RO1 (2026-08): de-looped from the original _prepare_rounds,
+        which processed 3 rounds via enumerate(zip(maps, extractions)).
+        Same validation logic per round, just run once instead of
+        looped — team/winner resolution (OCR-grouping-based, not the
+        static match_players.team) is UNCHANGED, see the comment below.
+        round_number is hardcoded to 1 (schema still allows 1-3, kept
+        for parity with historical RO3 rows — see migration_014_ro1.sql).
+        Reason strings no longer carry a "round N:" prefix — with only
+        one round, the prefix disambiguated nothing and just added
+        noise to review messages.
         """
-        resolved = [localization.resolve_map_name(str(ex.get("map") or "")) for ex, _ in pairs]
-        announced_upper = [m.upper() for m in maps]
-
-        if len(set(resolved)) != len(resolved) or any(r is None for r in resolved):
-            return pairs, []
-        if set(resolved) != set(announced_upper):
-            return pairs, []
-
-        by_map = dict(zip(resolved, pairs))
-        reordered = [by_map[m] for m in announced_upper]
-        if reordered == pairs:
-            return pairs, []
-        return reordered, ["screenshots were uploaded out of order — matched to rounds by detected map name instead"]
-
-    @staticmethod
-    def _prepare_rounds(match_players: list[dict], maps: list[str], extractions: list[dict]) -> tuple[list[dict], list[str]]:
         roster = {mp["players"]["ign"].strip().lower(): mp for mp in match_players}
-        rounds: list[dict] = []
         reasons: list[str] = []
-        for round_number, (announced_map, extraction) in enumerate(zip(maps, extractions), start=1):
-            reasons_before_this_round = len(reasons)
-            resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
-            if resolved_map != announced_map.upper():
-                raw_map = extraction.get("map")
-                reasons.append(
-                    f"round {round_number}: map mismatch — announced **{announced_map}**, "
-                    f"screenshot read as {raw_map!r}" +
-                    (f" (resolved to {resolved_map}, still doesn't match)" if resolved_map else " (not recognized by the map translation table at all)")
-                )
-            score = str(extraction.get("final_score") or "")
-            score_match = _SCORE_RE.fullmatch(score)
-            if not score_match or score_match.group(1) == score_match.group(2):
-                reasons.append(f"round {round_number}: final score is unreadable")
+        resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
+        if resolved_map != announced_map.upper():
+            raw_map = extraction.get("map")
+            reasons.append(
+                f"map mismatch — announced **{announced_map}**, "
+                f"screenshot read as {raw_map!r}" +
+                (f" (resolved to {resolved_map}, still doesn't match)" if resolved_map else " (not recognized by the map translation table at all)")
+            )
+        score = str(extraction.get("final_score") or "")
+        score_match = _SCORE_RE.fullmatch(score)
+        if not score_match or score_match.group(1) == score_match.group(2):
+            reasons.append("final score is unreadable")
+            return {"round_number": 1, "map_name": announced_map, "final_score": score, "results": [], "clean": False}, reasons
+        # Winner/loser is resolved from the OCR's own screen-position
+        # grouping (row["team"], "top group = A" per the vision prompt),
+        # NOT from match_players.team. match_players.team is a static
+        # letter fixed once at bootstrap purely for the Discord
+        # Defender/Attacker display label — it has no guaranteed
+        # relationship to which physical lobby side a player actually
+        # sits on in a given round. Hardpoint has no real attack/defense
+        # mechanic (both teams do the same thing), so nothing is lost by
+        # not enforcing that mapping: this way a genuine in-game seating
+        # mix-up (whole 5-player group loaded onto the "wrong" color)
+        # resolves correctly on its own, instead of failing every player
+        # in the round with a false "team mismatch". Confirmed further:
+        # the post-match "Match Details" screen shows each viewer's own
+        # team as blue regardless of physical side (observer-relative),
+        # so screen color was never a reliable signal to begin with —
+        # only the true spectator view shows real Defender/Attacker
+        # sides. See DECISIONS.md for the accepted tradeoff (a 1-2
+        # player crossover, as opposed to a whole-group swap, is not
+        # detectable by this check).
+        winner = "A" if int(score_match.group(1)) > int(score_match.group(2)) else "B"
+        results: list[dict] = []
+        seen_players: set[int] = set()
+        per_team = Counter()
+        for row in extraction.get("players", []):
+            mp, ambiguity = Match._resolve_ign(str(row.get("ign") or ""), roster)
+            if not mp:
+                if ambiguity:
+                    reasons.append(f"OCR IGN {row.get('ign')!r} is {ambiguity} — needs manual confirmation")
+                else:
+                    reasons.append(f"unknown OCR IGN {row.get('ign')!r}")
                 continue
-            # Winner/loser is resolved from the OCR's own screen-position
-            # grouping (row["team"], "top group = A" per the vision prompt),
-            # NOT from match_players.team. match_players.team is a static
-            # letter fixed once at bootstrap purely for the Discord
-            # Defender/Attacker display label — it has no guaranteed
-            # relationship to which physical lobby side a player actually
-            # sits on in a given round. Hardpoint has no real attack/defense
-            # mechanic (both teams do the same thing), so nothing is lost by
-            # not enforcing that mapping: this way a genuine in-game seating
-            # mix-up (whole 5-player group loaded onto the "wrong" color)
-            # resolves correctly on its own, instead of failing every player
-            # in the round with a false "team mismatch". Confirmed further:
-            # the post-match "Match Details" screen shows each viewer's own
-            # team as blue regardless of physical side (observer-relative),
-            # so screen color was never a reliable signal to begin with —
-            # only the true spectator view shows real Defender/Attacker
-            # sides. See DECISIONS.md for the accepted tradeoff (a 1-2
-            # player crossover, as opposed to a whole-group swap, is not
-            # detectable by this check).
-            winner = "A" if int(score_match.group(1)) > int(score_match.group(2)) else "B"
-            results: list[dict] = []
-            seen_players: set[int] = set()
-            per_team = Counter()
-            for row in extraction.get("players", []):
-                mp, ambiguity = Match._resolve_ign(str(row.get("ign") or ""), roster)
-                if not mp:
-                    if ambiguity:
-                        reasons.append(f"round {round_number}: OCR IGN {row.get('ign')!r} is {ambiguity} — needs manual confirmation")
-                    else:
-                        reasons.append(f"round {round_number}: unknown OCR IGN {row.get('ign')!r}")
-                    continue
-                if mp["player_id"] in seen_players:
-                    reasons.append(f"round {round_number}: duplicate OCR player {row.get('ign')}")
-                    continue
-                round_team = row.get("team")
-                if round_team not in ("A", "B"):
-                    reasons.append(f"round {round_number}: unreadable team grouping for {row.get('ign')!r}")
-                    continue
-                invalid = [field for field in _INTEGER_FIELDS if not _INTEGER_RE.fullmatch(str(row.get(field, "")))]
-                if not _HILL_TIME_RE.fullmatch(str(row.get("hill_time", ""))):
-                    invalid.append("hill_time")
-                if invalid:
-                    reasons.append(f"round {round_number}: invalid OCR digit format for {row.get('ign')} ({', '.join(invalid)})")
-                    continue
-                position = int(row["position"])
-                if not 1 <= position <= 5:
-                    reasons.append(f"round {round_number}: invalid position for {row.get('ign')}")
-                    continue
-                if not isinstance(row.get("is_mvp"), bool):
-                    reasons.append(f"round {round_number}: MVP flag is missing or invalid for {row.get('ign')}")
-                    continue
-                is_mvp = row["is_mvp"]
-                # damage is deliberately excluded from _INTEGER_FIELDS (see
-                # module-level NOTE) — it can be legitimately absent or
-                # non-numeric when a screenshot's scoreboard view doesn't
-                # show a Damage column. Parse it defensively here rather
-                # than assuming it already passed a digit check.
-                raw_damage = str(row.get("damage", ""))
-                damage_value = int(raw_damage) if _INTEGER_RE.fullmatch(raw_damage) else None
-                # impact, like damage, is never validated by _INTEGER_FIELDS
-                # or any regex above — parse defensively rather than assume
-                # it's always a clean number.
-                raw_impact = str(row.get("impact", ""))
-                impact_value = float(raw_impact) if _HILL_TIME_RE.fullmatch(raw_impact) else None
-                results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
-                                "mmr_delta": mmr_engine.calculate_mmr_change(position, round_team == winner, is_mvp),
-                                "team": round_team, "discord_id": mp["players"]["discord_id"],
-                                # Raw stats, kept alongside the MMR/position outcome so
-                                # match_player_stats can be written from this same pass
-                                # instead of re-deriving it later (P6 — see
-                                # migration_006_p6_stats_and_ranks.sql).
-                                "kills": int(row["kills"]), "deaths": int(row["deaths"]),
-                                "assists": int(row["assists"]), "damage": damage_value,
-                                "hill_time": float(row["hill_time"]),
-                                "impact": impact_value,
-                                "score": int(row["score"])})
-                seen_players.add(mp["player_id"])
-                per_team[round_team] += 1
-            if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
-                reasons.append(f"round {round_number}: scoreboard does not contain one valid row for every match player")
-            for team in ("A", "B"):
-                if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
-                    reasons.append(f"round {round_number}: Team {team} must have exactly one game-provided MVP")
-            rounds.append({
-                "round_number": round_number, "map_name": announced_map, "final_score": score, "results": results,
-                # Reform 2026-07-29: a round is "clean" only if nothing in
-                # THIS round's own checks (map, score, per-player OCR
-                # fields, roster completeness, MVP count) added a reason —
-                # a different round's problems don't affect this flag.
-                # match_submit uses this to write clean rounds to
-                # match_player_stats/match_round_results even when the
-                # overall match still needs admin review, instead of the
-                # old all-or-nothing behavior that discarded every round's
-                # data (including fully valid ones) whenever any single
-                # round had a problem. See migration_011 for the read-side
-                # change this depends on. MMR is UNCHANGED by this — a
-                # round's mmr_delta still only gets committed by
-                # approve_ro3_match, which still requires full manual/auto
-                # approval of the whole match regardless of this flag.
-                "clean": len(reasons) == reasons_before_this_round,
-            })
-        return rounds, reasons
+            if mp["player_id"] in seen_players:
+                reasons.append(f"duplicate OCR player {row.get('ign')}")
+                continue
+            round_team = row.get("team")
+            if round_team not in ("A", "B"):
+                reasons.append(f"unreadable team grouping for {row.get('ign')!r}")
+                continue
+            invalid = [field for field in _INTEGER_FIELDS if not _INTEGER_RE.fullmatch(str(row.get(field, "")))]
+            if not _HILL_TIME_RE.fullmatch(str(row.get("hill_time", ""))):
+                invalid.append("hill_time")
+            if invalid:
+                reasons.append(f"invalid OCR digit format for {row.get('ign')} ({', '.join(invalid)})")
+                continue
+            position = int(row["position"])
+            if not 1 <= position <= 5:
+                reasons.append(f"invalid position for {row.get('ign')}")
+                continue
+            if not isinstance(row.get("is_mvp"), bool):
+                reasons.append(f"MVP flag is missing or invalid for {row.get('ign')}")
+                continue
+            is_mvp = row["is_mvp"]
+            # damage is deliberately excluded from _INTEGER_FIELDS (see
+            # module-level NOTE) — it can be legitimately absent or
+            # non-numeric when a screenshot's scoreboard view doesn't
+            # show a Damage column. Parse it defensively here rather
+            # than assuming it already passed a digit check.
+            raw_damage = str(row.get("damage", ""))
+            damage_value = int(raw_damage) if _INTEGER_RE.fullmatch(raw_damage) else None
+            # impact, like damage, is never validated by _INTEGER_FIELDS
+            # or any regex above — parse defensively rather than assume
+            # it's always a clean number.
+            raw_impact = str(row.get("impact", ""))
+            impact_value = float(raw_impact) if _HILL_TIME_RE.fullmatch(raw_impact) else None
+            results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
+                            "mmr_delta": mmr_engine.calculate_mmr_change(position, round_team == winner, is_mvp),
+                            "team": round_team, "discord_id": mp["players"]["discord_id"],
+                            # Raw stats, kept alongside the MMR/position outcome so
+                            # match_player_stats can be written from this same pass
+                            # instead of re-deriving it later (P6 — see
+                            # migration_006_p6_stats_and_ranks.sql).
+                            "kills": int(row["kills"]), "deaths": int(row["deaths"]),
+                            "assists": int(row["assists"]), "damage": damage_value,
+                            "hill_time": float(row["hill_time"]),
+                            "impact": impact_value,
+                            "score": int(row["score"])})
+            seen_players.add(mp["player_id"])
+            per_team[round_team] += 1
+        if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
+            reasons.append("scoreboard does not contain one valid row for every match player")
+        for team in ("A", "B"):
+            if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
+                reasons.append(f"Team {team} must have exactly one game-provided MVP")
+        round_dict = {
+            "round_number": 1, "map_name": announced_map, "final_score": score, "results": results,
+            # Reform 2026-07-29 (RO3-era): a round is "clean" only if
+            # nothing in its own checks (map, score, per-player OCR
+            # fields, roster completeness, MVP count) added a reason.
+            # With RO1 there's only ever one round, so this flag now
+            # just means "did the whole submission validate cleanly" —
+            # match_submit still uses it to decide whether to write
+            # match_player_stats/match_round_results. MMR is UNCHANGED
+            # by this — mmr_delta still only gets committed by
+            # approve_match, which still requires full manual/auto
+            # approval regardless of this flag.
+            "clean": len(reasons) == 0,
+        }
+        return round_dict, reasons
 
     async def _run_post_approval_cleanup(self, guild: discord.Guild | None, match: dict) -> None:
         """Shared by the manual Approve button and the auto-approve sweep.
@@ -1011,7 +982,7 @@ class Match(commands.Cog):
         if await adb.has_open_issue(match_id):
             return False, "This match has an open correction request — approval is blocked until it's resolved."
         try:
-            await adb.approve_ro3_match(match_id, approved_by_id)
+            await adb.approve_match(match_id, approved_by_id)
         except Exception as exc:
             return False, f"Approval could not be committed safely: {exc}"
 

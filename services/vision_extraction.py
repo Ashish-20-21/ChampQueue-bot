@@ -74,7 +74,13 @@ the field, since both are load-bearing for match results.
 If a field is not legible or not present in the image, use null for that field —
 never guess or fabricate a number, and never substitute a different column's value.
 Double-check digits that could be visually ambiguous (e.g. 0 vs O, 1 vs 7, 8 vs 3,
-6 vs 8) by cross-referencing column alignment across all 10 rows."""
+6 vs 8) by cross-referencing column alignment across all 10 rows.
+
+Return exactly as many player entries as are actually visible in the scoreboard —
+normally 10, but sometimes fewer (e.g. 9, if a player left the match before it
+ended). Do NOT invent a placeholder row to reach 10 if only 9 players are shown.
+An incomplete roster is expected and handled downstream; a fabricated player row
+is not — it would silently corrupt that match's results."""
 
 
 class VisionProvider(ABC):

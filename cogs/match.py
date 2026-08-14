@@ -684,6 +684,17 @@ class Match(commands.Cog):
                         "player_id=%s after match_id=%s submission", mp["player_id"], match["id"], exc_info=result,
                     )
 
+            # AFK notice — fires once per submission if _prepare_round
+            # synthesized a leaver's row (see the "afk" key added there).
+            # Purely informational, does not block anything below; the
+            # match proceeds through the normal verification/approval
+            # flow exactly as if all 10 rows had come from OCR.
+            for item in clean_rounds:
+                for row in item["results"]:
+                    if row.get("afk"):
+                        ign = next((mp["players"]["ign"] for mp in match_players if mp["player_id"] == row["player_id"]), "unknown player")
+                        await self._notify_afk_leaver(match, row, ign)
+
         if review_reasons:
             screenshot_links = "\n".join(pair[1].url for pair in ordered_pairs)
             technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshot:\n{screenshot_links}"
@@ -811,6 +822,36 @@ class Match(commands.Cog):
         display = ", ".join(roster[c]["players"]["ign"] for c, _ in scores[:2])
         return None, f"ambiguous — could be {display}"
 
+    async def _notify_afk_leaver(self, match: dict, leaver_row: dict, leaver_ign: str) -> None:
+        """Informational only — does NOT create a match_issues row and
+        does NOT touch match status, unlike _route_to_review. The match
+        this belongs to has already been written as a normal 10-row
+        clean submission (see the AFK branch in _prepare_round) and
+        proceeds through the ordinary verification/approval flow
+        untouched. This just flags the synthesized row to admins so
+        they know to check in with the player and, if the reason is
+        valid, correct the MMR by hand via the existing /admin-adjust-mmr
+        command — no new admin command, no blocking behavior."""
+        intake_channel = self.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID) if config.ISSUE_INTAKE_CHANNEL_ID else None
+        if not intake_channel:
+            return
+        try:
+            await intake_channel.send(
+                embed=discord.Embed(
+                    title=f"Match {match['match_id']} — AFK detected",
+                    description=(
+                        f"**{leaver_ign}** was missing from the submitted scoreboard and was "
+                        f"auto-assigned a last-place loss ({leaver_row['mmr_delta']:+d} MMR) for "
+                        f"this match. This did not block approval.\n\n"
+                        f"If the player has a valid reason, adjust their MMR with "
+                        f"`/admin-adjust-mmr` — no action needed otherwise."
+                    ),
+                    color=discord.Color.orange(),
+                )
+            )
+        except discord.HTTPException:
+            pass
+
     @staticmethod
     def _prepare_round(match_players: list[dict], announced_map: str, extraction: dict) -> tuple[dict, list[str]]:
         """RO1 (2026-08): de-looped from the original _prepare_rounds,
@@ -917,6 +958,40 @@ class Match(commands.Cog):
                             "score": int(row["score"])})
             seen_players.add(mp["player_id"])
             per_team[round_team] += 1
+        # AFK / mid-match leaver detection (2026-08). Only fires when the
+        # gap is unambiguous: exactly 9 of the 10 registered players
+        # resolved cleanly above (no OCR-unknown, no fuzzy-match
+        # ambiguity, no duplicates, no bad team/digit/position/MVP data)
+        # AND exactly one registered player has no corresponding row at
+        # all. Any messier case — 2+ missing, an unresolved/ambiguous
+        # OCR name, wrong per-team counts — falls straight through to
+        # the existing "scoreboard does not contain one valid row for
+        # every match player" review path below, unchanged. This is a
+        # deliberately narrow net: a genuinely unambiguous 9/10 read is
+        # common enough to be worth automating, but a messy read that
+        # merely LOOKS like 9/10 (e.g. one real OCR misread on top of
+        # a real leaver) must not be auto-resolved — it goes to a human.
+        missing_players = [mp for mp in match_players if mp["player_id"] not in seen_players]
+        if len(results) == 9 and len(missing_players) == 1 and not reasons and per_team.get(missing_players[0]["team"], 0) == 4:
+            leaver = missing_players[0]
+            leaver_team = leaver["team"]
+            taken_positions = {row["position"] for row in results if row["team"] == leaver_team}
+            leaver_position = next(p for p in range(1, 6) if p not in taken_positions)
+            # Stats are honestly 0 — nothing happened for this player this
+            # round. MMR is NOT 0 — calculate_mmr_change() runs exactly as
+            # it would for any other losing-team player in this position,
+            # so leaving is never better than playing out a loss. No new
+            # MMR pathway, no new constant — same formula every other row
+            # in this function uses two lines up.
+            results.append({
+                "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
+                "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, leaver_team == winner, False),
+                "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
+                "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
+                "afk": True,
+            })
+            seen_players.add(leaver["player_id"])
+            per_team[leaver_team] += 1
         if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
             reasons.append("scoreboard does not contain one valid row for every match player")
         for team in ("A", "B"):

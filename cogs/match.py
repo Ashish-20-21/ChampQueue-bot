@@ -860,7 +860,7 @@ class Match(commands.Cog):
         looped — team/winner resolution (OCR-grouping-based, not the
         static match_players.team) is UNCHANGED, see the comment below.
         round_number is hardcoded to 1 (schema still allows 1-3, kept
-        for parity with historical RO3 rows — see migration_014_ro1.sql).
+        for parity with historical RO3 rows — see migration_015_ro1.sql).
         Reason strings no longer carry a "round N:" prefix — with only
         one round, the prefix disambiguated nothing and just added
         noise to review messages.

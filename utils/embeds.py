@@ -202,6 +202,22 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             f"{p.get('position', '?')}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
         )
 
+    # AFK / mid-match leaver (2026-08, nice-to-have): a synthesized row
+    # from _prepare_round's AFK branch has no corresponding entry in
+    # extraction["players"] at all — OCR never saw that player, since
+    # they weren't on the scoreboard. Without this, the row would just
+    # be silently absent from the block above rather than shown as
+    # what it is, which could read as a missing/broken card rather
+    # than an intentional AFK auto-assignment. verification_card has no
+    # roster/IGN lookup available (only match/round_data/extraction/
+    # map_name are passed in), so this uses the row's own discord_id
+    # (already set by _prepare_round) for a @mention instead.
+    for r in results:
+        if r.get("afk"):
+            team_lines.setdefault(r["team"], []).append(
+                f"{r['position']}  {'(AFK — left)':<16.16} {'—/—/—':<10}    —"
+            )
+
     block = f"Team A\n```\n{chr(10).join(team_lines.get('A', [])) or '(no readable rows)'}\n```\n" \
             f"Team B\n```\n{chr(10).join(team_lines.get('B', [])) or '(no readable rows)'}\n```"
 
@@ -213,10 +229,19 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             (r for r in results if r["team"] == "B"), key=lambda r: r["position"]))
         mmr_line = f"\n*MMR (proposed): A {team_a_deltas}  ·  B {team_b_deltas}*"
 
+    # Mentions don't render inside code fences (where the "(AFK — left
+    # match)" placeholder line above lives), so the actual @mention is
+    # appended here instead, outside the block, one line per AFK row.
+    afk_rows = [r for r in results if r.get("afk")]
+    afk_line = ""
+    if afk_rows:
+        mentions = "  ".join(f"<@{r['discord_id']}>" for r in afk_rows)
+        afk_line = f"\n⚠️ Auto-assigned AFK: {mentions}"
+
     final_score = extraction.get("final_score") or "—"
     embed.add_field(
         name=f"{map_name} ({final_score})",
-        value=block + mmr_line,
+        value=block + mmr_line + afk_line,
         inline=False,
     )
     return embed

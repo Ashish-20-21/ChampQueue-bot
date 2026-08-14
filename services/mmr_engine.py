@@ -23,7 +23,7 @@ def derive_rank(mmr: int) -> tuple[str, str]:
 
     IMPORTANT: this must stay in sync BY HAND with the identical CASE
     chain inside approve_match() in
-    database/migration_014_ro1.sql (carried over verbatim from
+    database/migration_015_ro1.sql (carried over verbatim from
     migration_012_rank_band_widen_and_global_reset.sql's
     approve_ro3_match — only the row-count assertion changed for RO1,
     the CASE chain itself is untouched). That SQL function is the one

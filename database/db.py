@@ -564,7 +564,7 @@ def _approve_match(self: Database, match_id: int, approved_by: int) -> list[dict
 
 
 # Backward-compat Python binding, mirrors the SQL-level alias
-# (migration_014_ro1.sql) -- kept so a missed call-site rename in
+# (migration_015_ro1.sql) -- kept so a missed call-site rename in
 # match.py during the RO1 conversion fails loudly via the *old*
 # RPC's own 10-row assertion, not via a Python AttributeError before
 # ever reaching Supabase. Safe to remove once a repo-wide grep for

@@ -195,7 +195,7 @@ RANK_DIVISIONS = ["II", "I"]
 # there is NO player vote on this list, it's announced as a fixed embed
 # ("Map: X"). See cogs/queue.py's map announcement step and
 # matches.map_pool in the schema (still stored as a 1-element array,
-# not a plain string — see migration_014_ro1.sql).
+# not a plain string — see migration_015_ro1.sql).
 HARDPOINT_MAPS = [
     "Summit",
     "Hacienda",

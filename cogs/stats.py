@@ -6,7 +6,7 @@ from discord.ext import commands
 
 from database.db import adb
 from services import mmr_engine
-from utils.embeds import player_stats_card, comparison_embed, rank_progress_card
+from utils.embeds import player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed
 from utils.permissions import admin_only
 
 _PAGE_SIZE = 25  # players per leaderboard page — Discord embed description
@@ -113,6 +113,37 @@ class LeaderboardView(discord.ui.View):
         await self._render(interaction)
 
 
+class RankProgressView(discord.ui.View):
+    """One-shot view for /rank-progress's "View rank ladder" button.
+    Deliberately NOT persistent (no custom_id, real timeout, no
+    bot.add_view() registration) — unlike LeaderboardView above, this
+    isn't a panel meant to survive a bot restart; it's a single ephemeral
+    reply's follow-up interaction, gone the moment the person closes it
+    or the 60s window lapses. See rank_progress_card's docstring for why
+    the ladder is opt-in rather than shown immediately."""
+
+    def __init__(self, player: dict, tier: str):
+        super().__init__(timeout=60)
+        self.player = player
+        self.tier = tier
+
+        self.ladder_button = discord.ui.Button(
+            label="📊 View rank ladder", style=discord.ButtonStyle.secondary
+        )
+        self.ladder_button.callback = self.ladder_callback
+        self.add_item(self.ladder_button)
+
+    async def ladder_callback(self, interaction: discord.Interaction):
+        # Button is single-use — remove it after the reveal rather than
+        # leaving a now-redundant button on a message that already shows
+        # the ladder (nothing to toggle back to; the near-term "next rank"
+        # block stays visible above the ladder either way).
+        self.clear_items()
+        await interaction.response.edit_message(
+            embed=rank_ladder_embed(self.player, self.tier), view=self
+        )
+
+
 class Stats(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -193,6 +224,7 @@ class Stats(commands.Cog):
         tier, division = mmr_engine.derive_rank(player["mmr"])
         await interaction.response.send_message(
             embed=rank_progress_card(player, tier),
+            view=RankProgressView(player, tier),
             ephemeral=True,
         )
 

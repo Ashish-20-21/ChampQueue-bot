@@ -142,50 +142,60 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
 
 
 def rank_progress_card(player: dict, tier: str) -> discord.Embed:
-    """/rank-progress card (2026-08). Two deliberate product calls, not
-    simplifications:
+    """/rank-progress initial card (2026-08, revised after live design
+    review). Deliberately does NOT show the full ladder up front — locked
+    2026-08-15 after the first version (title/MMR/next-tier/full-ladder
+    all in one embed) was flagged as demotivating: a brand-new Elite1
+    player seeing all 10 tiers stacked above them reads as "how far I
+    have to go", not "how close I am". The fix is sequencing, not data:
+    this card shows only the near-term win (next-tier distance); the full
+    ladder is opt-in via the "View rank ladder" button (see
+    RankProgressView in cogs/stats.py and rank_ladder_embed below) — by
+    the time a player taps that, they've already gotten the "19 MMR to
+    Elite2" dopamine hit, so the same ladder reads as "here's the system"
+    rather than "here's the mountain".
 
-    1. Distance shown is always to the *immediately next* tier, never the
-       raw gap to peak/top tier — a player at 190 MMR sees "19 MMR to
-       Elite2", not a discouraging "1811 to Legendary2". See
-       mmr_engine.next_tier_progress's docstring.
-    2. The full ladder is shown so the player has (near-term progress) +
-       (whole-ladder context) in one place, current tier marked with ▶.
-       Ladder is intentionally NOT MMR-annotated per rung beyond the
-       player's own row — showing every tier's floor value competes with
-       the single distance-to-next number for attention; the ladder's job
-       here is "where am I", not "here's the full band table" (that's what
-       the leaderboard/derive_rank docstring is for).
+    Distance is always to the *immediately next* tier, never the raw gap
+    to the top — see mmr_engine.next_tier_progress's docstring.
 
     `tier` is passed in (not re-derived here) since the caller already
-    calls derive_rank once for the title bar — avoids a second identical
-    call for what's cosmetically the same value."""
+    calls derive_rank once — avoids a second identical call for what's
+    cosmetically the same value."""
     embed = discord.Embed(
-        title=f"{player['ign']} — {tier}",
-        description=f"{player['mmr']} MMR",
+        description=f"**{player['ign']} — {tier} - {player['mmr']} MMR**\n"
+                     f"Peak: {player['peak_rank']} at {player['peak_mmr']} MMR",
         color=discord.Color.blue(),
     )
 
     progress = mmr_engine.next_tier_progress(player["mmr"])
     if progress:
         next_tier, remaining = progress
-        embed.add_field(
-            name="Next rank",
-            value=f"**{remaining} MMR** to {next_tier}",
-            inline=False,
-        )
+        embed.add_field(name="🔼 Next rank", value=f"{remaining} MMR to {next_tier}", inline=False)
     else:
-        embed.add_field(name="Next rank", value="You're at the top tier — Titans.", inline=False)
+        embed.add_field(name="🔼 Next rank", value="You're at the top tier — Titans.", inline=False)
+
+    return embed
+
+
+def rank_ladder_embed(player: dict, tier: str) -> discord.Embed:
+    """The full-ladder reveal shown after tapping "View rank ladder" on
+    the /rank-progress card. Same header/next-rank block as
+    rank_progress_card (so the message reads as one continuous card, not
+    a jarring swap) plus the full ladder, current tier marked ▶ with a
+    "you are here" note. See rank_progress_card's docstring for why this
+    is opt-in rather than shown up front."""
+    embed = rank_progress_card(player, tier)
 
     ladder_lines = []
     for _floor, ladder_tier in mmr_engine.tier_ladder():
-        marker = "▶ " if ladder_tier == tier else "\u2003"  # em-space to align non-current rows
-        ladder_lines.append(f"{marker}{ladder_tier}")
+        if ladder_tier == tier:
+            ladder_lines.append(f"▶ {ladder_tier}   ← you are here")
+        else:
+            ladder_lines.append(f"\u2003{ladder_tier}")
     # Ladder is stored lowest-first in mmr_engine; display highest-first so
     # "climbing" reads top-to-bottom the way a leaderboard does.
-    embed.add_field(name="Rank ladder", value="\n".join(reversed(ladder_lines)), inline=False)
+    embed.add_field(name="📍 Your path", value="\n".join(reversed(ladder_lines)), inline=False)
 
-    embed.set_footer(text=f"Peak: {player['peak_rank']} at {player['peak_mmr']} MMR")
     return embed
 
 

@@ -26,25 +26,40 @@ class Admin(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="admin-approve", description="[Admin] Approve a pending player by their Discord user")
-    @admin_only()
-    async def approve(self, interaction: discord.Interaction, user: discord.Member):
-        player = await adb.get_player_by_discord_id(user.id)
-        if not player:
-            await interaction.response.send_message(f"{user.mention} hasn't registered.", ephemeral=True)
-            return
-        await adb.approve_player(player["id"], str(interaction.user.id))
-        await interaction.response.send_message(f"Approved **{player['ign']}** ({user.mention}).", ephemeral=True)
-
-    @app_commands.command(name="admin-reject", description="[Admin] Reject a pending registration")
-    @admin_only()
-    async def reject(self, interaction: discord.Interaction, user: discord.Member):
-        player = await adb.get_player_by_discord_id(user.id)
-        if not player:
-            await interaction.response.send_message(f"{user.mention} hasn't registered.", ephemeral=True)
-            return
-        await adb.reject_player(player["id"])
-        await interaction.response.send_message(f"Rejected registration for **{player['ign']}**.", ephemeral=True)
+    # admin-approve / admin-reject — COMMENTED OUT (2026-08-15), not deleted.
+    # Confirmed dead relative to the live registration flow: /register
+    # (cogs/registration.py) auto-approves every successful registration
+    # immediately via adb.approve_player(..., approved_by="auto") in the
+    # same request — there is no manual admin-review step in the current
+    # design (UID format check + in-server screenshot verification by
+    # admins replaced the original "admin manually approves/rejects"
+    # workflow from the earliest pre-launch version). A player row can
+    # only ever sit at status='pending' if create_player() succeeded but
+    # the immediate follow-up approve_player() call failed/never ran —
+    # an edge case, not the designed path these two commands were built
+    # for. Kept commented rather than deleted in case manual review is
+    # reintroduced later (e.g. suspicious-registration flagging); db.py's
+    # approve_player()/reject_player() methods are untouched.
+    #
+    # @app_commands.command(name="admin-approve", description="[Admin] Approve a pending player by their Discord user")
+    # @admin_only()
+    # async def approve(self, interaction: discord.Interaction, user: discord.Member):
+    #     player = await adb.get_player_by_discord_id(user.id)
+    #     if not player:
+    #         await interaction.response.send_message(f"{user.mention} hasn't registered.", ephemeral=True)
+    #         return
+    #     await adb.approve_player(player["id"], str(interaction.user.id))
+    #     await interaction.response.send_message(f"Approved **{player['ign']}** ({user.mention}).", ephemeral=True)
+    #
+    # @app_commands.command(name="admin-reject", description="[Admin] Reject a pending registration")
+    # @admin_only()
+    # async def reject(self, interaction: discord.Interaction, user: discord.Member):
+    #     player = await adb.get_player_by_discord_id(user.id)
+    #     if not player:
+    #         await interaction.response.send_message(f"{user.mention} hasn't registered.", ephemeral=True)
+    #         return
+    #     await adb.reject_player(player["id"])
+    #     await interaction.response.send_message(f"Rejected registration for **{player['ign']}**.", ephemeral=True)
 
     @app_commands.command(name="admin-review-queue", description="[Admin] List matches awaiting review")
     @admin_only()
@@ -294,8 +309,12 @@ class Admin(commands.Cog):
             return
         await interaction.followup.send(f"Stats recomputed for **{player['ign']}** — check `/player-stats`.", ephemeral=True)
 
-    @approve.error
-    @reject.error
+    # @approve.error and @reject.error removed here (2026-08-15) — the
+    # commands they referenced are commented out above; leaving these
+    # decorators in place caused a NameError at cog-load time
+    # ("name 'approve' is not defined"), confirmed live via a real bot
+    # restart. If admin-approve/admin-reject are ever un-commented, these
+    # two lines must come back too.
     @review_queue.error
     @correct_round.error
     @force_approve.error

@@ -17,11 +17,13 @@ create table if not exists players (
     approved_at        timestamptz,
 
     -- skill / ranking
-    mmr               integer not null default 1000,
-    peak_mmr          integer not null default 1000,
-    current_rank      text not null default 'Elite',
-    current_division  text not null default 'II',
-    peak_rank         text not null default 'Elite',
+    mmr               integer not null default 200,
+    peak_mmr          integer not null default 200,
+    current_rank      text not null default 'Elite1',
+    -- current_division dropped (migration_016, 2026-08-15) — every live
+    -- writer set it to '' unconditionally since the migration_012 rename
+    -- away from the old two-part Elite/I/II scheme; provably dead.
+    peak_rank         text not null default 'Elite1',
 
     -- trust
     reputation        integer not null default 100,   -- 0-100 scale

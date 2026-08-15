@@ -39,9 +39,14 @@ async def recompute_career_stats(player_id: int) -> dict:
 
 
 async def update_rank(player_id: int) -> dict:
+    # NOTE: zero live callers (confirmed via repo-wide grep, 2026-08-15) —
+    # see process_post_match below, which is itself never invoked from any
+    # cog. current_division removed from the write since that column was
+    # dropped from the players table (migration_016) — it was always ''
+    # from mmr_engine.derive_rank() anyway.
     player = await adb.get_player_by_id(player_id)
-    tier, division = mmr_engine.derive_rank(player["mmr"])
-    fields = {"current_rank": tier, "current_division": division}
+    tier, _division = mmr_engine.derive_rank(player["mmr"])
+    fields = {"current_rank": tier}
     if player["mmr"] > player["peak_mmr"]:
         fields["peak_mmr"] = player["mmr"]
         fields["peak_rank"] = tier

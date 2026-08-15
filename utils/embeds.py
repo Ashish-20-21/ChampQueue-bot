@@ -28,8 +28,14 @@ def result_card(match: dict, match_players: list[dict]) -> discord.Embed:
 
 
 def profile_card(player: dict, achievements: list[dict]) -> discord.Embed:
+    # NOTE: zero live callers (confirmed via repo-wide grep, 2026-08-15) —
+    # /player-stats uses player_stats_card below instead. Kept for now as
+    # a possible future admin/profile-lookup command; current_division
+    # removed from the title since that column was dropped from the
+    # players table (migration_016) — it was always '' in every live
+    # writer anyway, so this is a no-op visually if this ever gets wired up.
     embed = discord.Embed(
-        title=f"{player['ign']} — {player['current_rank']} {player['current_division']}",
+        title=f"{player['ign']} — {player['current_rank']}",
         color=discord.Color.gold(),
     )
     embed.add_field(name="MMR", value=f"{player['mmr']} (peak {player['peak_mmr']})", inline=True)
@@ -135,11 +141,64 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     return embed
 
 
+def rank_progress_card(player: dict, tier: str) -> discord.Embed:
+    """/rank-progress card (2026-08). Two deliberate product calls, not
+    simplifications:
+
+    1. Distance shown is always to the *immediately next* tier, never the
+       raw gap to peak/top tier — a player at 190 MMR sees "19 MMR to
+       Elite2", not a discouraging "1811 to Legendary2". See
+       mmr_engine.next_tier_progress's docstring.
+    2. The full ladder is shown so the player has (near-term progress) +
+       (whole-ladder context) in one place, current tier marked with ▶.
+       Ladder is intentionally NOT MMR-annotated per rung beyond the
+       player's own row — showing every tier's floor value competes with
+       the single distance-to-next number for attention; the ladder's job
+       here is "where am I", not "here's the full band table" (that's what
+       the leaderboard/derive_rank docstring is for).
+
+    `tier` is passed in (not re-derived here) since the caller already
+    calls derive_rank once for the title bar — avoids a second identical
+    call for what's cosmetically the same value."""
+    embed = discord.Embed(
+        title=f"{player['ign']} — {tier}",
+        description=f"{player['mmr']} MMR",
+        color=discord.Color.blue(),
+    )
+
+    progress = mmr_engine.next_tier_progress(player["mmr"])
+    if progress:
+        next_tier, remaining = progress
+        embed.add_field(
+            name="Next rank",
+            value=f"**{remaining} MMR** to {next_tier}",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Next rank", value="You're at the top tier — Titans.", inline=False)
+
+    ladder_lines = []
+    for _floor, ladder_tier in mmr_engine.tier_ladder():
+        marker = "▶ " if ladder_tier == tier else "\u2003"  # em-space to align non-current rows
+        ladder_lines.append(f"{marker}{ladder_tier}")
+    # Ladder is stored lowest-first in mmr_engine; display highest-first so
+    # "climbing" reads top-to-bottom the way a leaderboard does.
+    embed.add_field(name="Rank ladder", value="\n".join(reversed(ladder_lines)), inline=False)
+
+    embed.set_footer(text=f"Peak: {player['peak_rank']} at {player['peak_mmr']} MMR")
+    return embed
+
+
 def leaderboard_embed(players: list[dict], metric_label: str = "MMR") -> discord.Embed:
+    # NOTE: zero live callers (confirmed via repo-wide grep, 2026-08-15) —
+    # the actually-used leaderboard render is _leaderboard_embed() inside
+    # cogs/stats.py, a separate function. Kept for now; current_division
+    # removed from the line format since that column was dropped from the
+    # players table (migration_016).
     embed = discord.Embed(title=f"🏆 Champion's Queue Leaderboard — {metric_label}", color=discord.Color.purple())
     lines = []
     for i, p in enumerate(players, start=1):
-        lines.append(f"**{i}.** {p['ign']} — {p['mmr']} MMR ({p['current_rank']} {p['current_division']})")
+        lines.append(f"**{i}.** {p['ign']} — {p['mmr']} MMR ({p['current_rank']})")
     embed.description = "\n".join(lines) or "No ranked players yet."
     return embed
 

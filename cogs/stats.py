@@ -6,7 +6,7 @@ from discord.ext import commands
 
 from database.db import adb
 from services import mmr_engine
-from utils.embeds import player_stats_card, comparison_embed
+from utils.embeds import player_stats_card, comparison_embed, rank_progress_card
 from utils.permissions import admin_only
 
 _PAGE_SIZE = 25  # players per leaderboard page — Discord embed description
@@ -192,8 +192,7 @@ class Stats(commands.Cog):
             return
         tier, division = mmr_engine.derive_rank(player["mmr"])
         await interaction.response.send_message(
-            f"**{player['ign']}** — {tier} {division} — {player['mmr']} MMR\n"
-            f"(Peak: {player['peak_rank']} at {player['peak_mmr']} MMR)",
+            embed=rank_progress_card(player, tier),
             ephemeral=True,
         )
 

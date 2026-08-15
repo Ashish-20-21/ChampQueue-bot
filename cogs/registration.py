@@ -142,7 +142,7 @@ class Registration(commands.Cog):
             return
         await interaction.response.send_message(
             f"**{player['ign']}** — UID `{player['cod_uid']}` — status: `{player['status']}` "
-            f"— rank: {player['current_rank']} {player['current_division']} — MMR: {player['mmr']}",
+            f"— rank: {player['current_rank']} — MMR: {player['mmr']}",
             ephemeral=True,
         )
 

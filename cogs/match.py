@@ -782,36 +782,24 @@ class Match(commands.Cog):
         )
 
     @staticmethod
-    def _resolve_ign(raw_ign: str, roster: dict) -> tuple[dict | None, str | None]:
-        """Look up an OCR-read IGN against this match's 10-player roster.
+    def _fuzzy_lookup(ign: str, roster: dict) -> tuple[dict | None, str | None]:
+        """Shared fuzzy-match + ambiguity-tiebreak core, used by both the
+        raw-string pass and the stripped-parenthetical pass in
+        _resolve_ign so the two share identical collision-safety logic —
+        a fuzzy match is only accepted when exactly one roster IGN is
+        decisively closer than every other candidate; two IGNs close
+        enough that a one-character OCR slip could mean either one are
+        refused, not guessed.
 
-        Exact match (case-insensitive) first, since that's the overwhelming
-        common case and carries zero risk. Only on an exact miss do we try
-        a fuzzy match — and only against this match's own 10 players, never
-        the full player base, to keep the collision risk low. A fuzzy match
-        is only accepted when exactly one roster IGN is a clearly closer
-        match than every other candidate; if two roster IGNs are close
-        enough that a one-character OCR slip could plausibly mean either,
-        we refuse to guess and surface both candidates instead.
-
-        Returns (match_player_or_None, ambiguity_note_or_None). The note is
-        set only when we deliberately declined an ambiguous fuzzy match, so
-        the caller can produce a "did you mean X or Y?" message instead of
-        a bare "unknown IGN".
+        Returns (match_player_or_None, ambiguity_note_or_None), same
+        contract as _resolve_ign itself.
         """
-        ign = raw_ign.strip().lower()
-        exact = roster.get(ign)
-        if exact:
-            return exact, None
-
         candidates = difflib.get_close_matches(ign, roster.keys(), n=3, cutoff=0.75)
         if not candidates:
             return None, None
         if len(candidates) == 1:
             return roster[candidates[0]], None
 
-        # Multiple candidates: only auto-accept if the top one is decisively
-        # closer than the runner-up, not just tied for "close enough".
         scores = [(c, difflib.SequenceMatcher(None, ign, c).ratio()) for c in candidates]
         scores.sort(key=lambda item: item[1], reverse=True)
         best_ign, best_score = scores[0]
@@ -821,6 +809,73 @@ class Match(commands.Cog):
 
         display = ", ".join(roster[c]["players"]["ign"] for c, _ in scores[:2])
         return None, f"ambiguous — could be {display}"
+
+    @staticmethod
+    def _resolve_ign(raw_ign: str, roster: dict) -> tuple[dict | None, str | None]:
+        """Look up an OCR-read IGN against this match's 10-player roster.
+
+        Four-step sequence, each step only reached if every step before it
+        came back with a clean miss (never overrides an ambiguity refusal):
+
+        1. Exact match (case-insensitive) on the raw OCR string — the
+           overwhelming common case, zero risk.
+        2. Fuzzy match on the raw string (see _fuzzy_lookup) — catches
+           ordinary OCR misreads (e.g. "Ézio." vs "Ezío.").
+        3. Strip a "(...)" suffix, if present, and retry as an EXACT match
+           on the remainder. CQ Mobile appends a parenthetical after some
+           players' names on the scoreboard — a short/lowercase echo of
+           their own IGN shown when the full name gets truncated (e.g.
+           "RVL.Eiji(eiji)", "CÖNÑÖR(Con...)"). This is UI chrome, not part
+           of the IGN, and OCR reads it verbatim per its prompt ("string,
+           exactly as shown"). Never reads what was inside the parens —
+           only ever discards it and matches on the part before "(".
+        4. Strip the same "(...)" suffix and retry with a full fuzzy pass
+           (_fuzzy_lookup again) on the remainder — catches the combined
+           case where a player's name has BOTH the parenthetical AND an
+           ordinary OCR character slip in the base name (e.g. OCR misreads
+           "RVL.Eiji(eiji)" as "RVL.Eijl(eiji)"), which step 3's exact-only
+           check can't catch on its own. Same collision-safety tiebreak as
+           step 2, just run a second time on the stripped string.
+
+        Steps 3 and 4 are a genuine last resort — they only run once
+        BOTH step 1 and step 2 already missed against the raw string —
+        so nothing about today's exact/fuzzy behavior changes for the
+        overwhelming majority of IGNs that don't contain "(" at all.
+
+        Returns (match_player_or_None, ambiguity_note_or_None). The note
+        is set whenever a step deliberately declined an ambiguous fuzzy
+        match (step 2 or step 4), so the caller can produce a "did you
+        mean X or Y?" message instead of a bare "unknown IGN".
+        """
+        ign = raw_ign.strip().lower()
+
+        # Step 1: exact match on the raw string.
+        exact = roster.get(ign)
+        if exact:
+            return exact, None
+
+        # Step 2: fuzzy match on the raw string.
+        result, note = Match._fuzzy_lookup(ign, roster)
+        if result or note:
+            return result, note
+
+        # Both steps 1 and 2 came back a clean miss (no match, no
+        # ambiguity note) — only now do we consider stripping a
+        # parenthetical, and only if one is actually present.
+        if "(" not in ign:
+            return None, None
+        stripped = ign.split("(", 1)[0].strip()
+        if not stripped:
+            return None, None
+
+        # Step 3: exact match on the stripped string.
+        stripped_exact = roster.get(stripped)
+        if stripped_exact:
+            return stripped_exact, None
+
+        # Step 4: fuzzy match on the stripped string — same collision
+        # safety as step 2, just applied to the parenthetical-free name.
+        return Match._fuzzy_lookup(stripped, roster)
 
     async def _notify_afk_leaver(self, match: dict, leaver_row: dict, leaver_ign: str) -> None:
         """Informational only — does NOT create a match_issues row and

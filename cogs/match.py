@@ -31,11 +31,12 @@ def normalize_match_code(raw: str) -> str:
     or dropped the hyphen ("1324", "cq1324", "cq-1324"), got an exact-
     match failure with no clear next step, and had to re-attempt the
     whole upload. Rather than pre-filling a hint (Discord slash-command
-    string options don't support a default value, only modals do —
-    see MatchSubmitModal below), this normalizes on the receiving end so
-    ANY reasonable variant of the code works on the first try, regardless
-    of entry point (modal, /match-submit, /match-correction all funnel
-    through this). Strips everything except letters/digits, then
+    string options don't support a default value), this normalizes on
+    the receiving end so ANY reasonable variant of the code works on the
+    first try, regardless of entry point (/match-submit, /match-correction
+    both funnel through this — the modal-based entry point mentioned in
+    an earlier version of this docstring was removed 2026-08-15, see
+    the REMOVED note near match-submit-post further down this file). Strips everything except letters/digits, then
     re-assembles as CQ-<digits> — so "cq1324", "1324", " CQ-1324 ",
     "Cq1324" all normalize to "CQ-1324". If the result doesn't look like
     a valid code (no digits at all), returns the cleaned-but-unprefixed
@@ -257,63 +258,6 @@ class CorrectionDetailModal(discord.ui.Modal, title="Correction Details"):
         )
 
 
-class MatchSubmitModal(discord.ui.Modal, title="Submit Match Results"):
-    """Modal opened from the persistent panel button. Discord modals can't
-    take file attachments, so this only collects the match ID and then
-    points the host at /match-submit for the actual 3-screenshot upload —
-    see Match.start_submission below for why this two-step exists.
-
-    2026-07-29: default="CQ-" pre-fills the prefix so the user's cursor
-    lands right after it and they only type the number — found live that
-    users frequently forgot the prefix or typed it lowercase/without the
-    hyphen. Whatever they end up submitting is also normalized via
-    normalize_match_code() as a second layer, so even if they clear the
-    default and type something else entirely (e.g. just "1324"), it still
-    resolves correctly instead of failing on an exact-format mismatch."""
-
-    match_id_input = discord.ui.TextInput(
-        label="Match ID",
-        placeholder="e.g. CQ-0001",
-        default="CQ-",
-        required=True,
-        max_length=16,
-    )
-
-    def __init__(self, cog: "Match"):
-        super().__init__()
-        self.cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.start_submission(interaction, normalize_match_code(self.match_id_input.value))
-
-
-class SubmissionPanelView(discord.ui.View):
-    """Persistent panel posted once via /match-submit-post. Registered
-    with a fixed custom_id in setup() below so it survives bot restarts,
-    same pattern as RegionQueueView in cogs/queue.py."""
-
-    def __init__(self, cog: "Match"):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    @discord.ui.button(label="Submit Match Results", style=discord.ButtonStyle.primary,
-                        custom_id="match_submit_panel_button")
-    async def submit(self, interaction: discord.Interaction, _: discord.ui.Button):
-        # Unified 2026-07-29: was region-aware (checked against either
-        # region's upload channel, since this button has no match_id yet
-        # and can't resolve a specific match's region). Now there's only
-        # ONE upload channel for all 4 queues, so this is a plain
-        # single-value check — no per-match resolution needed at all,
-        # here or in match_submit() below.
-        if config.RESULT_UPLOAD_CHANNEL_ID and interaction.channel_id != config.RESULT_UPLOAD_CHANNEL_ID:
-            await interaction.response.send_message(
-                "Match results can only be submitted in the result-upload channel.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_modal(MatchSubmitModal(self.cog))
-
-
 class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -363,17 +307,24 @@ class Match(commands.Cog):
             return None
         return self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID)
 
-    @app_commands.command(name="match-submit-post", description="Post the persistent match-results submission panel in this channel")
-    @admin_only()
-    async def match_submit_post(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="Submit Match Results",
-                description="Match Host: click below after the match is played.",
-                color=discord.Color.blurple(),
-            ),
-            view=SubmissionPanelView(self),
-        )
+    # REMOVED 2026-08-15: /match-submit-post + SubmissionPanelView +
+    # MatchSubmitModal + start_submission() (below) were the original
+    # "click a persistent button, fill a modal" submission flow. Built
+    # early on the assumption a button would be easier for players than
+    # a slash command; in practice it added a needless extra step (modal
+    # can't take file attachments, so it only pointed the host at
+    # /match-submit anyway — see start_submission's old docstring) with
+    # zero unique functionality. /match-submit (below) has been the
+    # actual live path for a while; this whole system had no callers
+    # left outside itself. Confirmed via repo-wide grep before removal:
+    # MatchSubmitModal was only opened by SubmissionPanelView's button;
+    # start_submission was only called by that modal; match_submit
+    # itself never touched any of this. The bot.add_view(...) call
+    # registering this as a persistent view has also been removed from
+    # setup() at the bottom of this file — leaving that in place after
+    # removing the class would have crashed the bot on next restart
+    # (NameError), same failure mode as the admin-approve/reject cleanup
+    # earlier this session.
 
     # REMOVED 2026-07-29: /match-roomcode was a pre-/rc prototype that
     # never got wired to _post_match_log (cogs/queue.py) — using it left
@@ -757,27 +708,6 @@ class Match(commands.Cog):
         await approval_channel.send(embed=verification_card(match, round_data, ordered_extractions[0], maps[0]), view=HostApprovalView(self, match["id"]))
         await interaction.followup.send(
             f"Submitted. Check {approval_channel.mention} to approve once you've verified the result.",
-            ephemeral=True,
-        )
-
-    async def start_submission(self, interaction: discord.Interaction, match_id: str):
-        """Entry point from the persistent-panel modal. Discord modals
-        can't collect file attachments, so this validates the match/host
-        up front (fail fast on a bad match ID or wrong host) and then
-        points the Host at /match-submit for the actual upload — that
-        command re-validates match/host/status independently, so nothing
-        here is a security boundary, only a faster failure message."""
-        match = await adb.get_match_by_code(match_id)
-        player = await adb.get_player_by_discord_id(interaction.user.id)
-        if not match or match.get("status") != "awaiting_result":
-            await interaction.response.send_message("Match not found or not awaiting its scoreboard.", ephemeral=True)
-            return
-        if not player or match.get("room_code_shared_by") != player["id"]:
-            await interaction.response.send_message("Only the Match Host can upload the scoreboard.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            f"Match **{match_id}** confirmed. Now run `/match-submit match_id:{match_id}` "
-            f"in this channel and attach the scoreboard screenshot to that command.",
             ephemeral=True,
         )
 
@@ -1244,7 +1174,13 @@ class Match(commands.Cog):
 async def setup(bot: commands.Bot):
     cog = Match(bot)
     await bot.add_cog(cog)
-    bot.add_view(SubmissionPanelView(cog))
+    # bot.add_view(SubmissionPanelView(cog)) removed 2026-08-15 — the
+    # class it registered no longer exists (see REMOVED note above,
+    # /match-submit-post cleanup). Leaving this line in place after
+    # removing the class would raise a NameError on every bot start,
+    # same failure mode caught live during the admin-approve/reject
+    # cleanup earlier this session — checked for and removed together
+    # with the class this time, not as an afterthought.
     bot.add_dynamic_items(IssueResolveButton)
     bot.add_dynamic_items(HostApprovalButton)
     cog.approval_sweep.start()

@@ -600,21 +600,19 @@ class Match(commands.Cog):
         _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
         clean_rounds = [item for item in round_data if item["clean"]]
         if clean_rounds:
+            # migration_017: round_results + player_stats now write in a
+            # single atomic RPC call (replace_match_round_data) instead of
+            # two separate delete+insert pairs across two gathers. Fixes
+            # the write-race from incident_CQ-8758_2026-08-12.txt Root
+            # Cause #1 — either the whole round (both tables) lands, or
+            # none of it does. P6 note (still applies): raw per-round
+            # stats are written from the same round_data already
+            # assembled above — no re-extraction, no second OCR pass.
             await asyncio.gather(*(
                 with_retry(
-                    adb.replace_match_round_results,
+                    adb.replace_match_round_data,
                     match["id"], item["round_number"],
                     [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in item["results"]],
-                )
-                for item in clean_rounds
-            ))
-            # P6: raw per-round stats, written from the same round_data that
-            # was already assembled above — no re-extraction, no second OCR
-            # pass. See migration_006_p6_stats_and_ranks.sql.
-            await asyncio.gather(*(
-                with_retry(
-                    adb.replace_match_player_stats,
-                    match["id"], item["round_number"],
                     [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in item["results"]],
                 )
                 for item in clean_rounds

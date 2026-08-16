@@ -35,6 +35,15 @@ _RETRYABLE_EXCEPTIONS = (
     # class, not a real application-level protocol violation — safe to
     # retry same as RemoteProtocolError.
     httpx.LocalProtocolError,
+    # 2026-08-16: CQ-2578 — a broken-pipe ReadError mid-read on
+    # player_recent_matches (services/validation.py's
+    # check_stat_outliers) crashed match_submit uncaught, since
+    # with_retry passed it straight through on the first attempt
+    # without this being in the tuple. Same transient transport-layer
+    # character as the others here, not an application error — safe
+    # to retry. See incident note comparing this to CQ-8758 (2026-08-16
+    # session) for why these are two distinct bugs, not one.
+    httpx.ReadError,
 )
 
 
@@ -546,13 +555,23 @@ def _upsert_match_screenshot(self: Database, match_id: int, round_number: int,
     return res.data[0]
 
 
-def _replace_match_round_results(self: Database, match_id: int, round_number: int,
-                                 results: list[dict]) -> list[dict]:
-    self.client.table("match_round_results").delete().eq("match_id", match_id).eq("round_number", round_number).execute()
-    if not results:
-        return []
-    payload = [{**row, "match_id": match_id, "round_number": round_number} for row in results]
-    return self.client.table("match_round_results").insert(payload).execute().data
+def _replace_match_round_data(self: Database, match_id: int, round_number: int,
+                               round_results: list[dict], player_stats: list[dict]) -> None:
+    """migration_017: replaces the old _replace_match_round_results +
+    _replace_match_player_stats pair. Both tables' delete+insert now
+    happen inside a single Postgres transaction via the
+    replace_match_round_data RPC -- either the whole round (both
+    tables) lands, or none of it does. Fixes the write-race documented
+    in incident_CQ-8758_2026-08-12.txt Root Cause #1: the old version
+    did DELETE-then-INSERT as separate non-atomic HTTP calls, and the
+    two tables weren't atomic with each other either. See
+    migration_017_atomic_round_data_write.sql for the SQL side."""
+    self.client.rpc("replace_match_round_data", {
+        "p_match_id": match_id,
+        "p_round_number": round_number,
+        "p_round_results": round_results,
+        "p_player_stats": player_stats,
+    }).execute()
 
 
 def _get_match_round_results(self: Database, match_id: int) -> list[dict]:
@@ -649,19 +668,6 @@ def _correct_match_round_result(self: Database, row_id: int, position: int, is_m
     return self.client.table("match_round_results").update(payload).eq("id", row_id).execute().data[0]
 
 
-def _replace_match_player_stats(self: Database, match_id: int, round_number: int,
-                                 stats_rows: list[dict]) -> list[dict]:
-    """Same delete-then-insert shape as replace_match_round_results —
-    naturally idempotent, safe to retry blindly. See P6 migration for
-    why this table exists: raw per-round stats were being validated in
-    _prepare_rounds and then discarded instead of persisted."""
-    self.client.table("match_player_stats").delete().eq("match_id", match_id).eq("round_number", round_number).execute()
-    if not stats_rows:
-        return []
-    payload = [{**row, "match_id": match_id, "round_number": round_number} for row in stats_rows]
-    return self.client.table("match_player_stats").insert(payload).execute().data
-
-
 def _recompute_player_career_stats(self: Database, player_id: int) -> None:
     """Calls the Postgres function of the same name — full recompute
     from match_player_stats + match_round_results, not an increment.
@@ -698,7 +704,7 @@ def _weekly_leaders(self: Database) -> dict[str, dict]:
 
 Database.get_players_by_ids = _get_players_by_ids
 Database.upsert_match_screenshot = _upsert_match_screenshot
-Database.replace_match_round_results = _replace_match_round_results
+Database.replace_match_round_data = _replace_match_round_data  # migration_017, replaces the two lines below
 Database.get_match_round_results = _get_match_round_results
 Database.approve_match = _approve_match
 Database.approve_ro3_match = _approve_ro3_match  # backward-compat, see comment above
@@ -711,7 +717,6 @@ Database.get_overdue_pending_matches = _get_overdue_pending_matches
 Database.set_approval_deadline = _set_approval_deadline
 Database.get_match_screenshot = _get_match_screenshot
 Database.correct_match_round_result = _correct_match_round_result
-Database.replace_match_player_stats = _replace_match_player_stats
 Database.recompute_player_career_stats = _recompute_player_career_stats
 Database.region_leaderboard = _region_leaderboard
 Database.weekly_leaders = _weekly_leaders

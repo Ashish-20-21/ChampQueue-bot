@@ -718,7 +718,10 @@ class Queue(commands.Cog):
         # would reject with "Match not found or not awaiting its three
         # scoreboards" no matter how correct everything else was. Found via
         # live testing 2026-07-17.
-        await respond(f"Room code updated to **{code}**. Match is now live!")
+        await channel.send(
+            f"@everyone Room code updated to **{code}**. Match is now live!",
+            allowed_mentions=discord.AllowedMentions(everyone=True)
+        )
 
         # Match-log entry: only post fresh on the *first* share. A
         # correction just updates the room code in place — re-posting a

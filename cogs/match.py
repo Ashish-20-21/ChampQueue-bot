@@ -954,10 +954,28 @@ class Match(commands.Cog):
         # common enough to be worth automating, but a messy read that
         # merely LOOKS like 9/10 (e.g. one real OCR misread on top of
         # a real leaver) must not be auto-resolved — it goes to a human.
+        # FIX 2026-08-18 (CQ-7594): the short screen-team must be found
+        # by SCREEN-team letter (OCR's own "top group = A" grouping,
+        # per-round and independent of bootstrap), NOT by looking up
+        # per_team using the missing player's STATIC match_players.team
+        # letter. Those two letters have no guaranteed relationship —
+        # same reasoning as the winner/loser resolution above, which
+        # already deliberately never reads match_players.team either.
+        # Using the missing player's static letter as a lookup key into
+        # the screen-team counter only worked when the two letters
+        # happened to coincide — a roughly 50/50 coincidence, not a
+        # guarantee. When they didn't coincide (CQ-7594: missing
+        # player's static team was "A", but the screen-team actually
+        # short a player rendered as "B" that round), this check
+        # silently failed a genuinely clean 9/10 case straight to
+        # manual review. Fix: find whichever screen-team letter has
+        # exactly 4 entries in `results` directly — that IS the short
+        # team, regardless of what any letter means elsewhere.
         missing_players = [mp for mp in match_players if mp["player_id"] not in seen_players]
-        if len(results) == 9 and len(missing_players) == 1 and not reasons and per_team.get(missing_players[0]["team"], 0) == 4:
+        short_screen_teams = [team for team in ("A", "B") if per_team.get(team, 0) == 4]
+        if len(results) == 9 and len(missing_players) == 1 and not reasons and len(short_screen_teams) == 1:
             leaver = missing_players[0]
-            leaver_team = leaver["team"]
+            leaver_team = short_screen_teams[0]
             taken_positions = {row["position"] for row in results if row["team"] == leaver_team}
             leaver_position = next(p for p in range(1, 6) if p not in taken_positions)
             # Stats are honestly 0 — nothing happened for this player this

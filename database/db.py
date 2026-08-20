@@ -223,9 +223,28 @@ class Database:
             "player_id", player_ids
         ).eq("status", "matched").execute()
 
-    # ------------------------------------------------------------------
-    # MATCHES
-    # ------------------------------------------------------------------
+    def queue_clean_all(self, queue_key: str) -> int:
+        """Bulk-wipe every 'waiting' row for one queue_key, flipping
+        status to 'left' — same terminal status queue_leave() uses for a
+        normal voluntary leave. Built for /admin-queue-clean (2026-08-20):
+        an admin recovery tool for the recurring case where players who
+        joined the queue go AFK/unresponsive by the time it actually
+        fills and a match tries to form. Scoped to one queue_key so a
+        stuck queue in one region can be cleared without touching the
+        other 3. Returns the number of rows actually flipped, so the
+        caller can report an accurate count back to the admin (0 is a
+        valid, expected result — not an error — if the queue was already
+        empty)."""
+        res = (
+            self.client.table("queue_entries")
+            .update({"status": "left"})
+            .eq("status", "waiting")
+            .eq("queue_key", queue_key)
+            .execute()
+        )
+        return len(res.data or [])
+
+
     def generate_match_id(self) -> str:
         # Fix 2026-08-19 (quick prod fix): was a bare random 4-digit pick
         # with NO collision check — matches.match_id is a permanent
@@ -287,6 +306,17 @@ class Database:
             {"match_id": match_id, "player_id": player_id, "team": team, "is_captain": is_captain}
         ).execute()
         return res.data[0]
+
+    def remove_match_player(self, match_id: int, player_id: int) -> None:
+        """Deletes one player's match_players row. Built for
+        /admin-queue-replace (2026-08-20) — paired with add_match_player
+        to swap an AFK/unavailable player for a new one on the same team,
+        without touching anyone else's row. Not used anywhere else; the
+        normal match lifecycle never removes a match_players row once
+        added."""
+        self.client.table("match_players").delete().eq(
+            "match_id", match_id
+        ).eq("player_id", player_id).execute()
 
     def get_match_players(self, match_id: int) -> list[dict]:
         res = (

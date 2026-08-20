@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +12,8 @@ from database.db import db, adb
 from services import reputation, mmr_engine
 from utils.embeds import verification_card
 from utils.permissions import admin_only, is_admin
+
+logger = logging.getLogger("champions_queue")
 
 _ADMIN_SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")  # same pattern as cogs/match.py's _SCORE_RE
 
@@ -536,6 +539,230 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
+    # ── /admin-queue-clean (2026-08-20) ───────────────────────────
+    @app_commands.command(name="admin-queue-clean",
+                          description="[Admin] Clear AFK/unresponsive players from a queue — whole queue or up to 3 named players")
+    @app_commands.describe(
+        queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)",
+        user1="Player to remove (leave all 3 blank to clear the ENTIRE queue)",
+        user2="Second player to remove (optional)",
+        user3="Third player to remove (optional)",
+    )
+    @app_commands.choices(queue=[
+        app_commands.Choice(name="EU / AF", value="EU_AF"),
+        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
+        app_commands.Choice(name="India / ME", value="INDIA_ME"),
+        app_commands.Choice(name="Japan", value="JAPAN"),
+    ])
+    @admin_only()
+    async def queue_clean(self, interaction: discord.Interaction, queue: app_commands.Choice[str],
+                           user1: discord.Member | None = None, user2: discord.Member | None = None,
+                           user3: discord.Member | None = None):
+        # Recovery tool for the recurring AFK-at-fill-time problem: players
+        # join early, go unresponsive by the time the queue actually hits
+        # 10 and a match tries to form. Penalties alone don't solve the
+        # immediate "queue is stuck with a dead slot" problem — this does.
+        #
+        # No panel auto-refresh here by design (2026-08-20 planning
+        # discussion): the DB write below is correct the instant this
+        # command runs; the persistent queue panel message just displays
+        # whatever it last rendered until the next Join/Leave/Reload click
+        # re-renders it. A short display lag is an acceptable tradeoff for
+        # not having to locate/guess which channel's panel message to edit.
+        await interaction.response.defer(ephemeral=True)
+        queue_key = queue.value
+
+        named_users = [u for u in (user1, user2, user3) if u is not None]
+        if not named_users:
+            removed_count = await adb.queue_clean_all(queue_key)
+            await interaction.followup.send(
+                f"🧹 Cleared **{removed_count}** player(s) from the **{queue.name}** queue.",
+                ephemeral=True,
+            )
+            return
+
+        current = await adb.queue_current(queue_key=queue_key)
+        by_player_id = {row["player_id"]: row for row in current}
+
+        removed, not_found = [], []
+        for member in named_users:
+            player = await adb.get_player_by_discord_id(member.id)
+            if not player or player["id"] not in by_player_id:
+                not_found.append(member.mention)
+                continue
+            await adb.queue_leave(player["id"])
+            removed.append(player["ign"])
+
+        lines = []
+        if removed:
+            lines.append(f"🧹 Removed from **{queue.name}** queue: " + ", ".join(f"**{ign}**" for ign in removed))
+        if not_found:
+            lines.append("⚠️ Not in that queue (skipped): " + ", ".join(not_found))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    # ── /admin-queue-replace (2026-08-20) ─────────────────────────
+    @app_commands.command(name="admin-queue-replace",
+                          description="[Admin] Swap an AFK/unavailable player in a formed match for a new player")
+    @app_commands.describe(
+        match_id="The match ID (e.g. CQ-0001)",
+        old_player="The AFK/unavailable player currently in the match",
+        new_player="The new player to bring in, same team as old_player",
+    )
+    @admin_only()
+    async def queue_replace(self, interaction: discord.Interaction, match_id: str,
+                             old_player: discord.Member, new_player: discord.Member):
+        match = await adb.get_match_by_code(match_id.strip().upper())
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+
+        # Extended through awaiting_result (2026-08-20 planning discussion):
+        # in practice most AFK reports surface right after the room code
+        # is shared, once teammates start joining the in-game lobby and
+        # notice a seat isn't filling — not earlier at forming/awaiting_room
+        # when nobody's tried to actually join yet. Cut off at
+        # awaiting_result rather than allowing it indefinitely — once the
+        # match reaches later states (awaiting_review, completed, etc.)
+        # a scoreboard already exists with the original player's IGN on
+        # it, and OCR/IGN-resolution is the correct path from there, not
+        # a roster swap.
+        allowed_statuses = ("forming", "awaiting_room", "awaiting_result")
+        if match["status"] not in allowed_statuses:
+            await interaction.response.send_message(
+                f"Match is `{match['status']}` — replace only works while it's still pre-review "
+                f"({', '.join(f'`{s}`' for s in allowed_statuses)}).",
+                ephemeral=True,
+            )
+            return
+
+        old = await adb.get_player_by_discord_id(old_player.id)
+        new = await adb.get_player_by_discord_id(new_player.id)
+        if not old:
+            await interaction.response.send_message(f"{old_player.mention} isn't registered.", ephemeral=True)
+            return
+        if not new:
+            await interaction.response.send_message(f"{new_player.mention} isn't registered.", ephemeral=True)
+            return
+
+        roster = await adb.get_match_players(match["id"])
+        old_row = next((r for r in roster if r["player_id"] == old["id"]), None)
+        if not old_row:
+            await interaction.response.send_message(
+                f"**{old['ign']}** isn't part of match `{match_id}`.", ephemeral=True
+            )
+            return
+        if any(r["player_id"] == new["id"] for r in roster):
+            await interaction.response.send_message(
+                f"**{new['ign']}** is already in this match.", ephemeral=True
+            )
+            return
+
+        team = old_row["team"]
+        await interaction.response.defer(ephemeral=True)
+
+        # Pull the incoming player out of ANY queue they might currently
+        # be sitting in (2026-08-20 planning discussion) — they're about
+        # to be seated in a real match, a stale 'waiting' row would let
+        # them get pulled into a second match simultaneously.
+        all_queues = await adb.queue_current()
+        new_queue_row = next((r for r in all_queues if r["player_id"] == new["id"]), None)
+        if new_queue_row:
+            await adb.queue_leave(new["id"])
+
+        await adb.remove_match_player(match["id"], old["id"])
+        await adb.add_match_player(match["id"], new["id"], team, is_captain=False)
+
+        was_host = match.get("room_code_shared_by") == old["id"]
+        if was_host:
+            await adb.update_match(match["id"], {"room_code_shared_by": new["id"]})
+
+        # Update channel/VC permissions so the swap is real, not just a
+        # DB row change — old player loses access, new player gains it.
+        guild = interaction.guild
+        text_channel_id = match.get("text_channel_id")
+        vc_field = "voice_channel_a_id" if team == "A" else "voice_channel_b_id"
+        vc_id = match.get(vc_field)
+
+        text_channel = guild.get_channel(int(text_channel_id)) if guild and text_channel_id else None
+        vc = guild.get_channel(int(vc_id)) if guild and vc_id else None
+        old_member_obj = guild.get_member(old["discord_id"]) if guild else None
+        # new_player is already a resolved discord.Member from the slash
+        # command param — no lookup needed.
+
+        for channel_obj in (text_channel, vc):
+            if not channel_obj:
+                continue
+            try:
+                if old_member_obj:
+                    await channel_obj.set_permissions(old_member_obj, overwrite=None)
+                if text_channel_id and channel_obj is text_channel:
+                    await channel_obj.set_permissions(new_player, read_messages=True, send_messages=True)
+                elif vc_id and channel_obj is vc:
+                    await channel_obj.set_permissions(new_player, view_channel=True, connect=True)
+            except discord.HTTPException:
+                logger.exception(
+                    "admin_queue_replace: permission update failed for match_id=%s channel_id=%s",
+                    match["id"], getattr(channel_obj, "id", None),
+                )
+
+        # Short, plain, in-a-hurry-friendly note — no skill-vote cleanup,
+        # teams sort operator picks out themselves (2026-08-20 call).
+        if text_channel:
+            try:
+                host_note = " (new host)" if was_host else ""
+                await text_channel.send(
+                    f"🔄 **{old['ign']}** replaced by **{new['ign']}**{host_note} (admin). "
+                    f"Discuss operator skills with your team."
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            f"✅ **{old['ign']}** → **{new['ign']}** on match `{match_id}` (Team {team})."
+            + (" New player was also removed from a queue they were sitting in." if new_queue_row else "")
+            + (" Host reassigned to the new player." if was_host else ""),
+            ephemeral=True,
+        )
+
+    # ── /admin-map-change (2026-08-20) ────────────────────────────
+    @app_commands.command(name="admin-map-change",
+                          description="[Admin] Correct a match's map (e.g. after an illegal in-game map switch)")
+    @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", new_map="The corrected map")
+    @app_commands.choices(new_map=[app_commands.Choice(name=m, value=m) for m in config.HARDPOINT_MAPS])
+    @admin_only()
+    async def map_change(self, interaction: discord.Interaction, match_id: str, new_map: app_commands.Choice[str]):
+        match = await adb.get_match_by_code(match_id.strip().upper())
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+        if match["status"] in ("completed", "cancelled", "abandoned"):
+            await interaction.response.send_message(
+                f"Match is already `{match['status']}` — map can no longer be changed.", ephemeral=True
+            )
+            return
+
+        old_map = (match.get("map_pool") or ["Unknown"])[0]
+        if old_map == new_map.value:
+            await interaction.response.send_message(
+                f"Map is already **{new_map.value}** — nothing to change.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await adb.update_match(match["id"], {"map_pool": [new_map.value]})
+
+        text_channel_id = match.get("text_channel_id")
+        text_channel = interaction.guild.get_channel(int(text_channel_id)) if interaction.guild and text_channel_id else None
+        if text_channel:
+            try:
+                await text_channel.send(f"🗺️ Map corrected to **{new_map.value}** by admin.")
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            f"Map for `{match_id}` changed: **{old_map}** → **{new_map.value}**.", ephemeral=True
+        )
+
     # ── /admin-recompute-stats — COMMENTED OUT (2026-08-15) ──────
     # Superseded by /admin-enter-result routing through approve_match()
     # directly — manual entry no longer needs a separate recompute step.
@@ -571,6 +798,9 @@ class Admin(commands.Cog):
     @reset_match.error
     @match_card.error
     @enter_result.error
+    @queue_clean.error
+    @queue_replace.error
+    @map_change.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(str(error), ephemeral=True)

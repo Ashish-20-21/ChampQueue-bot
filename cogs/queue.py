@@ -468,10 +468,35 @@ class Queue(commands.Cog):
                 f"_start_match_flow failed for queue_key={queue_key}, host_player_id={player['id']}. "
                 f"Rolling back {len(player_ids)} players to 'waiting'."
             )
-            await adb.queue_mark_waiting(player_ids)
+            # Fix 2026-08-19 (quick prod fix): the rollback call itself
+            # used to be unguarded — if queue_mark_waiting ALSO threw
+            # (e.g. a player already had a stale 'waiting' row, hitting
+            # idx_queue_entries_one_waiting_per_player), this whole
+            # except block died right here. interaction.followup.send()
+            # below never ran, so the clicking player got zero message,
+            # and any players the rollback didn't reach stayed stuck as
+            # 'matched' with no channel — the "queue goes empty, no
+            # channel created" incident from 2026-08-18. Now the
+            # rollback's own failure is caught and logged separately so
+            # it can never prevent the player-facing message from going
+            # out, whether or not the rollback itself succeeded.
+            try:
+                await adb.queue_mark_waiting(player_ids)
+            except Exception:
+                logger.exception(
+                    f"Rollback ALSO failed for player_ids={player_ids} in queue_key={queue_key} — "
+                    f"these players may be stuck as 'matched' with no channel. Needs manual DB check."
+                )
+            # Message reworded 2026-08-19: avoid implying the bot itself
+            # is broken (players read "something went wrong" as a bot
+            # malfunction). This is framed as an automatic safety measure
+            # catching a Discord-side hiccup (channel/VC creation,
+            # permissions, rate limits — see comment above this try
+            # block) or a rare internal ID conflict, not a bot failure.
             await interaction.followup.send(
-                "Something went wrong setting up the match — you've been returned to the queue. "
-                "An admin has been notified.",
+                "This match couldn't be started due to a brief sync issue with Discord — "
+                "as a precaution, you've been placed back in queue automatically. "
+                "No action needed on your end, just try Start Match again.",
                 ephemeral=True,
             )
 

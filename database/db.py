@@ -226,10 +226,25 @@ class Database:
     # ------------------------------------------------------------------
     # MATCHES
     # ------------------------------------------------------------------
-    @staticmethod
-    def generate_match_id() -> str:
-        suffix = "".join(random.choices(string.digits, k=4))
-        return f"CQ-{suffix}"
+    def generate_match_id(self) -> str:
+        # Fix 2026-08-19 (quick prod fix): was a bare random 4-digit pick
+        # with NO collision check — matches.match_id is a permanent
+        # unique constraint (old completed matches' codes are never
+        # freed), so with only 10,000 possible values a collision becomes
+        # likely well before 10,000 matches lifetime (birthday paradox).
+        # Hit live 2026-08-18 as a 409 Conflict on CQ-7875, which then
+        # cascaded into handle_start_match's except-block failing too
+        # (see cogs/queue.py) and 10 players silently vanishing from the
+        # queue with no channel. Now checks the DB before returning a
+        # candidate, retrying up to 10 times. No longer @staticmethod
+        # since it needs self.client for the existence check.
+        for _ in range(10):
+            suffix = "".join(random.choices(string.digits, k=4))
+            candidate = f"CQ-{suffix}"
+            existing = self.client.table("matches").select("id").eq("match_id", candidate).execute()
+            if not existing.data:
+                return candidate
+        raise RuntimeError("generate_match_id: could not find a free match_id after 10 attempts")
 
     def create_match(self, is_bootstrap: bool, queue_key: str, season_id: Optional[int] = None) -> dict:
         # Unified 2026-07-29: matches.region is still NOT NULL (migration_008)
@@ -720,3 +735,109 @@ Database.correct_match_round_result = _correct_match_round_result
 Database.recompute_player_career_stats = _recompute_player_career_stats
 Database.region_leaderboard = _region_leaderboard
 Database.weekly_leaders = _weekly_leaders
+
+
+# ── /admin-reset-match (2026-08-15) ──────────────────────────────
+def _reset_match_for_resubmission(self: Database, match_id: int) -> dict:
+    """Clear all submission artifacts for a match and reset its status
+    to 'awaiting_result' so the host can re-upload screenshots through
+    the normal pipeline. Does NOT touch match_players (roster is created
+    at queue formation, not submission). Returns the counts of deleted
+    child rows + the match_players count for caller verification.
+
+    Ground-truth query taken directly from the manually-run SQL that
+    resolved CQ-8758 and CQ-1612 (see incident_CQ-8758_2026-08-12.txt
+    and the session handoff doc for the full investigation trail)."""
+    screenshots = self.client.table("match_screenshots").delete().eq("match_id", match_id).execute()
+    stats = self.client.table("match_player_stats").delete().eq("match_id", match_id).execute()
+    results = self.client.table("match_round_results").delete().eq("match_id", match_id).execute()
+    issues = self.client.table("match_issues").delete().eq("match_id", match_id).execute()
+
+    self.client.table("matches").update({
+        "status": "awaiting_result",
+        "scoreboard_image_url": None,
+        "raw_extraction": None,
+        "completed_at": None,
+        "winner_team": None,
+        "final_score": None,
+        "mvp_player_id": None,
+        "approved_by": None,
+        "approved_at": None,
+    }).eq("id", match_id).execute()
+
+    roster = self.client.table("match_players").select("id").eq("match_id", match_id).execute()
+    return {
+        "screenshots_deleted": len(screenshots.data),
+        "stats_deleted": len(stats.data),
+        "results_deleted": len(results.data),
+        "issues_deleted": len(issues.data),
+        "match_players_count": len(roster.data),
+    }
+
+
+Database.reset_match_for_resubmission = _reset_match_for_resubmission
+
+
+# ── /admin-match-card (2026-08-15) ───────────────────────────────
+def _get_match_player_stats(self: Database, match_id: int) -> list[dict]:
+    """Return all match_player_stats rows for a match."""
+    res = self.client.table("match_player_stats").select("*").eq("match_id", match_id).execute()
+    return res.data
+
+
+Database.get_match_player_stats = _get_match_player_stats
+
+
+# ── /ign-change rate-limit (2026-08-15) ──────────────────────────
+def _log_ign_change(self: Database, player_id: int, old_ign: str, new_ign: str, changed_by: str) -> dict:
+    """Insert an ign_change_history row. changed_by is 'self' for
+    player-initiated changes or the admin's discord_id for admin changes."""
+    res = self.client.table("ign_change_history").insert({
+        "player_id": player_id,
+        "old_ign": old_ign,
+        "new_ign": new_ign,
+        "changed_by": changed_by,
+    }).execute()
+    return res.data[0] if res.data else {}
+
+
+def _count_recent_ign_changes(self: Database, player_id: int, since_iso: str) -> int:
+    """Count SELF-initiated ign_change_history rows for a player since
+    the given timestamp. Used by /ign-change to enforce the 2-per-7-days
+    rate limit for non-admin players.
+
+    Filtered to changed_by == 'self' deliberately (2026-08-19 fix) —
+    without this filter, an admin fixing a player's IGN (changed_by =
+    admin's discord_id) silently ate into that player's own weekly
+    quota too, since both land in the same history table. Found live:
+    admin changed a test player's IGN once, then that same player's own
+    very next self-service attempt was blocked as if they'd already used
+    2 changes. Admin-initiated changes are unlimited and must never
+    count against a player's own allowance."""
+    res = (self.client.table("ign_change_history").select("id", count="exact")
+           .eq("player_id", player_id).eq("changed_by", "self").gte("changed_at", since_iso).execute())
+    return res.count or 0
+
+
+Database.log_ign_change = _log_ign_change
+Database.count_recent_ign_changes = _count_recent_ign_changes
+
+
+# ── /admin-enter-result (2026-08-15) ─────────────────────────────
+def _insert_match_round_results_batch(self: Database, rows: list[dict]) -> list[dict]:
+    """Bulk-insert match_round_results rows. Used by /admin-enter-result
+    to populate the exact same table the OCR pipeline writes to, so
+    approve_match() sees identical input regardless of entry method."""
+    res = self.client.table("match_round_results").insert(rows).execute()
+    return res.data
+
+
+def _insert_match_player_stats_batch(self: Database, rows: list[dict]) -> list[dict]:
+    """Bulk-insert match_player_stats rows. Same table the OCR pipeline
+    writes to — see _insert_match_round_results_batch above."""
+    res = self.client.table("match_player_stats").insert(rows).execute()
+    return res.data
+
+
+Database.insert_match_round_results_batch = _insert_match_round_results_batch
+Database.insert_match_player_stats_batch = _insert_match_player_stats_batch

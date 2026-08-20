@@ -259,16 +259,27 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
     )
     results = round_data[0]["results"] if round_data else []
 
-    players = sorted(extraction.get("players", []), key=lambda p: (p.get("team"), p.get("position", 9)))
+        # position may be None for admin-match-card's dash-placeholder rows
+    # (roster players with no round_results row at all — see
+    # cogs/admin.py's match_card). Sort those last within their team
+    # rather than crashing on a None-vs-int comparison (found live
+    # 2026-08-19: TypeError, '<' not supported between str and int, from
+    # an earlier version of match_card that used "—" as the position
+    # value instead of None).
+    players = sorted(extraction.get("players", []), key=lambda p: (p.get("team") or "", p.get("position") if p.get("position") is not None else 9))
     team_lines = {"A": [], "B": []}
     for p in players:
         ign = str(p.get("ign") or "?")
-        kda = f"{p.get('kills', '?')}/{p.get('deaths', '?')}/{p.get('assists', '?')}"
+        position_str = str(p["position"]) if p.get("position") is not None else "—"
+        kills = p.get("kills")
+        deaths = p.get("deaths")
+        assists = p.get("assists")
+        kda = f"{kills if kills is not None else '—'}/{deaths if deaths is not None else '—'}/{assists if assists is not None else '—'}"
         impact = p.get("impact")
         impact_str = str(impact) if impact is not None else "—"
         mvp = "  MVP" if p.get("is_mvp") else ""
         team_lines.setdefault(p.get("team"), []).append(
-            f"{p.get('position', '?')}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
+            f"{position_str}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
         )
 
     # AFK / mid-match leaver (2026-08, nice-to-have): a synthesized row

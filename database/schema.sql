@@ -48,6 +48,21 @@ create index if not exists idx_players_status on players(status);
 create index if not exists idx_players_mmr on players(mmr desc);
 
 -- ============================================================
+-- IGN CHANGE HISTORY (rate-limit tracking for /ign-change)
+-- ============================================================
+create table if not exists ign_change_history (
+    id          bigserial primary key,
+    player_id   bigint not null references players(id) on delete cascade,
+    old_ign     text not null,
+    new_ign     text not null,
+    changed_by  text not null,      -- 'self' for player-initiated, discord_id string for admin
+    changed_at  timestamptz not null default now()
+);
+
+create index if not exists idx_ign_change_history_player_recent
+    on ign_change_history (player_id, changed_at desc);
+
+-- ============================================================
 -- SEASONS
 -- ============================================================
 create table if not exists seasons (
@@ -105,6 +120,7 @@ create table if not exists matches (
     voice_channel_b_id text,
     scoreboard_image_url text,
     raw_extraction    jsonb,                            -- raw Vision AI output, kept for audits
+    entry_method      text not null default 'ocr',      -- 'ocr' (normal) or 'manual' (/admin-enter-result)
     created_at        timestamptz not null default now(),
     completed_at      timestamptz
 );

@@ -623,12 +623,18 @@ class Queue(commands.Cog):
         # mention is a single atomic pill either way.
         embed_teams.add_field(
             name="🛡️ Team Defender",
-            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_a),
+            value="\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_a),
             inline=True,
         )
+        # Spacer field (2026-08-20): forces Team Attacker onto its own row
+        # instead of packing tight against Defender's field boundary.
+        # inline=False so it takes the full row width — an inline=True
+        # spacer would instead sit beside Defender/Attacker as a third
+        # column on desktop, which isn't the intent here.
+        embed_teams.add_field(name="\u200b", value="\u200b", inline=False)
         embed_teams.add_field(
             name="⚔️ Team Attacker",
-            value="\n\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_b),
+            value="\n".join(f"**{p['ign']}**\n<@{p['discord_id']}>" for p in team_b),
             inline=True,
         )
         # Mode footer intentionally not shown to players — bootstrap is an
@@ -667,7 +673,7 @@ class Queue(commands.Cog):
             # f"{mentions}\n\n"
             f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
             f"Host {host_mention}: share the room code here with `+rc<code>` "
-            f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n"
+            f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n\n"
             f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."
         )
 

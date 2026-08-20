@@ -9,7 +9,9 @@ from services import mmr_engine
 from utils.embeds import player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed
 from utils.permissions import admin_only
 
-_PAGE_SIZE = 25  # players per leaderboard page — Discord embed description
+_PAGE_SIZE = 50  # players per leaderboard page — Discord embed description
+                 # limit is 4096 chars; 50/page × ~50 chars/line (long ign
+                 # worst case) ≈ 2500 chars, still comfortably under that.
                  # limit is 4096 chars; a real ign+rank+mmr line runs
                  # ~40-50 chars, so 25/page stays comfortably under that
                  # even for long names, without needing per-name length math.

@@ -108,9 +108,24 @@ _PERMANENT_BADGES = (
     ("rank_grandmaster", "💎", "Grandmaster",    "Reached Grandmaster1 rank"),
     ("rank_legendary",   "🌟", "Legendary",      "Reached Legendary1 rank"),
     ("rank_titan",       "🛡️", "Titan",          "Reached Titans rank"),
-    ("win_streak_10",    "🔥", "10 Win Streak",  "10 wins in a row"),
-    ("mvp_streak",       "🎯", "MVP Streak",     "3 MVPs in a row"),
-    ("positive_kd_streak","📈","Positive KD Streak", "Positive KD across 5 matches"),
+    # Hidden 2026-08-21 (post-launch check): confirmed via direct query
+    # that ZERO players have ever earned these 3 -- because nothing,
+    # old (dead services/stats_engine.py) or new
+    # (check_and_grant_achievements, migration_020), has ever actually
+    # implemented streak-detection logic. Threshold badges above check
+    # a single stored cumulative value ("total_matches >= 50"); a streak
+    # needs ordered, sequential match history ("were the last N matches
+    # in a row all wins/MVPs/positive-KD") plus a real design decision
+    # on what resets a streak and when that reset gets detected — a
+    # meaningfully different, harder feature than what's built so far.
+    # Commented out (not deleted) so the roadmap is visible in the code
+    # itself: uncomment these 3 lines once the actual streak-checking
+    # function exists and is wired into check_and_grant_achievements().
+    # The `achievements` table rows themselves are untouched — DB state
+    # doesn't need to change for this, only what /achievements displays.
+    # ("win_streak_10",    "🔥", "10 Win Streak",  "10 wins in a row"),
+    # ("mvp_streak",       "🎯", "MVP Streak",     "3 MVPs in a row"),
+    # ("positive_kd_streak","📈","Positive KD Streak", "Positive KD across 5 matches"),
 )
 _PERMANENT_BADGE_LOOKUP = {code: (icon, name, desc) for code, icon, name, desc in _PERMANENT_BADGES}
 

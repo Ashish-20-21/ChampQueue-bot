@@ -82,12 +82,126 @@ def _badge_lines(player_id: int, weekly: dict[str, dict], cap: int = 2) -> list[
     return held[:cap]
 
 
+# Permanent career-badge metadata (2026-08-21 design session, calibrated
+# against real prod stat distributions — see migration_020's own
+# comments for the calibration data). Ordered as displayed: kill ladder,
+# MVP ladder, match-count ladder, KD, rank ladder, streaks. Every code
+# here must exist in the `achievements` table (migration_020) — this is
+# purely display metadata (icon + short mobile-friendly description),
+# NOT the source of truth for who has earned what. That's always
+# player_achievements, read fresh via get_player_achievements().
+_PERMANENT_BADGES = (
+    ("first_blood",      "🩸", "First Blood",   "250 career kills"),
+    ("kill_slayer",      "🔫", "Kill Slayer",    "750 career kills"),
+    ("death_dealer",     "💀", "Death Dealer",   "1500 career kills"),
+    ("sharpshooter",     "🎯", "Sharpshooter",   "3000 career kills"),
+    ("mvp_king",         "🏅", "MVP King",       "20 career MVPs"),
+    ("mvp_legend",       "👑", "MVP Legend",     "30 career MVPs"),
+    ("initiator",        "🌱", "Initiator",      "Played your first match"),
+    ("pacekeeper",       "🥾", "Pacekeeper",     "10 matches played"),
+    ("grinder",          "⚙️", "Grinder",        "30 matches played"),
+    ("veteran",          "🎖️", "Veteran",        "50 matches played"),
+    ("centurion",        "💯", "Centurion",      "100+ matches played"),
+    ("positive_kd",      "📈", "Positive KD",    "Career KD above 1.0"),
+    ("rank_pro",         "🥈", "PRO",            "Reached PRO1 rank"),
+    ("rank_master",      "🥇", "Master",         "Reached Master1 rank"),
+    ("rank_grandmaster", "💎", "Grandmaster",    "Reached Grandmaster1 rank"),
+    ("rank_legendary",   "🌟", "Legendary",      "Reached Legendary1 rank"),
+    ("rank_titan",       "🛡️", "Titan",          "Reached Titans rank"),
+    ("win_streak_10",    "🔥", "10 Win Streak",  "10 wins in a row"),
+    ("mvp_streak",       "🎯", "MVP Streak",     "3 MVPs in a row"),
+    ("positive_kd_streak","📈","Positive KD Streak", "Positive KD across 5 matches"),
+)
+_PERMANENT_BADGE_LOOKUP = {code: (icon, name, desc) for code, icon, name, desc in _PERMANENT_BADGES}
+
+# Live titles (2026-08-21) — NOT stored, computed fresh every call via
+# the live_player_titles() SQL function (migration_020). title_name
+# strings here must match the fixed literals that function returns
+# EXACTLY (it always returns the same constant string per code, never a
+# dynamic one) — kept as plain metadata here, not re-derived from the
+# RPC result, so the browse view can render every title's name even for
+# a player who holds none of them.
+_LIVE_TITLES = (
+    ("top_of_ladder",     "👑", "Top of the Ladder",       "Currently #1 on the leaderboard"),
+    ("top_10",             "🏆", "Top 10",                  "Currently ranked #2–#10"),
+    ("top_50",             "⚡", "Top 50",                  "Currently ranked #11–#50"),
+    ("most_mvps_ever",     "🎯", "Most MVPs Ever",          "Highest career MVP count"),
+    ("most_matches_ever",  "⚔️", "Most Matches Played",     "Highest career match count"),
+    ("highest_kd_ever",    "💥", "Highest KD",              "Highest career KD"),
+)
+_LIVE_TITLE_LOOKUP = {code: (icon, name, desc) for code, icon, name, desc in _LIVE_TITLES}
+
+
+def achievements_card(player: dict, earned: list[dict], live_titles: list[dict]) -> discord.Embed:
+    """Main /achievements card — earned permanent badges + current live
+    titles only, NOT the full browsable list (that's achievements_browse_
+    embed below, opt-in via a button, same "don't overwhelm up front"
+    pattern as rank_progress_card's ladder reveal). `earned` is
+    get_player_achievements()'s raw return (list of {"achievements":
+    {...}} rows); `live_titles` is live_player_titles()'s raw RPC return
+    (list of {"title_code": ..., "title_name": ...} rows).
+
+    Badges/titles with no metadata entry in _PERMANENT_BADGE_LOOKUP /
+    _LIVE_TITLE_META (e.g. an old dead-pipeline code like 'hill_king'
+    that somehow has a row) are skipped rather than crashing or showing
+    a blank line — this card only ever renders codes it has real
+    icon/name data for."""
+    embed = discord.Embed(title=f"{player['ign']} — Badges", color=discord.Color.gold())
+
+    earned_codes = [e["achievements"]["code"] for e in earned]
+    permanent_lines = [
+        f"{icon} **{name}**"
+        for code, icon, name, _desc in _PERMANENT_BADGES
+        if code in earned_codes
+    ]
+    embed.add_field(
+        name="🏅 Earned",
+        value="\n".join(permanent_lines) if permanent_lines else "*No badges earned yet — play a match to get started!*",
+        inline=False,
+    )
+
+    live_lines = [
+        f"{_LIVE_TITLE_LOOKUP[t['title_code']][0]} **{_LIVE_TITLE_LOOKUP[t['title_code']][1]}**"
+        for t in live_titles
+        if t["title_code"] in _LIVE_TITLE_LOOKUP
+    ]
+    if live_lines:
+        embed.add_field(name="👑 Live Titles (can be snatched)", value="\n".join(live_lines), inline=False)
+
+    return embed
+
+
+def achievements_browse_embed(player: dict, earned: list[dict], live_titles: list[dict]) -> discord.Embed:
+    """Full badge catalogue reveal for /achievements' "Browse All Badges"
+    button — every permanent badge and live title that exists, with a
+    ✅/⬜ earned indicator and a short mobile-friendly description on
+    each, split into the same two sections as achievements_card. See
+    2026-08-21 mockup discussion for the exact layout this follows."""
+    embed = discord.Embed(title=f"All Badges — {player['ign']}", color=discord.Color.gold())
+
+    earned_codes = {e["achievements"]["code"] for e in earned}
+    permanent_lines = []
+    for code, icon, name, desc in _PERMANENT_BADGES:
+        mark = "✅" if code in earned_codes else "⬜"
+        permanent_lines.append(f"{mark} {icon} **{name}**\n{desc}")
+    embed.add_field(name="🏅 PERMANENT (earn once)", value="\n\n".join(permanent_lines), inline=False)
+
+    held_titles = {t["title_code"] for t in live_titles}
+    live_lines = []
+    for code, icon, name, desc in _LIVE_TITLES:
+        mark = "✅" if code in held_titles else "⬜"
+        live_lines.append(f"{mark} {icon} **{name}**\n{desc}")
+    embed.add_field(name="👑 LIVE TITLES (can be snatched)", value="\n\n".join(live_lines), inline=False)
+
+    return embed
+
+
 def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     """The renamed, locked-field-set /player-stats card (P6, confirmed
     2026-07-19). Always sent ephemeral by the calling command — see
     cogs/stats.py. Fields, exact locked order: Name, Rank, Region, MMR
-    (+peak), MVPs, KD, Avg hill/obj time, Total assists, Total matches,
-    Record (W-L). Badges are computed live from weekly_leaders(), not
+    (+peak), MVPs, KD, Avg hill/obj time, Avg kills, Total matches,
+    Battles (win %). Badges are computed live from weekly_leaders(), not
     stored — see migration_007.
 
     Rank is derived from mmr_engine.derive_rank(player['mmr']), NOT read
@@ -101,17 +215,20 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     query; here it's a single row, so the existing Python function is
     the simpler fix, no SQL duplication needed.
 
-    Layout: 2 fields per row, FORCED via an invisible zero-width spacer
-    field after every pair. Discord's client packs inline fields
-    greedily based on available render width, not on add_field() call
-    order — three short fields (e.g. Region/MMR/MVPs) will happily share
-    one row on a wide screen even if they were added as separate pairs
-    in code. Confirmed live 2026-07-19: the "2 per row" fix in the
-    previous version still rendered as 3-then-3 on a real Discord
-    client. A spacer field with a zero-width-space value and no name
-    forces a hard row break after each real pair, which is the only
-    reliable way to control this without going non-inline (which would
-    stack everything in one column instead)."""
+    Layout (revised 2026-08-20, mobile UI feedback): plain inline
+    add_field() pairs, no forced-row-break spacer. The old version
+    inserted a zero-width spacer field after every pair specifically to
+    force a hard 2-per-row break on desktop (Discord packs inline fields
+    by available render width, not add_field() call order — see the
+    prior version of this docstring). That trick worked on desktop but
+    actively hurt mobile: mobile already renders inline fields 1-per-row
+    on its own narrow width, so every spacer added a wasted blank row
+    between pairs, roughly doubling the card's scroll length for no
+    benefit. Removing the spacer lets Discord's native inline packing
+    handle both cases correctly — desktop still gets a clean 2-3-per-row
+    layout from the available width, mobile stacks tightly with no dead
+    space. Field order/pairing in the code is unchanged; only the
+    forced-break spacer is gone."""
     rank, _ = mmr_engine.derive_rank(player["mmr"])
     embed = discord.Embed(
         title=f"{player['ign']} — {rank}",
@@ -121,7 +238,6 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     def _pair(name1, value1, name2, value2):
         embed.add_field(name=name1, value=value1, inline=True)
         embed.add_field(name=name2, value=value2, inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)  # forces row break
 
     _pair("Region", player.get("region", "—"), "MMR", f"{player['mmr']} (peak {player['peak_mmr']})")
 
@@ -129,11 +245,22 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     kd = round(player["avg_kills"] / deaths, 2) if deaths else float(player["avg_kills"])
     _pair("MVPs", str(player["mvp_count"]), "KD", f"{kd:.2f}")
 
-    _pair("Avg obj time", f"{player['avg_hill_time']}s", "Total assists", str(player["total_assists"]))
+    # avg_kills swapped in for total_assists (2026-08-20 UI feedback) —
+    # total_assists was felt to be a less useful at-a-glance number than
+    # a per-match kill average. avg_kills is a stored column already
+    # computed by recompute_player_career_stats() as
+    # total_kills / total_rounds, guarded there by a
+    # "case when v_total_rounds > 0" check — so a player with matches
+    # but no counted rounds yet (abandoned match, incomplete result
+    # entry, etc.) already safely reads 0 here rather than dividing by
+    # zero. No new null/zero handling needed on this side.
+    _pair("Avg obj time", f"{player['avg_hill_time']}s", "Avg kills", f"{player['avg_kills']:.2f}")
 
     total = player["total_matches"]
     wr = f"{(player['wins'] / (player['wins'] + player['losses']) * 100):.1f}%" if (player['wins'] + player['losses']) else "—"
-    _pair("Total matches", str(total), "Record (rounds)", f"{player['wins']}W - {player['losses']}L ({wr})")
+    # Renamed 2026-08-20: "Record (rounds)" -> "Battles (win %)" (UI
+    # wording feedback). Value format unchanged (still "WW - LL (xx%)").
+    _pair("Total matches", str(total), "Battles (win %)", f"{player['wins']}W - {player['losses']}L ({wr})")
 
     badges = _badge_lines(player["id"], weekly)
     if badges:

@@ -6,12 +6,16 @@ from discord.ext import commands
 
 from database.db import adb
 from services import mmr_engine
-from utils.embeds import player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed
+from utils.embeds import (
+    player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed,
+    achievements_card, achievements_browse_embed,
+)
 from utils.permissions import admin_only
 
 _PAGE_SIZE = 50  # players per leaderboard page — Discord embed description
-                 # limit is 4096 chars; 50/page × ~50 chars/line (long ign
-                 # worst case) ≈ 2500 chars, still comfortably under that.
+                 # limit is 4096 chars; a real ign+rank+mmr line runs
+                 # ~40-50 chars, so 50/page × ~50 chars (long-name worst
+                 # case) ≈ 2500 chars, still comfortably under that.
 
 
 def _leaderboard_page_text(players: list[dict], page: int) -> tuple[str, int]:
@@ -118,11 +122,21 @@ class RankProgressView(discord.ui.View):
     bot.add_view() registration) — unlike LeaderboardView above, this
     isn't a panel meant to survive a bot restart; it's a single ephemeral
     reply's follow-up interaction, gone the moment the person closes it
-    or the 60s window lapses. See rank_progress_card's docstring for why
-    the ladder is opt-in rather than shown immediately."""
+    or the timeout window lapses. See rank_progress_card's docstring for
+    why the ladder is opt-in rather than shown immediately.
+
+    Timeout bumped 60s -> 180s (2026-08-21, live testing): a player who
+    clicked "View rank ladder" ~2 minutes after running the command hit
+    a silent Discord-side "didn't respond in time" — not a bug, exactly
+    the documented behavior of a non-persistent view's timeout elapsing,
+    but 60s was too tight for how players actually pause before
+    clicking. No logged error is possible here even in principle: once
+    discord.py's internal view-timeout fires, the view is dropped from
+    its dispatch table, so a late click never reaches any of this code
+    at all — Discord's client shows the failure entirely client-side."""
 
     def __init__(self, player: dict, tier: str):
-        super().__init__(timeout=60)
+        super().__init__(timeout=180)
         self.player = player
         self.tier = tier
 
@@ -140,6 +154,36 @@ class RankProgressView(discord.ui.View):
         self.clear_items()
         await interaction.response.edit_message(
             embed=rank_ladder_embed(self.player, self.tier), view=self
+        )
+
+
+class AchievementsBrowseView(discord.ui.View):
+    """One-shot view for /achievements' "Browse All Badges" button. Same
+    pattern as RankProgressView above (non-persistent, real timeout, no
+    custom_id/bot.add_view() registration) — a single ephemeral reply's
+    follow-up interaction, not a panel meant to survive a restart. 180s
+    timeout matches RankProgressView's post-2026-08-21-feedback value
+    rather than the original 60s, since the same "player pauses before
+    clicking" behavior applies here too."""
+
+    def __init__(self, player: dict, earned: list[dict], live_titles: list[dict]):
+        super().__init__(timeout=180)
+        self.player = player
+        self.earned = earned
+        self.live_titles = live_titles
+
+        self.browse_button = discord.ui.Button(
+            label="📖 Browse All Badges", style=discord.ButtonStyle.secondary
+        )
+        self.browse_button.callback = self.browse_callback
+        self.add_item(self.browse_button)
+
+    async def browse_callback(self, interaction: discord.Interaction):
+        # Single-use, same reasoning as RankProgressView.ladder_callback —
+        # nothing to toggle back to once the full catalogue is showing.
+        self.clear_items()
+        await interaction.response.edit_message(
+            embed=achievements_browse_embed(self.player, self.earned, self.live_titles), view=self
         )
 
 
@@ -227,25 +271,36 @@ class Stats(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="achievements", description="View your earned achievements")
+    @app_commands.command(name="achievements", description="View a player's earned badges and current live titles")
+    @app_commands.describe(user="Leave blank to see your own badges, or mention someone else to see theirs")
     async def achievements(self, interaction: discord.Interaction, user: discord.Member | None = None):
+        # Rebuilt 2026-08-21: old version read player_achievements and
+        # dumped every earned row into one flat "General" category field
+        # (all seed achievements share category='general', so this
+        # rendered as one long undifferentiated list — the exact
+        # staleness/clutter complaint that started this redesign). Now
+        # reads the same get_player_achievements() data but renders it
+        # against the curated _PERMANENT_BADGES display order (see
+        # utils/embeds.py), plus live_player_titles() for the
+        # unstored "currently #1" titles — two clearly separated
+        # sections, opt-in full catalogue via the Browse button, same
+        # "don't overwhelm up front" pattern as /rank-progress.
+        #
+        # NOT ephemeral, unlike /player-stats — badges are meant to be
+        # seen by others in a competitive environment (2026-08-21
+        # discussion), same reasoning as the user param existing here in
+        # the first place.
         target = user or interaction.user
         player = await adb.get_player_by_discord_id(target.id)
         if not player:
             await interaction.response.send_message(f"{target.mention} isn't registered.", ephemeral=True)
             return
         earned = await adb.get_player_achievements(player["id"])
-        if not earned:
-            await interaction.response.send_message(f"{player['ign']} hasn't earned any achievements yet.")
-            return
-        by_category: dict[str, list[str]] = {}
-        for e in earned:
-            cat = e["achievements"]["category"]
-            by_category.setdefault(cat, []).append(e["achievements"]["name"])
-        embed = discord.Embed(title=f"{player['ign']} — Achievements", color=discord.Color.gold())
-        for cat, names in by_category.items():
-            embed.add_field(name=cat.title(), value="\n".join(names), inline=False)
-        await interaction.response.send_message(embed=embed)
+        live_titles = await adb.live_player_titles(player["id"])
+        await interaction.response.send_message(
+            embed=achievements_card(player, earned, live_titles),
+            view=AchievementsBrowseView(player, earned, live_titles),
+        )
 
 
 async def setup(bot: commands.Bot):

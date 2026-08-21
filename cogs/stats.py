@@ -300,6 +300,7 @@ class Stats(commands.Cog):
         await interaction.response.send_message(
             embed=achievements_card(player, earned, live_titles),
             view=AchievementsBrowseView(player, earned, live_titles),
+            ephemeral=True,
         )
 
 

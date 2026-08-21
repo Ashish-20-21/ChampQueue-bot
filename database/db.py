@@ -747,6 +747,17 @@ def _weekly_leaders(self: Database) -> dict[str, dict]:
     return {row["category"]: {"player_id": row["player_id"], "value": row["value"]} for row in rows}
 
 
+def _live_player_titles(self: Database, player_id: int) -> list[dict]:
+    """Calls the Postgres function of the same name (migration_020) —
+    computed fresh every call, nothing stored. Returns [{"title_code":
+    ..., "title_name": ...}, ...] for whichever "currently #1" titles
+    this specific player holds right now (ladder position tier +
+    most-MVPs/most-matches/highest-KD-ever). Can be an empty list — most
+    players hold none of these at any given moment, same as the weekly
+    badges."""
+    return self.client.rpc("live_player_titles", {"p_player_id": player_id}).execute().data
+
+
 Database.get_players_by_ids = _get_players_by_ids
 Database.upsert_match_screenshot = _upsert_match_screenshot
 Database.replace_match_round_data = _replace_match_round_data  # migration_017, replaces the two lines below
@@ -765,6 +776,7 @@ Database.correct_match_round_result = _correct_match_round_result
 Database.recompute_player_career_stats = _recompute_player_career_stats
 Database.region_leaderboard = _region_leaderboard
 Database.weekly_leaders = _weekly_leaders
+Database.live_player_titles = _live_player_titles
 
 
 # ── /admin-reset-match (2026-08-15) ──────────────────────────────

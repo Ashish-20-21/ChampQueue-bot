@@ -12,6 +12,7 @@ from database.db import db, adb
 from services import reputation, mmr_engine
 from utils.embeds import verification_card
 from utils.permissions import admin_only, is_admin
+from cogs.queue import RegionQueueView, make_queue_embed
 
 logger = logging.getLogger("champions_queue")
 
@@ -539,6 +540,40 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
+    async def _refresh_queue_panel(self, channel: discord.abc.Messageable, queue_key: str) -> bool:
+        """Finds the persistent queue-panel message for queue_key in this
+        channel (matched by its Join button's custom_id, which is unique
+        per queue_key — see RegionQueueView) and re-renders it with the
+        current DB state. Built for /admin-queue-clean (2026-08-20): an
+        admin cleaning a queue from within the SAME channel the panel
+        lives in — the normal workflow — expects the panel to reflect the
+        removal immediately, not wait for the next Join/Leave/Reload
+        click. Bounded to the last 50 messages; if the panel isn't found
+        in that window (wrong channel, or buried under unrelated chat),
+        this quietly returns False and the caller falls back to the old
+        catches-up-on-next-click behavior rather than erroring out."""
+        target_custom_id = f"join_queue_{queue_key}"
+        async for msg in channel.history(limit=50):
+            if not msg.author.bot or not msg.components:
+                continue
+            found = any(
+                getattr(child, "custom_id", None) == target_custom_id
+                for row in msg.components for child in row.children
+            )
+            if not found:
+                continue
+            current_queue = await adb.queue_current(queue_key=queue_key)
+            view = RegionQueueView(queue_key, self.bot.get_cog("Queue"))
+            await view.update_view_state(current_queue)
+            embed = make_queue_embed(queue_key, current_queue)
+            try:
+                await msg.edit(embed=embed, view=view)
+                return True
+            except discord.HTTPException:
+                logger.warning("_refresh_queue_panel: edit failed for message_id=%s queue_key=%s", msg.id, queue_key)
+                return False
+        return False
+
     # ── /admin-queue-clean (2026-08-20) ───────────────────────────
     @app_commands.command(name="admin-queue-clean",
                           description="[Admin] Clear AFK/unresponsive players from a queue — whole queue or up to 3 named players")
@@ -563,18 +598,23 @@ class Admin(commands.Cog):
         # 10 and a match tries to form. Penalties alone don't solve the
         # immediate "queue is stuck with a dead slot" problem — this does.
         #
-        # No panel auto-refresh here by design (2026-08-20 planning
-        # discussion): the DB write below is correct the instant this
-        # command runs; the persistent queue panel message just displays
-        # whatever it last rendered until the next Join/Leave/Reload click
-        # re-renders it. A short display lag is an acceptable tradeoff for
-        # not having to locate/guess which channel's panel message to edit.
+        # Panel refresh added 2026-08-20 (live testing feedback): the
+        # panel used to just sit stale until the next Join/Leave/Reload
+        # click — in practice that meant a player could hit "Start Match"
+        # on a panel still showing 10/10 right after an admin clean, and
+        # get rejected. _refresh_queue_panel searches THIS channel (the
+        # normal workflow: admin runs the command in the same channel the
+        # panel lives in) and re-renders it immediately. If the panel
+        # isn't found here, this fails quietly — the DB write already
+        # succeeded regardless, so nothing is lost, the display just
+        # catches up on the next natural click instead.
         await interaction.response.defer(ephemeral=True)
         queue_key = queue.value
 
         named_users = [u for u in (user1, user2, user3) if u is not None]
         if not named_users:
             removed_count = await adb.queue_clean_all(queue_key)
+            await self._refresh_queue_panel(interaction.channel, queue_key)
             await interaction.followup.send(
                 f"🧹 Cleared **{removed_count}** player(s) from the **{queue.name}** queue.",
                 ephemeral=True,
@@ -592,6 +632,9 @@ class Admin(commands.Cog):
                 continue
             await adb.queue_leave(player["id"])
             removed.append(player["ign"])
+
+        if removed:
+            await self._refresh_queue_panel(interaction.channel, queue_key)
 
         lines = []
         if removed:

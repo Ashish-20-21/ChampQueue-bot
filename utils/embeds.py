@@ -467,3 +467,90 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         inline=False,
     )
     return embed
+
+
+def ign_confirmation_embed(
+    match: dict,
+    match_players: list[dict],
+    ign_failures: list[dict],
+    unmatched: list[dict],
+    screenshot_url: str,
+) -> discord.Embed:
+    """Rich embed for the IGN confirmation flow. Shows:
+    1. What happened (how many IGNs failed)
+    2. The OCR-read IGNs that couldn't be resolved
+    3. The unmatched roster players (numbered, for the N≥2 modal)
+    4. The full roster for context
+    5. The screenshot as embed image
+
+    For N=1 the mapping is unambiguous and shown explicitly.
+    For N≥2 the numbered unmatched list is what the admin references
+    when typing roster numbers in the modal."""
+    n = len(ign_failures)
+    embed = discord.Embed(
+        title=f"Match {match['match_id']} — IGN Confirmation Needed",
+        description=(
+            f"OCR read the scoreboard but **{n}** player name{'s' if n > 1 else ''} "
+            f"couldn't be matched to the roster. All other data (stats, teams, "
+            f"score) validated fine — this is an IGN-reading issue only."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    # Unresolved OCR reads
+    ocr_lines = "\n".join(f"• `{f.get('ocr_ign', '?')}`" for f in ign_failures)
+    embed.add_field(
+        name="🔍 OCR Could Not Resolve",
+        value=ocr_lines,
+        inline=True,
+    )
+
+    # Unmatched roster players (numbered for modal reference)
+    unmatched_lines = "\n".join(
+        f"**{i+1}.** {mp['players']['ign']}  <@{mp['players']['discord_id']}>"
+        for i, mp in enumerate(unmatched)
+    )
+    embed.add_field(
+        name="❓ Unmatched Roster Players",
+        value=unmatched_lines or "(none)",
+        inline=True,
+    )
+
+    # For N=1, show the explicit proposed mapping
+    if n == 1:
+        embed.add_field(
+            name="📋 Proposed Mapping",
+            value=(
+                f"`{ign_failures[0].get('ocr_ign', '?')}` → "
+                f"**{unmatched[0]['players']['ign']}** "
+                f"<@{unmatched[0]['players']['discord_id']}>"
+            ),
+            inline=False,
+        )
+
+    # Full roster for context (Team Defender / Attacker)
+    team_a = [mp for mp in match_players if mp.get("team") == "A"]
+    team_b = [mp for mp in match_players if mp.get("team") == "B"]
+    roster_a = ", ".join(mp["players"]["ign"] for mp in team_a)
+    roster_b = ", ".join(mp["players"]["ign"] for mp in team_b)
+    embed.add_field(
+        name="🛡️ Team Defender",
+        value=roster_a or "(empty)",
+        inline=True,
+    )
+    embed.add_field(
+        name="⚔️ Team Attacker",
+        value=roster_b or "(empty)",
+        inline=True,
+    )
+
+    # Screenshot for visual verification
+    if screenshot_url:
+        embed.set_image(url=screenshot_url)
+
+    if n == 1:
+        embed.set_footer(text="Click Confirm if this player is visible in the screenshot.")
+    else:
+        embed.set_footer(text="Click Map IGNs and enter the roster number for each OCR name.")
+
+    return embed

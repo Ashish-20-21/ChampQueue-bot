@@ -15,7 +15,7 @@ import config
 import logging
 from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
-from utils.embeds import verification_card
+from utils.embeds import ign_confirmation_embed, verification_card
 from utils.permissions import admin_only, is_admin
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,254 @@ def _truncate_for_discord(prefix: str, parts: list[str], sep: str = "; ", limit:
     if remaining > 0:
         text += f" (+{remaining} more — see admin review panel for full detail)"
     return text
+
+
+# ---------------------------------------------------------------------------
+# IGN Confirmation flow (2026-08): lightweight admin-verification path for
+# matches where the ONLY failure is OCR IGN resolution. Instead of routing
+# to full manual review, the admin sees the roster + screenshot side by
+# side and confirms the mapping. Single click for 1 unresolved IGN, short
+# modal for 2-5. Survives restarts via DynamicItem (same pattern as
+# HostApprovalButton / IssueResolveButton).
+# ---------------------------------------------------------------------------
+
+class IGNConfirmButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"ign_confirm:(?P<match_db_id>[0-9]+):(?P<player_id>[0-9]+)"):
+    """N=1 case: exactly one IGN unresolved, exactly one roster player
+    unmatched — the mapping is unambiguous. Admin clicks to confirm."""
+
+    def __init__(self, match_db_id: int, player_id: int):
+        super().__init__(
+            discord.ui.Button(label="✅ Confirm Match", style=discord.ButtonStyle.success,
+                              custom_id=f"ign_confirm:{match_db_id}:{player_id}")
+        )
+        self.match_db_id = match_db_id
+        self.player_id = player_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["match_db_id"]), int(match["player_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Only admins can confirm IGN mappings.", ephemeral=True)
+            return
+        cog = interaction.client.get_cog("Match")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        # N=1: single-element list — positional pairing with the one
+        # ign_failure entry is trivially correct.
+        await cog._complete_ign_confirmed(interaction, self.match_db_id, [self.player_id])
+
+
+class IGNMapButton(discord.ui.DynamicItem[discord.ui.Button],
+                   template=r"ign_map:(?P<match_db_id>[0-9]+)"):
+    """N=2-5 case: admin needs to map each unresolved OCR IGN to a
+    roster player via a modal."""
+
+    def __init__(self, match_db_id: int):
+        super().__init__(
+            discord.ui.Button(label="🔗 Map IGNs", style=discord.ButtonStyle.primary,
+                              custom_id=f"ign_map:{match_db_id}")
+        )
+        self.match_db_id = match_db_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["match_db_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Only admins can confirm IGN mappings.", ephemeral=True)
+            return
+        # Build the modal from the embed that's already on this message —
+        # no DB queries before the initial response, since Discord's 3s
+        # window for send_modal is tight and DB round-trips could eat it.
+        # _complete_ign_confirmed will re-derive full state from DB later
+        # (after the modal is submitted and properly deferred).
+        try:
+            embed = interaction.message.embeds[0]
+        except (IndexError, AttributeError):
+            await interaction.response.send_message("Could not read embed data — use manual review.", ephemeral=True)
+            return
+
+        # Parse OCR IGNs from the "OCR Could Not Resolve" field
+        ocr_field = next((f for f in embed.fields if f.name and "OCR" in f.name and "Resolve" in f.name), None)
+        ocr_igns: list[str] = []
+        if ocr_field and ocr_field.value:
+            for line in ocr_field.value.split("\n"):
+                # Lines are like "• `someIgn`"
+                line = line.strip().lstrip("•").strip().strip("`").strip()
+                if line:
+                    ocr_igns.append(line)
+
+        # Parse unmatched players from the "Unmatched Roster Players" field
+        unmatched_field = next((f for f in embed.fields if f.name and "Unmatched" in f.name), None)
+        unmatched_igns: list[str] = []
+        unmatched_pids: list[int] = []
+        if unmatched_field and unmatched_field.value:
+            for line in unmatched_field.value.split("\n"):
+                # Lines are like "**1.** SomeIGN  <@123456>"
+                line = line.strip()
+                if not line:
+                    continue
+                # Extract player_id from <@discord_id> — but we actually
+                # need player_id (DB), not discord_id. We can't get that
+                # from the embed alone. So we'll let _complete_ign_confirmed
+                # re-derive the full mapping from DB. The modal just needs
+                # the display info (OCR IGNs + count of unmatched).
+                # Extract the IGN text for the label
+                parts = line.split("**", 2)
+                if len(parts) >= 3:
+                    ign_part = parts[2].strip().split("<")[0].strip()
+                    unmatched_igns.append(ign_part)
+
+        if not ocr_igns:
+            await interaction.response.send_message("Could not parse OCR IGNs from embed — use manual review.", ephemeral=True)
+            return
+
+        # Build lightweight modal — just needs OCR IGN labels and count
+        # of unmatched slots. The actual player_id mapping is resolved
+        # in _complete_ign_confirmed from DB after the modal is submitted.
+        await interaction.response.send_modal(
+            IGNMappingModal(self.match_db_id, ocr_igns, len(unmatched_igns) or len(ocr_igns))
+        )
+
+
+class IGNRejectButton(discord.ui.DynamicItem[discord.ui.Button],
+                      template=r"ign_reject:(?P<match_db_id>[0-9]+)"):
+    """Fallback: admin rejects the quick-confirm and sends the match to
+    the regular manual review path (creates a match_issues row)."""
+
+    def __init__(self, match_db_id: int):
+        super().__init__(
+            discord.ui.Button(label="❌ Send to Review", style=discord.ButtonStyle.secondary,
+                              custom_id=f"ign_reject:{match_db_id}")
+        )
+        self.match_db_id = match_db_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["match_db_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Only admins can review matches.", ephemeral=True)
+            return
+        cog = interaction.client.get_cog("Match")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        match_row = await adb.get_match(self.match_db_id)
+        if not match_row or match_row["status"] != "awaiting_review":
+            await interaction.followup.send("This match is no longer awaiting review.", ephemeral=True)
+            return
+        # Create the match_issues row that the IGN confirmation path
+        # deliberately skipped — now the regular Resolve flow can work.
+        issue = await adb.create_match_issue(
+            match_row["id"], match_row.get("room_code_shared_by"),
+            "vision_failure", "Admin rejected IGN quick-confirm — sent to full manual review."
+        )
+        intake_channel = cog.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID) if config.ISSUE_INTAKE_CHANNEL_ID else None
+        if intake_channel:
+            try:
+                await intake_channel.send(
+                    embed=discord.Embed(
+                        title=f"Match {match_row['match_id']} — needs review",
+                        description="Admin rejected IGN quick-confirm. Full manual review required.",
+                        color=discord.Color.orange(),
+                    ).add_field(name="Reason", value="vision_failure")
+                     .add_field(name="Issue ID", value=str(issue["id"])),
+                    view=IssueResolveView(cog, issue["id"]),
+                )
+            except discord.HTTPException:
+                pass
+        # Edit the original IGN confirmation embed to show rejected
+        try:
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.red()
+            embed.add_field(name="Status", value=f"❌ Rejected by {interaction.user.mention} — sent to full review", inline=False)
+            await interaction.message.edit(embed=embed, view=None)
+        except (discord.HTTPException, IndexError):
+            pass
+        await interaction.followup.send("Sent to full manual review.", ephemeral=True)
+
+
+class IGNMappingModal(discord.ui.Modal, title="Map Unresolved IGNs"):
+    """Modal for N=2-5: admin types the roster number for each unresolved
+    OCR IGN. The numbered roster is visible in the embed above.
+    Lightweight — only needs the OCR IGN strings for labels and the
+    unmatched count for validation. Full player_id resolution happens
+    in _complete_ign_confirmed from DB after submission."""
+
+    def __init__(self, match_db_id: int, ocr_igns: list[str], n_unmatched: int):
+        super().__init__()
+        self.match_db_id = match_db_id
+        self._ocr_igns = ocr_igns[:5]
+        self._n_unmatched = n_unmatched
+        for i, ocr_ign in enumerate(self._ocr_igns):
+            field = discord.ui.TextInput(
+                label=f"OCR: {ocr_ign[:35]}",
+                placeholder="Roster # from embed above",
+                required=True,
+                max_length=2,
+                custom_id=f"ign_slot_{i}",
+            )
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cog = interaction.client.get_cog("Match")
+        # Parse admin inputs — each field value is a 1-based index into
+        # the unmatched-players list shown in the embed. Validate here,
+        # then pass to _complete_ign_confirmed which re-derives the
+        # actual player_ids from DB.
+        roster_indices: list[int] = []
+        seen: set[int] = set()
+        field_idx = 0
+        for child in self.children:
+            if not isinstance(child, discord.ui.TextInput):
+                continue
+            raw_val = child.value.strip()
+            try:
+                idx = int(raw_val)
+            except ValueError:
+                await interaction.followup.send(
+                    f"Invalid input for {self._ocr_igns[field_idx]!r}: expected a number, got {raw_val!r}.",
+                    ephemeral=True,
+                )
+                return
+            if idx < 1 or idx > self._n_unmatched:
+                await interaction.followup.send(
+                    f"Roster number {raw_val} is out of range (1-{self._n_unmatched}).",
+                    ephemeral=True,
+                )
+                return
+            if idx in seen:
+                await interaction.followup.send(
+                    f"Roster number {raw_val} used more than once — each player can only be mapped once.",
+                    ephemeral=True,
+                )
+                return
+            seen.add(idx)
+            roster_indices.append(idx)
+            field_idx += 1
+        # Pass the 1-based roster indices to _complete_ign_confirmed,
+        # which will resolve them to player_ids from the actual DB state.
+        await cog._complete_ign_confirmed_from_modal(
+            interaction, self.match_db_id, roster_indices
+        )
+
+
+class IGNConfirmView(discord.ui.View):
+    """Thin wrapper for the IGN confirmation buttons. timeout=None so
+    they stay clickable indefinitely (DynamicItem handles restart
+    survival — this View is just the container)."""
+
+    def __init__(self, match_db_id: int, n_unresolved: int, unmatched_player_id: int | None = None):
+        super().__init__(timeout=None)
+        if n_unresolved == 1 and unmatched_player_id is not None:
+            self.add_item(IGNConfirmButton(match_db_id, unmatched_player_id))
+        else:
+            self.add_item(IGNMapButton(match_db_id))
+        self.add_item(IGNRejectButton(match_db_id))
 
 
 class HostApprovalButton(discord.ui.DynamicItem[discord.ui.Button], template=r"host_approve:(?P<match_id>[0-9]+)"):
@@ -573,7 +821,7 @@ class Match(commands.Cog):
             for number, (extraction, attachment) in enumerate(ordered_pairs, start=1)
         ))
 
-        round_data, review_reasons = self._prepare_round(match_players, maps[0], ordered_extractions[0])
+        round_data, review_reasons, ign_failures, has_non_ign_issue = self._prepare_round(match_players, maps[0], ordered_extractions[0])
         round_data = [round_data]
 
         # Reform 2026-07-29: previously any non-empty review_reasons caused
@@ -645,6 +893,27 @@ class Match(commands.Cog):
                         await self._notify_afk_leaver(match, row, ign)
 
         if review_reasons:
+            # IGN-confirmation path (2026-08): when the ONLY failures are
+            # IGN resolution (unknown or ambiguous — no map mismatch, no
+            # bad digits, no position/MVP/team issues), and the number of
+            # unresolved OCR rows matches the number of unmatched roster
+            # players, route to the lightweight admin-confirmation flow
+            # instead of full review. The admin sees the roster + screenshot
+            # side by side and confirms which OCR name belongs to which
+            # player — one click for N=1, a short modal for N=2-5.
+            # Cap at 5 (Discord modal limit); 6+ unresolved is too messy
+            # for a quick confirmation and goes to full manual review.
+            resolved_ids = {r["player_id"] for r in round_data[0]["results"]}
+            unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
+            if (ign_failures and not has_non_ign_issue
+                    and len(ign_failures) == len(unmatched)
+                    and 1 <= len(ign_failures) <= 5):
+                screenshot_url = ordered_pairs[0][1].url
+                await self._route_to_ign_confirmation(
+                    interaction, match, match_players, ign_failures, unmatched, screenshot_url
+                )
+                return
+
             screenshot_links = "\n".join(pair[1].url for pair in ordered_pairs)
             technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshot:\n{screenshot_links}"
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
@@ -835,8 +1104,273 @@ class Match(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def _route_to_ign_confirmation(
+        self,
+        interaction: discord.Interaction,
+        match: dict,
+        match_players: list[dict],
+        ign_failures: list[dict],
+        unmatched: list[dict],
+        screenshot_url: str,
+    ) -> None:
+        """Lightweight alternative to _route_to_review for IGN-only
+        failures. Flips match status to awaiting_review (same as full
+        review — prevents re-upload), but does NOT create a match_issues
+        row. Posts a rich embed with the roster, unresolved OCR reads,
+        and the screenshot image to the intake channel, with Confirm/Map
+        + Reject buttons. Also posts a reassuring message in the match
+        text channel so the 10 players know what's happening."""
+        await adb.update_match(match["id"], {"status": "awaiting_review"})
+
+        # --- Player-facing: reassuring message in the match text channel ---
+        text_channel = (
+            self.bot.get_channel(int(match["text_channel_id"]))
+            if match.get("text_channel_id") else None
+        )
+        if text_channel:
+            try:
+                await text_channel.send(
+                    "⚔️ ChampQueue is battling special characters! "
+                    "An admin is sending reinforcements — result will "
+                    "be confirmed shortly. Hang tight!"
+                )
+            except discord.HTTPException:
+                pass
+
+        # --- Admin-facing: rich embed in intake channel ---
+        intake_channel = (
+            self.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID)
+            if config.ISSUE_INTAKE_CHANNEL_ID else None
+        )
+        if intake_channel:
+            n = len(ign_failures)
+            embed = ign_confirmation_embed(
+                match, match_players, ign_failures, unmatched, screenshot_url
+            )
+            view = IGNConfirmView(
+                match["id"], n,
+                unmatched_player_id=unmatched[0]["player_id"] if n == 1 else None,
+            )
+            admin_roles = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS) if hasattr(config, "ADMIN_ROLE_IDS") and config.ADMIN_ROLE_IDS else ""
+            try:
+                await intake_channel.send(
+                    content=admin_roles or None,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            except discord.HTTPException:
+                logger.exception("Failed to send IGN confirmation embed for match %s", match["match_id"])
+
+        # --- Uploader (host) response ---
+        await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+
+    async def _complete_ign_confirmed(
+        self,
+        interaction: discord.Interaction,
+        match_db_id: int,
+        confirmed_pids: list[int],
+    ) -> None:
+        """Called by IGNConfirmButton (N=1) and IGNMappingModal (N≥2)
+        after the admin has confirmed the mapping. confirmed_pids is
+        an ORDERED list, positionally paired with ign_failures — i.e.
+        confirmed_pids[i] is the player_id for ign_failures[i].
+        Re-derives the unresolved state from DB, builds force_map,
+        re-runs _prepare_round, and — if clean — writes the round
+        data, flips status to pending_verification, and posts the
+        verification card. Essentially replays the second half of
+        _submit_body."""
+        match = await adb.get_match(match_db_id)
+        if not match:
+            await interaction.followup.send("Match not found.", ephemeral=True)
+            return
+        if match["status"] != "awaiting_review":
+            await interaction.followup.send("This match is no longer awaiting review.", ephemeral=True)
+            return
+        match_players = await with_retry(adb.get_match_players, match["id"])
+        screenshot = await with_retry(adb.get_match_screenshot, match["id"], 1)
+        if not screenshot or not screenshot.get("raw_extraction"):
+            await interaction.followup.send("Screenshot data not found — use manual review.", ephemeral=True)
+            return
+        extraction = screenshot["raw_extraction"]
+        maps = match.get("map_pool") or []
+        if not maps:
+            await interaction.followup.send("Map pool missing — use manual review.", ephemeral=True)
+            return
+
+        # Re-derive unresolved state to build force_map
+        _, _, ign_failures, has_non_ign = Match._prepare_round(match_players, maps[0], extraction)
+        if not ign_failures or has_non_ign:
+            await interaction.followup.send(
+                "Match state changed — IGN confirmation no longer applicable. Use manual review.",
+                ephemeral=True,
+            )
+            return
+
+        # Identify unmatched roster players
+        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction)
+        resolved_ids = {r["player_id"] for r in temp_round["results"]}
+        unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
+
+        # Sanity: every confirmed player_id must be an unmatched player
+        unmatched_pids = {mp["player_id"] for mp in unmatched}
+        if not set(confirmed_pids).issubset(unmatched_pids):
+            await interaction.followup.send(
+                "Mapping references a player who isn't unmatched — state may have changed. Use manual review.",
+                ephemeral=True,
+            )
+            return
+
+        # Build force_map: each unresolved OCR IGN → the confirmed player_id.
+        # confirmed_pids is ordered to match ign_failures positionally.
+        if len(ign_failures) != len(confirmed_pids):
+            await interaction.followup.send(
+                f"Expected {len(ign_failures)} mappings but got {len(confirmed_pids)}. Use manual review.",
+                ephemeral=True,
+            )
+            return
+        force_map: dict[str, int] = {}
+        for fail, pid in zip(ign_failures, confirmed_pids):
+            key = str(fail.get("ocr_ign") or "").strip().lower()
+            force_map[key] = pid
+
+        # Re-run with force_map — this time IGN resolution is bypassed
+        # for the confirmed entries, but all other validation still runs.
+        round_data_dict, reasons, _, _ = Match._prepare_round(
+            match_players, maps[0], extraction, force_map=force_map
+        )
+        if reasons:
+            # Something else went wrong (bad digits on the force-mapped
+            # row, MVP count off, etc.) — can't auto-complete, fall back.
+            logger.warning(
+                "IGN confirmation for match %s produced new reasons after force_map: %s",
+                match["match_id"], reasons,
+            )
+            await interaction.followup.send(
+                "Confirmed the IGN mapping, but other validation issues remain: "
+                + "; ".join(reasons[:3])
+                + ". This match needs full manual review.",
+                ephemeral=True,
+            )
+            return
+
+        round_data = [round_data_dict]
+        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "mmr_delta", "team")
+        _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
+
+        # Write round data (same as _submit_body's clean-round write path)
+        await asyncio.gather(*(
+            with_retry(
+                adb.replace_match_round_data,
+                match["id"], item["round_number"],
+                [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in item["results"]],
+                [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in item["results"]],
+            )
+            for item in round_data
+        ))
+
+        # Recompute career stats (fire-and-forget, same as _submit_body)
+        recompute_results = await asyncio.gather(
+            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
+            return_exceptions=True,
+        )
+        for mp, result in zip(match_players, recompute_results):
+            if isinstance(result, Exception):
+                logger.exception(
+                    "recompute_player_career_stats failed for player_id=%s after IGN-confirmed match %s",
+                    mp["player_id"], match["match_id"], exc_info=result,
+                )
+
+        # Flip to pending_verification and post verification card
+        deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
+        await with_retry(adb.update_match, match["id"], {"status": "pending_verification", "approval_deadline": deadline})
+
+        approval_channel = (
+            self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID)
+            if config.RESULT_APPROVAL_CHANNEL_ID else None
+        )
+        if approval_channel:
+            await approval_channel.send(
+                embed=verification_card(match, round_data, extraction, maps[0]),
+                view=HostApprovalView(self, match["id"]),
+            )
+
+        # Update the original IGN confirmation embed to show success
+        try:
+            orig_embed = interaction.message.embeds[0]
+            orig_embed.color = discord.Color.green()
+            orig_embed.add_field(
+                name="Status",
+                value=f"✅ Confirmed by {interaction.user.mention} — sent to host approval",
+                inline=False,
+            )
+            await interaction.message.edit(embed=orig_embed, view=None)
+        except (discord.HTTPException, IndexError, AttributeError):
+            pass
+
+        # Match channel confirmation message
+        text_channel = (
+            self.bot.get_channel(int(match["text_channel_id"]))
+            if match.get("text_channel_id") else None
+        )
+        if text_channel:
+            try:
+                await text_channel.send(
+                    "✅ Reinforcements arrived! Result has been confirmed and "
+                    "sent for host approval. Check the approval channel!"
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send("IGN mapping confirmed — verification card posted.", ephemeral=True)
+
+    async def _complete_ign_confirmed_from_modal(
+        self,
+        interaction: discord.Interaction,
+        match_db_id: int,
+        roster_indices: list[int],
+    ) -> None:
+        """Bridge between IGNMappingModal (which only has 1-based roster
+        numbers) and _complete_ign_confirmed (which needs player_ids).
+        Re-derives the unmatched player list from DB and resolves each
+        index to a player_id, then delegates."""
+        match = await adb.get_match(match_db_id)
+        if not match or match["status"] != "awaiting_review":
+            await interaction.followup.send("This match is no longer awaiting review.", ephemeral=True)
+            return
+        match_players = await with_retry(adb.get_match_players, match["id"])
+        screenshot = await with_retry(adb.get_match_screenshot, match["id"], 1)
+        if not screenshot or not screenshot.get("raw_extraction"):
+            await interaction.followup.send("Screenshot data not found — use manual review.", ephemeral=True)
+            return
+        extraction = screenshot["raw_extraction"]
+        maps = match.get("map_pool") or []
+        if not maps:
+            await interaction.followup.send("Map pool missing — use manual review.", ephemeral=True)
+            return
+
+        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction)
+        resolved_ids = {r["player_id"] for r in temp_round["results"]}
+        unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
+
+        # Resolve 1-based indices to player_ids
+        confirmed_pids: list[int] = []
+        for idx in roster_indices:
+            zero_idx = idx - 1
+            if zero_idx < 0 or zero_idx >= len(unmatched):
+                await interaction.followup.send(
+                    f"Roster number {idx} is out of range (1-{len(unmatched)}). "
+                    "State may have changed — use manual review.",
+                    ephemeral=True,
+                )
+                return
+            confirmed_pids.append(unmatched[zero_idx]["player_id"])
+
+        await self._complete_ign_confirmed(interaction, match_db_id, confirmed_pids)
+
     @staticmethod
-    def _prepare_round(match_players: list[dict], announced_map: str, extraction: dict) -> tuple[dict, list[str]]:
+    def _prepare_round(match_players: list[dict], announced_map: str, extraction: dict,
+                       force_map: dict[str, int] | None = None) -> tuple[dict, list[str], list[dict], bool]:
         """RO1 (2026-08): de-looped from the original _prepare_rounds,
         which processed 3 rounds via enumerate(zip(maps, extractions)).
         Same validation logic per round, just run once instead of
@@ -847,11 +1381,31 @@ class Match(commands.Cog):
         Reason strings no longer carry a "round N:" prefix — with only
         one round, the prefix disambiguated nothing and just added
         noise to review messages.
+
+        force_map: when provided, maps OCR IGN (lowered/stripped) →
+        player_id for admin-confirmed IGN resolutions. Bypasses
+        _resolve_ign entirely for matched entries — all other per-row
+        validation (digits, position, MVP, team) still runs normally.
+        Used by the IGN confirmation flow (2026-08).
+
+        Returns (round_dict, reasons, ign_failures, has_non_ign_issue):
+        - ign_failures: list of {"ocr_ign": str, "ocr_row": dict} for
+          each OCR row where _resolve_ign could not find a match.
+          Empty when force_map resolves everything.
+        - has_non_ign_issue: True if any failure OTHER than IGN
+          resolution was detected (map mismatch, bad digits, invalid
+          position, etc.). Completeness/MVP-count checks at the end
+          do NOT set this flag — those are consequences of IGN
+          failures, not independent problems.
         """
         roster = {mp["players"]["ign"].strip().lower(): mp for mp in match_players}
+        roster_by_pid = {mp["player_id"]: mp for mp in match_players}
         reasons: list[str] = []
+        ign_failures: list[dict] = []
+        has_non_ign_issue = False
         resolved_map = localization.resolve_map_name(str(extraction.get("map") or ""))
         if resolved_map != announced_map.upper():
+            has_non_ign_issue = True
             raw_map = extraction.get("map")
             reasons.append(
                 f"map mismatch — announced **{announced_map}**, "
@@ -862,7 +1416,7 @@ class Match(commands.Cog):
         score_match = _SCORE_RE.fullmatch(score)
         if not score_match or score_match.group(1) == score_match.group(2):
             reasons.append("final score is unreadable")
-            return {"round_number": 1, "map_name": announced_map, "final_score": score, "results": [], "clean": False}, reasons
+            return {"round_number": 1, "map_name": announced_map, "final_score": score, "results": [], "clean": False}, reasons, [], True
         # Winner/loser is resolved from the OCR's own screen-position
         # grouping (row["team"], "top group = A" per the vision prompt),
         # NOT from match_players.team. match_players.team is a static
@@ -887,31 +1441,50 @@ class Match(commands.Cog):
         seen_players: set[int] = set()
         per_team = Counter()
         for row in extraction.get("players", []):
-            mp, ambiguity = Match._resolve_ign(str(row.get("ign") or ""), roster)
-            if not mp:
-                if ambiguity:
-                    reasons.append(f"OCR IGN {row.get('ign')!r} is {ambiguity} — needs manual confirmation")
-                else:
-                    reasons.append(f"unknown OCR IGN {row.get('ign')!r}")
-                continue
+            raw_ign_str = str(row.get("ign") or "")
+            ign_lower = raw_ign_str.strip().lower()
+            # Force-map: admin-confirmed IGN mapping bypasses _resolve_ign
+            # entirely. All other per-row validation (digits, position,
+            # MVP, team) still runs — force_map only skips the name-
+            # matching step, not the data-quality checks.
+            if force_map and ign_lower in force_map:
+                mp = roster_by_pid.get(force_map[ign_lower])
+                if not mp:
+                    has_non_ign_issue = True
+                    reasons.append(f"force-mapped player_id {force_map[ign_lower]} not in roster")
+                    continue
+            else:
+                mp, ambiguity = Match._resolve_ign(raw_ign_str, roster)
+                if not mp:
+                    if ambiguity:
+                        reasons.append(f"OCR IGN {row.get('ign')!r} is {ambiguity} — needs manual confirmation")
+                    else:
+                        reasons.append(f"unknown OCR IGN {row.get('ign')!r}")
+                    ign_failures.append({"ocr_ign": row.get("ign"), "ocr_row": row})
+                    continue
             if mp["player_id"] in seen_players:
+                has_non_ign_issue = True
                 reasons.append(f"duplicate OCR player {row.get('ign')}")
                 continue
             round_team = row.get("team")
             if round_team not in ("A", "B"):
+                has_non_ign_issue = True
                 reasons.append(f"unreadable team grouping for {row.get('ign')!r}")
                 continue
             invalid = [field for field in _INTEGER_FIELDS if not _INTEGER_RE.fullmatch(str(row.get(field, "")))]
             if not _HILL_TIME_RE.fullmatch(str(row.get("hill_time", ""))):
                 invalid.append("hill_time")
             if invalid:
+                has_non_ign_issue = True
                 reasons.append(f"invalid OCR digit format for {row.get('ign')} ({', '.join(invalid)})")
                 continue
             position = int(row["position"])
             if not 1 <= position <= 5:
+                has_non_ign_issue = True
                 reasons.append(f"invalid position for {row.get('ign')}")
                 continue
             if not isinstance(row.get("is_mvp"), bool):
+                has_non_ign_issue = True
                 reasons.append(f"MVP flag is missing or invalid for {row.get('ign')}")
                 continue
             is_mvp = row["is_mvp"]
@@ -1012,7 +1585,7 @@ class Match(commands.Cog):
             # approval regardless of this flag.
             "clean": len(reasons) == 0,
         }
-        return round_dict, reasons
+        return round_dict, reasons, ign_failures, has_non_ign_issue
 
     async def _run_post_approval_cleanup(self, guild: discord.Guild | None, match: dict) -> None:
         """Shared by the manual Approve button and the auto-approve sweep.
@@ -1199,4 +1772,7 @@ async def setup(bot: commands.Bot):
     # with the class this time, not as an afterthought.
     bot.add_dynamic_items(IssueResolveButton)
     bot.add_dynamic_items(HostApprovalButton)
+    bot.add_dynamic_items(IGNConfirmButton)
+    bot.add_dynamic_items(IGNMapButton)
+    bot.add_dynamic_items(IGNRejectButton)
     cog.approval_sweep.start()

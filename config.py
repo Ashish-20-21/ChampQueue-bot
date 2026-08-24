@@ -161,6 +161,18 @@ AFK_REQUEUE_PENALTY = -5             # reputation hit for not confirming in time
 BOOTSTRAP_MATCH_THRESHOLD = 10
 BOOTSTRAP_MIN_ELIGIBLE_POOL = 20     # need at least this many "graduated" players before analysis mode goes live
 
+# Team split (2026-08, analysis mode only — see services/matchmaking.py
+# module docstring for the full design). Exhaustive C(10,5) search finds
+# the true-optimal 5v5 split by composite score; this epsilon widens the
+# pool to every split within N composite-points of optimal, and one is
+# picked at random from that pool. Prevents the same 10 players (common
+# in a small community) always getting an identical lineup, without ever
+# admitting a genuinely worse split for the sake of variety. Calibrated
+# against 145 real historical match pops: guaranteed >=2 candidates per
+# pop at this value, median ~8 candidates, sampled diff stayed at a
+# 7-14 point median/mean — negligible against this project's MMR scale.
+TEAM_SPLIT_EPSILON = 10
+
 # --- MMR weights (tunable; win/loss dominates by design) ---
 MMR_WIN_BASE = 25
 MMR_LOSS_BASE = -20

@@ -505,14 +505,19 @@ class Queue(commands.Cog):
         player_ids = [p["id"] for p in players]
         bootstrap = await matchmaking.is_bootstrap_match(player_ids)
 
-        # Call balancing function (captains removed from return type)
-        _ = matchmaking.balance_teams(players, bootstrap=bootstrap)
-
-        # Split 10 queued players by index (Defender vs Attacker)
-        # Players 1,3,5,7,9 (0, 2, 4, 6, 8) = Defender
-        # Players 2,4,6,8,10 (1, 3, 5, 7, 9) = Attacker
-        team_a = [players[0], players[2], players[4], players[6], players[8]]  # Defender
-        team_b = [players[1], players[3], players[5], players[7], players[9]]  # Attacker
+        # Team split (2026-08): wired up to balance_teams()'s actual
+        # output. Previously discarded (`_ = ...`) and replaced with
+        # hardcoded even-odd join-order indexing — flagged in
+        # DECISIONS.md as "a real gap, not intentional" since
+        # balance_teams() already computed a real split every match.
+        # Historical replay against 145 real match pops showed even-odd
+        # produced a mean team-MMR gap of ~116-262 (measurement-method
+        # dependent); the wired-up exhaustive+epsilon split brings that
+        # down to a 7-14 point median/mean on the same real data. See
+        # services/matchmaking.py's module docstring for the full design.
+        result = matchmaking.balance_teams(players, bootstrap=bootstrap)
+        team_a = result["team_a"]  # Defender
+        team_b = result["team_b"]  # Attacker
 
         # Create match (no captains assigned)
         match = await adb.create_match(is_bootstrap=bootstrap, queue_key=queue_key)

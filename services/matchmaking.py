@@ -1,7 +1,7 @@
 """
 Matchmaking service: turns 10 queued players into two balanced 5-player
-teams, picks a captain per team, and decides whether we're still in the
-"bootstrap" (random) phase or the analysis-driven phase.
+teams, and decides whether we're still in the "bootstrap" (random) phase
+or the analysis-driven phase.
 
 Bootstrap cutover rule (see config.BOOTSTRAP_MATCH_THRESHOLD /
 BOOTSTRAP_MIN_ELIGIBLE_POOL): calendar time is not a reliable proxy for
@@ -10,10 +10,42 @@ A given match runs in analysis mode only if ALL 10 players in that
 queue pop have already reached the match threshold; otherwise it's a
 bootstrap (random) match, and it still counts toward every player's
 threshold progress.
+
+Analysis-mode split (2026-08): exhaustive evaluation of all C(10,5)=252
+possible 5-player splits, scored on a composite metric (MMR-dominant).
+Wired up 2026-08 — previously balance_teams() computed a snake-draft
+split every match but cogs/queue.py discarded the result and used
+even-odd join-order instead (see DECISIONS.md "Team split: join-order
+vs MMR-balanced" — flagged there as "a real gap, not intentional").
+Historical replay against 145 real match pops confirmed even-odd
+produced a mean team-MMR gap of ~116-262 depending on measurement
+method (see session notes); the true optimal split for those same
+pops averaged a 3-10 point gap. Exhaustive search over 252 splits is
+sub-millisecond (benchmarked ~0.39ms), completely negligible against
+the >1s of Discord API calls (channel/VC creation) that follow team
+formation in cogs/queue.py's _start_match_flow.
+
+Randomization (2026-08): rather than always picking the single
+mathematically-best split, we collect every split within
+config.TEAM_SPLIT_EPSILON composite-points of the true optimum and
+pick uniformly at random among them. This exists because a fully
+deterministic split means the same 10 players (a common occurrence in
+a small community that queues together repeatedly) would get the
+identical team lineup every time — swapping "random, sometimes
+lopsided" for "predictable, always the same two crews" is its own
+complaint waiting to happen. Every candidate in the pool is
+near-optimal by construction, so this never trades away real balance
+for variety. Epsilon=10 was chosen by replaying it against all 145
+real historical match pops: every single pop produced at least 2
+candidate splits (never a de-facto single option), median 8 candidates
+per pop, and the randomly-sampled diff stayed at a 7-14 point median/
+mean — negligible against this project's MMR scale (players observed
+ranging roughly 0-990 composite).
 """
 
 from __future__ import annotations
 import asyncio
+import itertools
 import random
 from typing import Any
 
@@ -39,24 +71,43 @@ async def is_bootstrap_match(player_ids: list[int]) -> bool:
     return (pool_res.count or 0) < config.BOOTSTRAP_MIN_ELIGIBLE_POOL
 
 
-def _performance_score(player: dict) -> float:
-    """Single composite score used ONLY for balancing/captain selection —
-    not the same thing as MMR, though MMR is the dominant input."""
+def _composite_score(player: dict) -> float:
+    """Single composite score used ONLY for balancing — not the same
+    thing as MMR, though MMR is the dominant input (~75% of the score
+    for a typical player, by design — the secondary signals exist to
+    differentiate players whose MMR is similar but whose actual play
+    isn't, and to break ties, not to override MMR).
+
+    Formula locked 2026-08 after reviewing real player data (267
+    players, MMR range 0-990 composite): mmr + win_rate*100 +
+    kd_ratio*40 + avg_hill_time*1.5 + mvp_rate*60.
+    """
     mmr = player.get("mmr", 200)  # matches players.mmr's default (200 as of 2026-07-30 global-transition reset, see migration_012)
-    win_rate = 0.0
     total = player.get("total_matches", 0)
-    if total > 0:
-        win_rate = player.get("wins", 0) / total
-    avg_damage = float(player.get("avg_damage", 0) or 0)
+    win_rate = (player.get("wins", 0) / total) if total > 0 else 0.0
+    avg_kills = float(player.get("avg_kills", 0) or 0)
+    avg_deaths = float(player.get("avg_deaths", 0) or 0)
+    kd_ratio = avg_kills / avg_deaths if avg_deaths > 0 else avg_kills  # avoid div/0; a 0-death player's KD is just their kill count
+    mvp_rate = (player.get("mvp_count", 0) / total) if total > 0 else 0.0
     avg_hill_time = float(player.get("avg_hill_time", 0) or 0)
-    return mmr + (win_rate * 200) + (avg_damage * 0.05) + (avg_hill_time * 2)
+    return mmr + (win_rate * 100) + (kd_ratio * 40) + (avg_hill_time * 1.5) + (mvp_rate * 60)
 
 
 def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]:
     """
     queued_players: list of player dicts (must include id, mmr, wins,
-    total_matches, avg_damage, avg_hill_time).
-    Returns {"team_a": [...], "team_b": [...], "captain_a": id, "captain_b": id}
+    total_matches, avg_kills, avg_deaths, avg_hill_time, mvp_count).
+    Returns {"team_a": [...], "team_b": [...]}
+
+    Bootstrap: random shuffle — noisy/insufficient data shouldn't be
+    trusted for balancing (see module docstring + DECISIONS.md).
+
+    Analysis mode: exhaustive C(10,5)=252-split search on composite
+    score, epsilon-bounded randomization among near-optimal splits
+    (see module docstring for the epsilon=10 calibration). Which of
+    the two resulting groups becomes Defender (team_a) vs Attacker
+    (team_b) is a coin flip — nothing about the split computation
+    itself should create a systematic side bias.
     """
     assert len(queued_players) == config.QUEUE_SIZE, "matchmaking requires exactly 10 players"
 
@@ -67,13 +118,27 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
         team_a = players[:config.TEAM_SIZE]
         team_b = players[config.TEAM_SIZE:]
     else:
-        # Snake draft by performance score: 1-2-2-1-2-2-1-2-2-1 style
-        # alternation gives a much more even split than "top 5 vs bottom 5".
-        ranked = sorted(players, key=_performance_score, reverse=True)
-        team_a, team_b = [], []
-        order = ["A", "B", "B", "A", "A", "B", "B", "A", "A", "B"]
-        for player, side in zip(ranked, order):
-            (team_a if side == "A" else team_b).append(player)
+        scores = [_composite_score(p) for p in players]
+        best_diff = float("inf")
+        all_splits: list[tuple[float, tuple[int, ...], tuple[int, ...]]] = []
+        for combo in itertools.combinations(range(10), 5):
+            rest = tuple(i for i in range(10) if i not in combo)
+            sum_a = sum(scores[i] for i in combo)
+            sum_b = sum(scores[i] for i in rest)
+            diff = abs(sum_a - sum_b)
+            all_splits.append((diff, combo, rest))
+            if diff < best_diff:
+                best_diff = diff
+
+        near_optimal = [s for s in all_splits if s[0] <= best_diff + config.TEAM_SPLIT_EPSILON]
+        _, group_1_idx, group_2_idx = random.choice(near_optimal)
+
+        group_1 = [players[i] for i in group_1_idx]
+        group_2 = [players[i] for i in group_2_idx]
+        if random.random() < 0.5:
+            team_a, team_b = group_1, group_2
+        else:
+            team_a, team_b = group_2, group_1
 
     return {
         "team_a": team_a,

@@ -17,6 +17,7 @@ from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
 from utils.embeds import ign_confirmation_embed, verification_card
 from utils.permissions import admin_only, is_admin
+from utils import incident_log
 
 logger = logging.getLogger(__name__)
 
@@ -782,11 +783,25 @@ class Match(commands.Cog):
             # _prepare_round crashed match_submit with zero notification
             # to anyone, player or admin.
             logger.exception("match_submit: unhandled exception for match_id=%s", match_id)
+            await incident_log.post(
+                self.bot,
+                category="MATCH_SUBMIT_UNHANDLED",
+                summary=f"Unhandled exception in match_submit for match_id={match_id}",
+                exc=exc,
+                match=match,
+            )
             try:
                 await self._route_to_review(match, player["id"] if player else None, "vision_failure",
                                              f"Unhandled exception in match_submit: {exc!r}")
-            except Exception:
+            except Exception as route_exc:
                 logger.exception("match_submit: even _route_to_review failed while handling the original exception")
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_SUBMIT_UNHANDLED",
+                    summary=f"_route_to_review ALSO failed while handling original match_submit exception for match_id={match_id}",
+                    exc=route_exc,
+                    match=match,
+                )
             await interaction.followup.send(
                 "Something went wrong on our end processing this submission — it's been flagged for admin "
                 "review automatically. Sorry about that, we'll sort it out.", ephemeral=True
@@ -802,6 +817,14 @@ class Match(commands.Cog):
                 for image_bytes, attachment in zip(payloads, attachments)
             ))
         except Exception as exc:
+            logger.exception("_submit_body: OCR/extraction raised an exception for match_id=%s", match["id"])
+            await incident_log.post(
+                self.bot,
+                category="MATCH_OCR_FAIL",
+                summary=f"OCR/extraction raised an exception for match_id={match['id']} — routed to manual review",
+                exc=exc,
+                match=match,
+            )
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", f"OCR/extraction raised an exception: {exc}")
             await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
@@ -1159,8 +1182,15 @@ class Match(commands.Cog):
                     view=view,
                     allowed_mentions=discord.AllowedMentions(roles=True),
                 )
-            except discord.HTTPException:
+            except discord.HTTPException as exc:
                 logger.exception("Failed to send IGN confirmation embed for match %s", match["match_id"])
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_IGN_CONFIRM_SEND_FAIL",
+                    summary=f"IGN confirmation embed failed to send for match {match['match_id']} — match is stuck in awaiting_review with no admin-visible embed",
+                    exc=exc,
+                    match=match,
+                )
 
         # --- Uploader (host) response ---
         await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
@@ -1279,6 +1309,13 @@ class Match(commands.Cog):
                 logger.exception(
                     "recompute_player_career_stats failed for player_id=%s after IGN-confirmed match %s",
                     mp["player_id"], match["match_id"], exc_info=result,
+                )
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_STAT_RECOMPUTE_FAIL",
+                    summary=f"recompute_player_career_stats failed for player_id={mp['player_id']} after IGN-confirmed match {match['match_id']} — career stats now stale for this player, MMR already committed and unaffected",
+                    exc=result,
+                    match=match,
                 )
 
         # Flip to pending_verification and post verification card
@@ -1654,6 +1691,12 @@ class Match(commands.Cog):
                     "recompute_player_career_stats failed for player_id=%s after match_id=%s approval",
                     mp["player_id"], match_id, exc_info=result,
                 )
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_STAT_RECOMPUTE_FAIL",
+                    summary=f"recompute_player_career_stats failed for player_id={mp['player_id']} after match_id={match_id} approval — career stats now stale for this player, MMR already committed and unaffected",
+                    exc=result,
+                )
 
         match = await adb.get_match(match_id)
         await self._run_post_approval_cleanup(guild, match)
@@ -1719,8 +1762,14 @@ class Match(commands.Cog):
         now_iso = discord.utils.utcnow().isoformat()
         try:
             overdue = await adb.get_overdue_pending_matches(now_iso)
-        except Exception:
+        except Exception as exc:
             logger.exception("approval_sweep: get_overdue_pending_matches failed")
+            await incident_log.post(
+                self.bot,
+                category="MATCH_APPROVAL_SWEEP_FAIL",
+                summary="approval_sweep: get_overdue_pending_matches failed — this entire sweep cycle was skipped",
+                exc=exc,
+            )
             return
 
         guild = self.bot.get_guild(config.GUILD_ID)

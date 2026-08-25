@@ -57,6 +57,15 @@ ADMIN_ROLE_IDS = {int(x.strip()) for x in _require("ADMIN_ROLE_IDS").split(",") 
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
+# --- Incident logging (2026-08-24) ---
+# #botlog channel — created manually in Discord same as AFK/MATCH_LOG above.
+# Same fail-open pattern: unset means utils/incident_log.py falls back to
+# console-only logging instead of crashing the bot on boot. This channel
+# only ever receives messages from inside existing except blocks (see
+# utils/incident_log.py) — it has no other code path and no background
+# task, so it costs nothing when nothing is failing.
+BOTLOG_CHANNEL_ID = int(os.getenv("BOTLOG_CHANNEL_ID")) if os.getenv("BOTLOG_CHANNEL_ID") else None
+
 # --- Unified global region + 4-queue matchmaking (2026-07-29) ---
 # Server moved to one unified show with four ticket-counter queues, kept
 # separate for matchmaking throughput / ping reasons only. Everything

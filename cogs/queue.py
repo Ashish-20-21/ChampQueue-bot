@@ -12,6 +12,7 @@ import config
 from database.db import db, adb
 from services import matchmaking, mmr_engine, reputation
 from utils.permissions import admin_only
+from utils import incident_log
 
 logger = logging.getLogger("champions_queue")
 
@@ -463,10 +464,17 @@ class Queue(commands.Cog):
         try:
             await self._start_match_flow(interaction, players_list, player["id"], queue_key)
             await interaction.followup.send("Match started successfully!", ephemeral=True)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 f"_start_match_flow failed for queue_key={queue_key}, host_player_id={player['id']}. "
                 f"Rolling back {len(player_ids)} players to 'waiting'."
+            )
+            await incident_log.post(
+                self.bot,
+                category="QUEUE_MATCH_CREATE_FAIL",
+                summary=f"_start_match_flow failed for queue_key={queue_key}, rolling back {len(player_ids)} players",
+                exc=exc,
+                players=[(p["ign"], p["discord_id"]) for p in players_list],
             )
             # Fix 2026-08-19 (quick prod fix): the rollback call itself
             # used to be unguarded — if queue_mark_waiting ALSO threw
@@ -482,10 +490,17 @@ class Queue(commands.Cog):
             # out, whether or not the rollback itself succeeded.
             try:
                 await adb.queue_mark_waiting(player_ids)
-            except Exception:
+            except Exception as rollback_exc:
                 logger.exception(
                     f"Rollback ALSO failed for player_ids={player_ids} in queue_key={queue_key} — "
                     f"these players may be stuck as 'matched' with no channel. Needs manual DB check."
+                )
+                await incident_log.post(
+                    self.bot,
+                    category="QUEUE_ROLLBACK_FAIL",
+                    summary=f"Rollback ALSO failed for queue_key={queue_key} — players may be stuck as 'matched' with no channel, needs manual DB check",
+                    exc=rollback_exc,
+                    players=[(p["ign"], p["discord_id"]) for p in players_list],
                 )
             # Message reworded 2026-08-19: avoid implying the bot itself
             # is broken (players read "something went wrong" as a bot
@@ -963,8 +978,15 @@ class Queue(commands.Cog):
             try:
                 if channel:
                     await channel.delete(reason="Scheduled cleanup — match completed/abandoned, grace window elapsed")
-            except discord.HTTPException:
+            except discord.HTTPException as exc:
                 logger.exception("cleanup_sweep: failed to delete channel_id=%s for match_id=%s", channel_id, match["id"])
+                await incident_log.post(
+                    self.bot,
+                    category="QUEUE_DISCORD_API_FAIL",
+                    summary=f"cleanup_sweep: failed to delete channel_id={channel_id} for match_id={match['id']} — will retry next sweep",
+                    exc=exc,
+                    match=match,
+                )
                 # Don't clear cleanup_at on failure — leave it due so the next sweep retries.
                 continue
             await adb.clear_cleanup(match["id"])

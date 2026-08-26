@@ -41,6 +41,28 @@ candidate splits (never a de-facto single option), median 8 candidates
 per pop, and the randomly-sampled diff stayed at a 7-14 point median/
 mean — negligible against this project's MMR scale (players observed
 ranging roughly 0-990 composite).
+
+Uncertainty discount (2026-08): a player who just crossed
+BOOTSTRAP_MATCH_THRESHOLD has far less real signal behind their stats
+than a 90+ match veteran, but _composite_score() alone can't tell the
+difference — it takes every player's numbers at face value regardless
+of sample size. Same problem every competitive matchmaker has to
+solve (Rainbow Six Siege, OpenSkill, TrueSkill all track a skill
+estimate AND a separate confidence/uncertainty value). Solved here via
+_uncertainty_discount(): a per-player deduction from their composite
+score, based purely on total_matches, that shrinks as they play more
+— never based on whether their individual stats "look consistent",
+since an earlier version of this (flagging players whose MMR and KD
+disagreed with each other) ended up penalizing the server's most
+active veteran hardest, precisely because a large sample size makes a
+real skill gap between two metrics look bigger than a small sample's
+noise does. That's backwards — more data should mean more trust.
+Match-count-only avoids that trap by construction. Calibrated against
+197 real historical match pops (base=50, half_life=20): smallest
+average-balance cost of every combination tested (+0.53 pts over the
+no-discount baseline of 6.87), while still giving a 10-match player a
+~40 point discount and a 97-match veteran only ~21 — proportionate at
+both ends, not a cliff and not a token gesture.
 """
 
 from __future__ import annotations
@@ -93,6 +115,31 @@ def _composite_score(player: dict) -> float:
     return mmr + (win_rate * 100) + (kd_ratio * 40) + (avg_hill_time * 1.5) + (mvp_rate * 60)
 
 
+def _uncertainty_discount(player: dict) -> float:
+    """How much to discount a player's composite score before
+    balancing, based purely on how many matches they've played — not
+    on whether their stats "look right." A newer graduated player's
+    numbers are less proven than a veteran's, so they get a bigger
+    discount; this shrinks toward zero as match count grows, never
+    fully reaching it.
+
+    Deliberately does NOT look at whether a player's individual stats
+    agree with each other (an earlier version of this tried exactly
+    that — flagging players whose MMR and KD disagreed — but it ended
+    up penalizing high-performing veterans the hardest, since a large
+    sample size makes a real skill gap between two metrics look like
+    a bigger "disagreement" than a small sample's noise does. That's
+    backwards: more data should mean MORE trust, not less. Match-count
+    alone avoids that trap entirely — a 97-match player gets one of
+    the smallest discounts in the whole pool, by construction, no
+    matter how unusual their stats look.)
+
+    Calibration: see config.TEAM_SIGMA_BASE / TEAM_SIGMA_HALF_LIFE.
+    """
+    total = player.get("total_matches", 0)
+    return config.TEAM_SIGMA_BASE / ((total / config.TEAM_SIGMA_HALF_LIFE) + 1) ** 0.5
+
+
 def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]:
     """
     queued_players: list of player dicts (must include id, mmr, wins,
@@ -102,12 +149,13 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
     Bootstrap: random shuffle — noisy/insufficient data shouldn't be
     trusted for balancing (see module docstring + DECISIONS.md).
 
-    Analysis mode: exhaustive C(10,5)=252-split search on composite
-    score, epsilon-bounded randomization among near-optimal splits
-    (see module docstring for the epsilon=10 calibration). Which of
-    the two resulting groups becomes Defender (team_a) vs Attacker
-    (team_b) is a coin flip — nothing about the split computation
-    itself should create a systematic side bias.
+    Analysis mode: exhaustive C(10,5)=252-split search on
+    (composite score - uncertainty discount), epsilon-bounded
+    randomization among near-optimal splits (see module docstring for
+    the epsilon=10 and sigma calibration). Which of the two resulting
+    groups becomes Defender (team_a) vs Attacker (team_b) is a coin
+    flip — nothing about the split computation itself should create a
+    systematic side bias.
     """
     assert len(queued_players) == config.QUEUE_SIZE, "matchmaking requires exactly 10 players"
 
@@ -118,7 +166,7 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
         team_a = players[:config.TEAM_SIZE]
         team_b = players[config.TEAM_SIZE:]
     else:
-        scores = [_composite_score(p) for p in players]
+        scores = [_composite_score(p) - _uncertainty_discount(p) for p in players]
         best_diff = float("inf")
         all_splits: list[tuple[float, tuple[int, ...], tuple[int, ...]]] = []
         for combo in itertools.combinations(range(10), 5):

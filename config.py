@@ -57,15 +57,6 @@ ADMIN_ROLE_IDS = {int(x.strip()) for x in _require("ADMIN_ROLE_IDS").split(",") 
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
-# --- Incident logging (2026-08-24) ---
-# #botlog channel — created manually in Discord same as AFK/MATCH_LOG above.
-# Same fail-open pattern: unset means utils/incident_log.py falls back to
-# console-only logging instead of crashing the bot on boot. This channel
-# only ever receives messages from inside existing except blocks (see
-# utils/incident_log.py) — it has no other code path and no background
-# task, so it costs nothing when nothing is failing.
-BOTLOG_CHANNEL_ID = int(os.getenv("BOTLOG_CHANNEL_ID")) if os.getenv("BOTLOG_CHANNEL_ID") else None
-
 # --- Unified global region + 4-queue matchmaking (2026-07-29) ---
 # Server moved to one unified show with four ticket-counter queues, kept
 # separate for matchmaking throughput / ping reasons only. Everything
@@ -181,6 +172,23 @@ BOOTSTRAP_MIN_ELIGIBLE_POOL = 20     # need at least this many "graduated" playe
 # pop at this value, median ~8 candidates, sampled diff stayed at a
 # 7-14 point median/mean — negligible against this project's MMR scale.
 TEAM_SPLIT_EPSILON = 10
+
+# Uncertainty discount (2026-08, analysis mode only — see
+# services/matchmaking.py's _uncertainty_discount docstring for the
+# full design). A newer graduated player's composite score is
+# discounted more than a veteran's before the balancer runs, since a
+# player at exactly BOOTSTRAP_MATCH_THRESHOLD matches has far less
+# data behind their stats than one with 90+. Same design used by
+# competitive matchmakers like Rainbow Six Siege / OpenSkill — track a
+# skill estimate AND a separate confidence in that estimate.
+# sigma = TEAM_SIGMA_BASE / sqrt(total_matches / TEAM_SIGMA_HALF_LIFE + 1)
+# Calibrated against 197 real historical match pops: this pair had the
+# smallest average-balance cost (+0.53 pts vs the no-sigma baseline of
+# 6.87) of every combination tested, while still discounting a
+# 10-match player by ~40 points and a 97-match veteran by only ~21 —
+# proportionate, not punishing either end.
+TEAM_SIGMA_BASE = 50
+TEAM_SIGMA_HALF_LIFE = 20
 
 # --- MMR weights (tunable; win/loss dominates by design) ---
 MMR_WIN_BASE = 25

@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from database.db import db, adb
+from database.db import db, adb, with_retry
 from services import matchmaking, mmr_engine, reputation
 from utils.permissions import admin_only
 from utils import incident_log
@@ -259,6 +259,43 @@ class RegionQueueView(discord.ui.View):
         await self.cog.handle_start_match(interaction, self.queue_key, self)
 
 
+class QueueActionRetryView(discord.ui.View):
+    """Shown when a Join/Leave/Start-Match click dies mid-flight because a DB
+    call failed even after with_retry's built-in retries (e.g. a Supabase
+    HTTP/2 connection drop — the RemoteProtocolError class confirmed live
+    2026-08-26, hitting Join Queue and an unrelated admin command at the
+    same instant). Without this, the player was just left on a dead
+    "Interaction Failed" with no way to recover except guessing whether
+    their click landed and re-clicking the original panel button blind.
+
+    Deliberately NOT persistent (no custom_id, real timeout, no
+    bot.add_view() registration) — same reasoning as RankProgressView in
+    stats.py. This is a short-lived recovery affordance tied to one failed
+    interaction, not a permanent panel control. panel_message is captured
+    from the ORIGINAL failed interaction (interaction.message, which for a
+    component interaction is the actual queue panel message) so the retry
+    can refresh the real panel directly — this retry button lives on a
+    separate ephemeral message, so interaction.edit_original_response()
+    inside the retry click would hit the wrong message."""
+
+    def __init__(self, cog: "Queue", action: str, queue_key: str,
+                 panel_message: discord.Message, timeout: float = 60):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.action = action
+        self.queue_key = queue_key
+        self.panel_message = panel_message
+
+    @discord.ui.button(label="Retry", style=discord.ButtonStyle.primary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # This click is its OWN interaction, separate from the one that
+        # originally failed — do NOT pre-ack it here. handle_join/handle_leave
+        # do their own interaction.response.defer(ephemeral=True) as the
+        # first thing on the panel_message-path (see there for why).
+        handlers = {"join": self.cog.handle_join, "leave": self.cog.handle_leave}
+        await handlers[self.action](interaction, self.queue_key, panel_message=self.panel_message)
+
+
 class Queue(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -310,7 +347,57 @@ class Queue(commands.Cog):
         names = ", ".join(p["players"]["ign"] for p in current) or "empty"
         await interaction.response.send_message(f"**{queue.name} Queue ({len(current)}/10):** {names}")
 
-    async def handle_join(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
+    async def _report_queue_action_failure(
+        self, interaction: discord.Interaction, exc: Exception, *,
+        action: str, queue_key: str, panel_message: discord.Message,
+        player: dict | None = None,
+    ) -> None:
+        """Called when a DB call inside handle_join/handle_leave fails even
+        after with_retry's built-in retries (or raises something
+        non-retryable). Two things this fixes vs. before 2026-08-27:
+        1. This used to vanish with no trace beyond the raw discord.py
+           console/file log — now it also lands in #botlog via
+           incident_log.post(), same as every other failure category.
+        2. The player used to be left on a dead "Interaction Failed" with
+           no way to tell if their click landed. Now they get an ephemeral
+           Retry button instead."""
+        logger.exception("handle_%s: DB call failed for queue_key=%s", action, queue_key)
+        await incident_log.post(
+            self.bot,
+            category=f"QUEUE_{action.upper()}_DB_FAIL",
+            summary=f"handle_{action}: DB call failed for queue_key={queue_key} after retries exhausted — {exc!r}",
+            exc=exc,
+            players=[(player["ign"], player["discord_id"])] if player else None,
+        )
+        retry_view = QueueActionRetryView(self, action, queue_key, panel_message)
+        message = (
+            "Something went wrong talking to the database — your click may not have gone through. "
+            "Tap **Retry** to try again."
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, view=retry_view, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, view=retry_view, ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            logger.warning("handle_%s: failed to send retry-button followup (interaction token likely stale)", action)
+
+    async def handle_join(
+        self, interaction: discord.Interaction, queue_key: str,
+        view: RegionQueueView | None = None, *, panel_message: discord.Message | None = None,
+    ):
+        # Two entry paths share this function:
+        #  - Normal panel click: `view` is the live persistent RegionQueueView,
+        #    and interaction.edit_original_response() below correctly targets
+        #    the panel message itself (component-interaction default).
+        #  - Retry-button click (QueueActionRetryView): that's a DIFFERENT
+        #    interaction living on its own ephemeral message, so editing the
+        #    real panel has to go through the captured `panel_message`
+        #    directly instead of interaction.edit_original_response().
+        is_retry = panel_message is not None
+        if is_retry:
+            view = RegionQueueView(queue_key, self)
+
         # Defer FIRST, before any DB round trip — same fix as SkillVoteView
         # above. Under concurrent clicks (queue filling up), the sequential
         # get_player_by_discord_id + queue_current + queue_join round trips
@@ -318,9 +405,16 @@ class Queue(commands.Cog):
         # nothing is actually broken; deferring first wins that race every
         # time instead of leaving the first response call to gamble on it
         # (see the 10062 "Unknown interaction" write-up in DECISIONS.md).
-        await interaction.response.defer()
+        # ephemeral=True on the retry path — this defer's "original response"
+        # is the ephemeral retry message, not the panel.
+        await interaction.response.defer(ephemeral=is_retry)
 
-        player = await adb.get_player_by_discord_id(interaction.user.id)
+        try:
+            player = await with_retry(adb.get_player_by_discord_id, interaction.user.id)
+        except Exception as exc:
+            await self._report_queue_action_failure(interaction, exc, action="join", queue_key=queue_key, panel_message=panel_message or interaction.message)
+            return
+
         if not player:
             await interaction.followup.send("You need to `/register` and be approved first.", ephemeral=True)
             return
@@ -344,22 +438,36 @@ class Queue(commands.Cog):
             return
 
         async with self._locks[queue_key]:
-            current_queue = await adb.queue_current(queue_key=queue_key)
-            if len(current_queue) >= 10:
-                await interaction.followup.send(
-                    "Queue is full (10/10) — a match is about to start. Try again in a moment.",
-                    ephemeral=True,
-                )
+            try:
+                current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+                if len(current_queue) >= 10:
+                    await interaction.followup.send(
+                        "Queue is full (10/10) — a match is about to start. Try again in a moment.",
+                        ephemeral=True,
+                    )
+                    return
+
+                entry = await with_retry(adb.queue_join, player["id"], queue_key)
+                if entry is None:
+                    await interaction.followup.send("You're already in the queue.", ephemeral=True)
+                    return
+
+                current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+            except Exception as exc:
+                await self._report_queue_action_failure(interaction, exc, action="join", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
                 return
 
-            entry = await adb.queue_join(player["id"], queue_key)
-            if entry is None:
-                await interaction.followup.send("You're already in the queue.", ephemeral=True)
-                return
-
-            current_queue = await adb.queue_current(queue_key=queue_key)
             await view.update_view_state(current_queue)
             embed = make_queue_embed(queue_key, current_queue)
+
+            if is_retry:
+                try:
+                    await panel_message.edit(embed=embed, view=view)
+                except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+                    logger.warning("handle_join(retry): panel_message.edit failed for player_id=%s (join already saved): %s", player["id"], e)
+                await interaction.edit_original_response(content="✅ You're in the queue.", view=None)
+                return
+
             # DB write above already succeeded — that's the source of
             # truth. This is just the visual ack; fall back to a log entry
             # instead of an unhandled exception if the interaction token
@@ -370,26 +478,52 @@ class Queue(commands.Cog):
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:
                 logger.warning("handle_join: edit_original_response failed for player_id=%s (join already saved): %s", player["id"], e)
 
-    async def handle_leave(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
-        # Defer first — see handle_join above for why.
-        await interaction.response.defer()
+    async def handle_leave(
+        self, interaction: discord.Interaction, queue_key: str,
+        view: RegionQueueView | None = None, *, panel_message: discord.Message | None = None,
+    ):
+        # See handle_join above for the two-entry-path explanation.
+        is_retry = panel_message is not None
+        if is_retry:
+            view = RegionQueueView(queue_key, self)
 
-        player = await adb.get_player_by_discord_id(interaction.user.id)
+        await interaction.response.defer(ephemeral=is_retry)
+
+        try:
+            player = await with_retry(adb.get_player_by_discord_id, interaction.user.id)
+        except Exception as exc:
+            await self._report_queue_action_failure(interaction, exc, action="leave", queue_key=queue_key, panel_message=panel_message or interaction.message)
+            return
+
         if not player:
             await interaction.followup.send("You're not registered.", ephemeral=True)
             return
 
         async with self._locks[queue_key]:
-            current_queue = await adb.queue_current(queue_key=queue_key)
-            in_queue = any(p["player_id"] == player["id"] for p in current_queue)
-            if not in_queue:
-                await interaction.followup.send("You're not in the queue.", ephemeral=True)
+            try:
+                current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+                in_queue = any(p["player_id"] == player["id"] for p in current_queue)
+                if not in_queue:
+                    await interaction.followup.send("You're not in the queue.", ephemeral=True)
+                    return
+
+                await with_retry(adb.queue_leave, player["id"])
+                current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+            except Exception as exc:
+                await self._report_queue_action_failure(interaction, exc, action="leave", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
                 return
 
-            await adb.queue_leave(player["id"])
-            current_queue = await adb.queue_current(queue_key=queue_key)
             await view.update_view_state(current_queue)
             embed = make_queue_embed(queue_key, current_queue)
+
+            if is_retry:
+                try:
+                    await panel_message.edit(embed=embed, view=view)
+                except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+                    logger.warning("handle_leave(retry): panel_message.edit failed for player_id=%s (leave already saved): %s", player["id"], e)
+                await interaction.edit_original_response(content="✅ You've left the queue.", view=None)
+                return
+
             try:
                 await interaction.edit_original_response(embed=embed, view=view)
             except (discord.errors.NotFound, discord.errors.HTTPException) as e:

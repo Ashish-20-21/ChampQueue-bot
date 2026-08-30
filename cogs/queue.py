@@ -440,18 +440,50 @@ class Queue(commands.Cog):
         async with self._locks[queue_key]:
             try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
-                if len(current_queue) >= 10:
+            except Exception as exc:
+                await self._report_queue_action_failure(interaction, exc, action="join", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
+                return
+
+            # Queue-full / already-in-queue are normal control flow, NOT DB
+            # failures — moved outside the try above deliberately. Bug
+            # 2026-08-30 (live, ~50 msg spam): these followup.send() calls
+            # used to be INSIDE the try/except Exception block. Under a
+            # genuine high-traffic burst (10 players clicking within
+            # seconds), Discord's own webhook rate limit (429 "Rate limit
+            # reached for webhook") on THIS send() — not on any DB call —
+            # was being caught by the broad except and misreported as a
+            # DB failure. That triggered _report_queue_action_failure,
+            # which fired MORE Discord API calls (an incident_log.post()
+            # + a retry-button followup) into the same already-rate-limited
+            # window, compounding the 429s into every other player's
+            # normal response failing too — a self-inflicted spam cascade,
+            # not 50 independent bugs. Fix: only the actual with_retry(adb.*)
+            # calls are try/excepted now; a 429 on our own message-send is
+            # just logged and returned, never escalated into more sends.
+            if len(current_queue) >= 10:
+                try:
                     await interaction.followup.send(
                         "Queue is full (10/10) — a match is about to start. Try again in a moment.",
                         ephemeral=True,
                     )
-                    return
+                except discord.errors.HTTPException as e:
+                    logger.warning("handle_join: 'queue full' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                return
 
+            try:
                 entry = await with_retry(adb.queue_join, player["id"], queue_key)
-                if entry is None:
-                    await interaction.followup.send("You're already in the queue.", ephemeral=True)
-                    return
+            except Exception as exc:
+                await self._report_queue_action_failure(interaction, exc, action="join", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
+                return
 
+            if entry is None:
+                try:
+                    await interaction.followup.send("You're already in the queue.", ephemeral=True)
+                except discord.errors.HTTPException as e:
+                    logger.warning("handle_join: 'already in queue' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                return
+
+            try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
             except Exception as exc:
                 await self._report_queue_action_failure(interaction, exc, action="join", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
@@ -502,11 +534,22 @@ class Queue(commands.Cog):
         async with self._locks[queue_key]:
             try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
-                in_queue = any(p["player_id"] == player["id"] for p in current_queue)
-                if not in_queue:
-                    await interaction.followup.send("You're not in the queue.", ephemeral=True)
-                    return
+            except Exception as exc:
+                await self._report_queue_action_failure(interaction, exc, action="leave", queue_key=queue_key, panel_message=panel_message or interaction.message, player=player)
+                return
 
+            # "Not in queue" is normal control flow, not a DB failure — see
+            # the 2026-08-30 spam-cascade writeup in handle_join above for
+            # why this is deliberately outside the try/except.
+            in_queue = any(p["player_id"] == player["id"] for p in current_queue)
+            if not in_queue:
+                try:
+                    await interaction.followup.send("You're not in the queue.", ephemeral=True)
+                except discord.errors.HTTPException as e:
+                    logger.warning("handle_leave: 'not in queue' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                return
+
+            try:
                 await with_retry(adb.queue_leave, player["id"])
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
             except Exception as exc:

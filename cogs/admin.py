@@ -250,8 +250,17 @@ class Admin(commands.Cog):
             result_message = await handler(self, interaction, season_id=season_id)
         except Exception as exc:
             logger.exception("admin-dispatch handler failed for category=%s", category.value)
+            # FIX: incident_log.post() takes category= and summary= as
+            # required keyword-only args, no positional message, no
+            # level= param — confirmed against utils/incident_log.py's
+            # real signature after this call crashed live with
+            # "post() got an unexpected keyword argument 'level'" the
+            # first time /admin-dispatch actually hit an error path.
             await incident_log.post(
-                self.bot, f"admin-dispatch `{category.value}` failed: {exc!r}", level="error",
+                self.bot,
+                category="ADMIN_DISPATCH_FAIL",
+                summary=f"admin-dispatch `{category.value}` failed: {exc!r}",
+                exc=exc,
             )
             await interaction.followup.send(f"❌ `{category.value}` failed — see #botlog for details.", ephemeral=True)
             return

@@ -17,6 +17,52 @@ _PAGE_SIZE = 50  # players per leaderboard page — Discord embed description
                  # ~40-50 chars, so 50/page × ~50 chars (long-name worst
                  # case) ≈ 2500 chars, still comfortably under that.
 
+# Fixed-width columns for the code-block leaderboard layout (2026-09).
+# Plain (non-code-block) embed text has no monospace guarantee on
+# Discord's mobile client, so lines of wildly different IGN length
+# (e.g. "SumitCantSnipe" vs "-EaSy-") render with a visibly zigzagging
+# "—" separator — cosmetic, but reported as looking rough on mobile.
+# A ```code block``` is the only Discord-side way to force real column
+# alignment; the cost is losing **bold**/color styling, which only
+# applies inside code blocks as literal characters, not formatting.
+# _IGN_COL_WIDTH chosen from real leaderboard data: "SumitCantSnipe" is
+# 14 chars, the longest IGN seen so far; 16 gives a little headroom
+# without ballooning line width on mobile. Longer real names get
+# truncated with a trailing "…" rather than wrapping (wrapping inside a
+# code block breaks alignment on the wrapped continuation line, which
+# would be worse than the truncation it's meant to avoid).
+_IGN_COL_WIDTH = 16
+
+
+def _leaderboard_page_text_aligned(players: list[dict], page: int) -> tuple[str, int]:
+    """Code-block-aligned alternative to _leaderboard_page_text — fixed-
+    width IGN column so the MMR/rank portion lines up vertically on every
+    row, including on mobile. Trade-off: no bold rank numbers, no color;
+    the whole block renders in Discord's default monospace embed font.
+    Not wired into _leaderboard_embed by default — swap the call site in
+    _leaderboard_embed to use this instead of _leaderboard_page_text once
+    it's confirmed to look right on an actual phone, not just in theory."""
+    total_pages = max(1, -(-len(players) // _PAGE_SIZE))  # ceil div
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PAGE_SIZE
+    chunk = players[start:start + _PAGE_SIZE]
+    if not chunk:
+        return "```\nNo approved players yet.\n```", total_pages
+
+    lines = []
+    for i, p in enumerate(chunk, start=1):
+        rank_num = f"{start + i}."
+        ign = p["ign"]
+        if len(ign) > _IGN_COL_WIDTH:
+            ign_display = ign[: _IGN_COL_WIDTH - 1] + "…"
+        else:
+            ign_display = ign
+        # ljust the IGN column so everything after it — the MMR/rank
+        # portion — starts at the same character position on every line,
+        # regardless of how short or long this row's IGN is.
+        lines.append(f"{rank_num:>3} {ign_display.ljust(_IGN_COL_WIDTH)} {p['mmr']:>4} MMR ({p['current_rank']})")
+    return "```\n" + "\n".join(lines) + "\n```", total_pages
+
 
 def _leaderboard_page_text(players: list[dict], page: int) -> tuple[str, int]:
     """Returns (rendered page text, total page count). Rank numbers are
@@ -33,8 +79,20 @@ def _leaderboard_page_text(players: list[dict], page: int) -> tuple[str, int]:
     return "\n".join(lines), total_pages
 
 
+# Toggle for testing the aligned code-block layout against the current
+# one — flip this to True to render leaderboards with
+# _leaderboard_page_text_aligned instead. Left as an explicit constant
+# rather than an env var since this is a short-lived visual A/B check,
+# not a permanent runtime setting; delete this flag (and whichever
+# _leaderboard_page_text_* function loses) once a call is made.
+_USE_ALIGNED_LEADERBOARD = False
+
+
 def _leaderboard_embed(players: list[dict], page: int) -> discord.Embed:
-    text, total_pages = _leaderboard_page_text(players, page)
+    if _USE_ALIGNED_LEADERBOARD:
+        text, total_pages = _leaderboard_page_text_aligned(players, page)
+    else:
+        text, total_pages = _leaderboard_page_text(players, page)
     embed = discord.Embed(
         title="🏆 Champion's Queue Leaderboard",
         description=text,

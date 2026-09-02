@@ -65,6 +65,7 @@ MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATC
 # utils/incident_log.py) — it has no other code path and no background
 # task, so it costs nothing when nothing is failing.
 BOTLOG_CHANNEL_ID = int(os.getenv("BOTLOG_CHANNEL_ID")) if os.getenv("BOTLOG_CHANNEL_ID") else None
+HALL_OF_FAME_CHANNEL_ID = int(os.getenv("HALL_OF_FAME_CHANNEL_ID")) if os.getenv("HALL_OF_FAME_CHANNEL_ID") else None
 
 # --- Unified global region + 4-queue matchmaking (2026-07-29) ---
 # Server moved to one unified show with four ticket-counter queues, kept

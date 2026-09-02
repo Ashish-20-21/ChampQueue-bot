@@ -522,12 +522,59 @@ class Database:
         res = self.client.table("seasons").select("*").eq("is_active", True).execute()
         return res.data[0] if res.data else None
 
+    def get_season_by_id(self, season_id: int) -> Optional[dict]:
+        """Look up any season by id, active or not — needed for /admin-dispatch's
+        season_id override (e.g. re-running Season 1's Hall of Fame after
+        Season 2 is already active)."""
+        res = self.client.table("seasons").select("*").eq("id", season_id).execute()
+        return res.data[0] if res.data else None
+
     def record_hall_of_fame(self, season_id: int, category: str, player_id: int, value: str) -> dict:
         res = self.client.table("hall_of_fame").upsert(
             {"season_id": season_id, "category": category, "player_id": player_id, "value": value},
             on_conflict="season_id,category",
         ).execute()
         return res.data[0]
+
+    # Hall of Fame category winners (migration_024). Each returns a single
+    # row dict or None if the >=8-match floor excludes everyone (e.g. a
+    # brand-new season with too little data yet), never an empty list
+    # crash — callers must handle None per category.
+    def hof_most_consistent(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_most_consistent", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_fastest_climber(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_fastest_climber", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_highest_total_kills(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_highest_total_kills", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_best_avg_kills(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_best_avg_kills", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_best_avg_deaths(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_best_avg_deaths", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_most_mvps(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_most_mvps", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_most_matches_played(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_most_matches_played", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_best_kd(self, season_id: int) -> Optional[dict]:
+        res = self.client.rpc("hof_best_kd", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
+    def hof_highest_mmr(self) -> Optional[dict]:
+        res = self.client.rpc("hof_highest_mmr", {}).execute()
+        return res.data[0] if res.data else None
 
 
 db = Database()

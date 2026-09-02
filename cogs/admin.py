@@ -8,10 +8,11 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from database.db import db, adb
+from database.db import db, adb, with_retry
 from services import reputation, mmr_engine
-from utils.embeds import verification_card
+from utils.embeds import verification_card, hall_of_fame_embed
 from utils.permissions import admin_only, is_admin
+from utils import incident_log
 from cogs.queue import RegionQueueView, make_queue_embed
 
 logger = logging.getLogger("champions_queue")
@@ -219,6 +220,117 @@ class Admin(commands.Cog):
     # @admin_only()
     # async def admin_ign_change(self, interaction: discord.Interaction, user: discord.Member, new_ign: str):
     #     ...  (see git history for full body)
+
+    @app_commands.command(name="admin-dispatch", description="[Admin] Trigger a season-related broadcast (Hall of Fame, weekly digest, etc.)")
+    @app_commands.describe(
+        category="Which broadcast to run",
+        season_id="Optional — run for a specific season instead of whichever is currently active (e.g. re-running Season 1's Hall of Fame after Season 2 started)",
+    )
+    @app_commands.choices(category=[
+        app_commands.Choice(name="Hall of Fame", value="hall_of_fame"),
+        # Add future categories here (weekly digest, etc.) as new Choice
+        # entries + a new _CATEGORY_HANDLERS entry below. This is a single
+        # Discord choice parameter, not shared-message buttons — deliberate,
+        # see the 2026-08 skill-vote 5th-voter race condition writeup in
+        # DEV_NOTES for why multi-handler commands here never use buttons.
+        # Discord's own picker means exactly one branch runs per invocation,
+        # no shared message state to race on.
+    ])
+    @admin_only()
+    async def dispatch(self, interaction: discord.Interaction, category: app_commands.Choice[str], season_id: int | None = None):
+        await interaction.response.defer(ephemeral=True)
+        handler = _CATEGORY_HANDLERS.get(category.value)
+        if handler is None:
+            await interaction.followup.send(f"No handler wired for `{category.value}` yet.", ephemeral=True)
+            return
+        try:
+            # season_id is passed positionally as an override; handlers
+            # that aren't season-scoped (a future weekly-digest, etc.)
+            # simply don't declare the param and this is a no-op for them.
+            result_message = await handler(self, interaction, season_id=season_id)
+        except Exception as exc:
+            logger.exception("admin-dispatch handler failed for category=%s", category.value)
+            await incident_log.post(
+                self.bot, f"admin-dispatch `{category.value}` failed: {exc!r}", level="error",
+            )
+            await interaction.followup.send(f"❌ `{category.value}` failed — see #botlog for details.", ephemeral=True)
+            return
+        await interaction.followup.send(result_message, ephemeral=True)
+
+    async def _dispatch_hall_of_fame(self, interaction: discord.Interaction, season_id: int | None = None) -> str:
+        """Fetches the target season, pulls the winner for all 9 HOF
+        categories (each query already has its own >=8-match floor or
+        explicit no-floor decision — see migration_024's header comment),
+        writes each winner to hall_of_fame (upsert on season_id+category,
+        safe to re-run if something needs correcting), then posts the
+        embed to HALL_OF_FAME_CHANNEL_ID. Missing channel config fails
+        loudly rather than silently no-op'ing, same lesson as the
+        BOTLOG_CHANNEL_ID gap.
+
+        season_id: optional override from /admin-dispatch's parameter.
+        Defaults to whatever's currently active — but Season 1 ending
+        without HOF ever being posted, followed by Season 2 activating,
+        is exactly why this exists: without an override, this would
+        silently compute Season 2's (empty) stats instead once Season 2
+        goes active. Passing season_id=1 explicitly re-targets Season 1
+        regardless of what's active right now."""
+        if season_id is not None:
+            season = await adb.get_season_by_id(season_id)
+            if not season:
+                return f"❌ No season found with id={season_id}."
+        else:
+            season = await adb.get_active_season()
+            if not season:
+                return "❌ No active season found — run migration_023_season_activation.sql first, or pass season_id explicitly."
+
+        season_id = season["id"]
+        categories = {
+            "most_consistent": adb.hof_most_consistent,
+            "fastest_climber": adb.hof_fastest_climber,
+            "highest_total_kills": adb.hof_highest_total_kills,
+            "best_avg_kills": adb.hof_best_avg_kills,
+            "best_avg_deaths": adb.hof_best_avg_deaths,
+            "most_mvps": adb.hof_most_mvps,
+            "most_matches_played": adb.hof_most_matches_played,
+            "best_kd": adb.hof_best_kd,
+        }
+
+        winners: dict[str, dict | None] = {}
+        for key, fn in categories.items():
+            winners[key] = await with_retry(fn, season_id)
+        # highest_mmr takes no season_id — current snapshot, not season-scoped,
+        # same regardless of which season is being posted for.
+        winners["highest_mmr"] = await with_retry(adb.hof_highest_mmr)
+
+
+        # Persist each winner. value column is text — stringify whatever
+        # this category's headline number is; skip categories nobody
+        # qualified for rather than writing a garbage row.
+        value_keys = {
+            "most_consistent": "win_rate_pct", "fastest_climber": "mmr_per_match",
+            "highest_total_kills": "total_kills", "best_avg_kills": "avg_kills",
+            "best_avg_deaths": "avg_deaths", "most_mvps": "mvp_count",
+            "most_matches_played": "matches_played", "best_kd": "kd_ratio",
+            "highest_mmr": "mmr",
+        }
+        for category, row in winners.items():
+            if row is None:
+                continue
+            await with_retry(
+                adb.record_hall_of_fame, season_id, category, row["player_id"], str(row[value_keys[category]]),
+            )
+
+        if not config.HALL_OF_FAME_CHANNEL_ID:
+            return "⚠️ Winners recorded to DB, but HALL_OF_FAME_CHANNEL_ID isn't set — nothing posted. Set it and re-run."
+
+        channel = interaction.guild.get_channel(config.HALL_OF_FAME_CHANNEL_ID) if interaction.guild else None
+        if channel is None:
+            return f"⚠️ Winners recorded to DB, but channel {config.HALL_OF_FAME_CHANNEL_ID} wasn't found — check HALL_OF_FAME_CHANNEL_ID."
+
+        embed = hall_of_fame_embed(season, winners)
+        await channel.send(embed=embed)
+        return f"✅ Hall of Fame posted to {channel.mention} and recorded for {season.get('code') or season.get('name')}."
+
 
     @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after 1hr")
     @admin_only()
@@ -844,6 +956,7 @@ class Admin(commands.Cog):
     @queue_clean.error
     @queue_replace.error
     @map_change.error
+    @dispatch.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(str(error), ephemeral=True)
@@ -1299,6 +1412,16 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
             await adb.recompute_player_career_stats(rr["player_id"])
         except Exception:
             pass
+
+
+# Dispatch table for /admin-dispatch. Defined after the class so it can
+# reference the bound methods by name; each entry is one isolated handler
+# — adding a new category (weekly digest, etc.) means one new Choice in
+# the command decorator + one new entry here + one new _dispatch_* method,
+# nothing existing changes.
+_CATEGORY_HANDLERS = {
+    "hall_of_fame": Admin._dispatch_hall_of_fame,
+}
 
 
 async def setup(bot: commands.Bot):

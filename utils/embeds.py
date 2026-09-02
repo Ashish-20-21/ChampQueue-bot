@@ -4,6 +4,40 @@ from services import mmr_engine
 from typing import Optional
 
 
+def season_recap_embed(season: dict, stats: dict, ai_tokens_used: str | None = None) -> discord.Embed:
+    """Decorative season-wide stat showcase — fires before Hall of Fame,
+    "how big was this season" framing rather than per-player winners.
+    Numbers come straight from season_recap_stats() (migration_026);
+    this function only formats, never computes.
+
+    ai_tokens_used is the one exception — there's no token-usage
+    tracking anywhere in the schema or codebase (confirmed: nothing in
+    vision_extraction.py or elsewhere persists per-call token counts),
+    so this isn't derived from a DB query like every other field here.
+    It's an optional pre-formatted string supplied by whoever triggers
+    the recap, sourced from the OpenAI dashboard directly. Omit the
+    field entirely if not provided, rather than showing a fake/zero
+    value."""
+    season_label = season.get("code") or season.get("name") or "Season"
+    start = (season.get("start_date") or "")[:10]  # YYYY-MM-DD, no time
+    embed = discord.Embed(
+        title=f"📊 Season Recap — {season_label}",
+        description=f"From **{start}** to today — here's what the community built together. 🔥",
+        color=discord.Color.from_rgb(255, 140, 0),
+    )
+    embed.add_field(name="🎮 Matches Played", value=f"**{stats['matches_played']:,}**", inline=True)
+    embed.add_field(name="🔄 Rounds Played", value=f"**{stats['rounds_played']:,}**", inline=True)
+    embed.add_field(name="👥 Players", value=f"**{stats['unique_players']:,}**", inline=True)
+    embed.add_field(name="🔫 Total Kills", value=f"**{stats['total_kills']:,}**", inline=True)
+    embed.add_field(name="💀 Total Deaths", value=f"**{stats['total_deaths']:,}**", inline=True)
+    embed.add_field(name="⭐ MVPs Awarded", value=f"**{stats['total_mvps_awarded']:,}**", inline=True)
+    embed.add_field(name="⏱️ Hours of Hardpoint", value=f"**{stats['total_hardpoint_hours']:,}**", inline=True)
+    if ai_tokens_used:
+        embed.add_field(name="🤖 AI Tokens Processed", value=f"**{ai_tokens_used}**", inline=True)
+    embed.set_footer(text="Every kill, every clutch, every close call — this was Season 1. 🏆")
+    return embed
+
+
 def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> discord.Embed:
     """Season-end Hall of Fame card, one field per category. `winners` maps
     category key -> the row dict from the matching db.hof_* call (or None
@@ -183,6 +217,22 @@ _PERMANENT_BADGES = (
 )
 _PERMANENT_BADGE_LOOKUP = {code: (icon, name, desc) for code, icon, name, desc in _PERMANENT_BADGES}
 
+# Seasonal participation badges (2026-09) — distinct from _PERMANENT_BADGES
+# above on purpose: every permanent badge is a lifetime-career threshold
+# ("3000 career kills"), earned once and never tied to a specific season.
+# A "played in Season 1" badge is a different kind of thing — a
+# participation marker for one closed season — and mixing it into the
+# same "🏅 Earned" list would misleadingly present "played S1" next to
+# "3000 career kills" as if they were the same category of achievement.
+# Gets its own section below instead. New seasons add a new row here
+# (code convention: "played_s{N}") — nothing else about this code needs
+# to change per season.
+_SEASONAL_BADGES = (
+    ("played_s1", "🎮", "Urising Season 1", "Played in Season 1"),
+)
+_SEASONAL_BADGE_LOOKUP = {code: (icon, name, desc) for code, icon, name, desc in _SEASONAL_BADGES}
+
+
 # Live titles (2026-08-21) — NOT stored, computed fresh every call via
 # the live_player_titles() SQL function (migration_020). title_name
 # strings here must match the fixed literals that function returns
@@ -228,6 +278,18 @@ def achievements_card(player: dict, earned: list[dict], live_titles: list[dict])
         value="\n".join(permanent_lines) if permanent_lines else "*No badges earned yet — play a match to get started!*",
         inline=False,
     )
+
+    # Seasonal participation badges — separate field from career-threshold
+    # badges above (see _SEASONAL_BADGES' comment for why). Only shown at
+    # all if the player has at least one, so a brand-new player's card
+    # isn't padded with an empty section.
+    seasonal_lines = [
+        f"{icon} **{name}**"
+        for code, icon, name, _desc in _SEASONAL_BADGES
+        if code in earned_codes
+    ]
+    if seasonal_lines:
+        embed.add_field(name="🗓️ Seasons Played", value="\n".join(seasonal_lines), inline=False)
 
     live_lines = [
         f"{_LIVE_TITLE_LOOKUP[t['title_code']][0]} **{_LIVE_TITLE_LOOKUP[t['title_code']][1]}**"

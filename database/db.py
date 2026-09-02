@@ -529,6 +529,14 @@ class Database:
         res = self.client.table("seasons").select("*").eq("id", season_id).execute()
         return res.data[0] if res.data else None
 
+    def season_recap_stats(self, season_id: int) -> Optional[dict]:
+        """Season-wide totals for the recap embed (migration_026). Single
+        row, not a leaderboard — see that migration's header for why the
+        numbers are computed the way they are (real matches only, not
+        every status='completed' row; rounds are RO3/RO1-agnostic)."""
+        res = self.client.rpc("season_recap_stats", {"p_season_id": season_id}).execute()
+        return res.data[0] if res.data else None
+
     def record_hall_of_fame(self, season_id: int, category: str, player_id: int, value: str) -> dict:
         res = self.client.table("hall_of_fame").upsert(
             {"season_id": season_id, "category": category, "player_id": player_id, "value": value},

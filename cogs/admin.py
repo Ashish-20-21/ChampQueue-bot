@@ -10,7 +10,7 @@ from discord.ext import commands
 import config
 from database.db import db, adb, with_retry
 from services import reputation, mmr_engine
-from utils.embeds import verification_card, hall_of_fame_embed
+from utils.embeds import verification_card, hall_of_fame_embed, season_recap_embed
 from utils.permissions import admin_only, is_admin
 from utils import incident_log
 from cogs.queue import RegionQueueView, make_queue_embed
@@ -225,8 +225,10 @@ class Admin(commands.Cog):
     @app_commands.describe(
         category="Which broadcast to run",
         season_id="Optional — run for a specific season instead of whichever is currently active (e.g. re-running Season 1's Hall of Fame after Season 2 started)",
+        ai_tokens_used="Optional, Season Recap only — total AI tokens used this season, pulled from the OpenAI dashboard (not tracked anywhere in the DB, so this is manual input, e.g. '206,008')",
     )
     @app_commands.choices(category=[
+        app_commands.Choice(name="Season Recap", value="season_recap"),
         app_commands.Choice(name="Hall of Fame", value="hall_of_fame"),
         # Add future categories here (weekly digest, etc.) as new Choice
         # entries + a new _CATEGORY_HANDLERS entry below. This is a single
@@ -237,17 +239,18 @@ class Admin(commands.Cog):
         # no shared message state to race on.
     ])
     @admin_only()
-    async def dispatch(self, interaction: discord.Interaction, category: app_commands.Choice[str], season_id: int | None = None):
+    async def dispatch(self, interaction: discord.Interaction, category: app_commands.Choice[str],
+                        season_id: int | None = None, ai_tokens_used: str | None = None):
         await interaction.response.defer(ephemeral=True)
         handler = _CATEGORY_HANDLERS.get(category.value)
         if handler is None:
             await interaction.followup.send(f"No handler wired for `{category.value}` yet.", ephemeral=True)
             return
         try:
-            # season_id is passed positionally as an override; handlers
-            # that aren't season-scoped (a future weekly-digest, etc.)
-            # simply don't declare the param and this is a no-op for them.
-            result_message = await handler(self, interaction, season_id=season_id)
+            # season_id / ai_tokens_used passed as overrides; handlers
+            # that don't need them (a future weekly-digest, etc.) simply
+            # don't declare the param and this is a no-op for them.
+            result_message = await handler(self, interaction, season_id=season_id, ai_tokens_used=ai_tokens_used)
         except Exception as exc:
             logger.exception("admin-dispatch handler failed for category=%s", category.value)
             # FIX: incident_log.post() takes category= and summary= as
@@ -266,7 +269,43 @@ class Admin(commands.Cog):
             return
         await interaction.followup.send(result_message, ephemeral=True)
 
-    async def _dispatch_hall_of_fame(self, interaction: discord.Interaction, season_id: int | None = None) -> str:
+    async def _dispatch_season_recap(self, interaction: discord.Interaction, season_id: int | None = None,
+                                      ai_tokens_used: str | None = None) -> str:
+        """Posts the decorative season-wide stat showcase to
+        HALL_OF_FAME_CHANNEL_ID (same channel as Hall of Fame — this is
+        meant to run right before it, "how big was the season" framing
+        leading into "who stood out"). No DB writes of its own — purely
+        a read + post, unlike Hall of Fame which also records winners.
+
+        ai_tokens_used: optional manual figure from the OpenAI dashboard
+        — see season_recap_embed's docstring for why this can't be
+        derived from the DB. Passed straight through to the embed;
+        omitted entirely if not supplied, never faked."""
+        if season_id is not None:
+            season = await adb.get_season_by_id(season_id)
+            if not season:
+                return f"❌ No season found with id={season_id}."
+        else:
+            season = await adb.get_active_season()
+            if not season:
+                return "❌ No active season found — pass season_id explicitly to target a specific season."
+
+        stats = await with_retry(adb.season_recap_stats, season["id"])
+        if not stats:
+            return f"❌ No recap stats available for season_id={season['id']}."
+
+        if not config.HALL_OF_FAME_CHANNEL_ID:
+            return "⚠️ HALL_OF_FAME_CHANNEL_ID isn't set — nothing posted."
+        channel = interaction.guild.get_channel(config.HALL_OF_FAME_CHANNEL_ID) if interaction.guild else None
+        if channel is None:
+            return f"⚠️ Channel {config.HALL_OF_FAME_CHANNEL_ID} wasn't found — check HALL_OF_FAME_CHANNEL_ID."
+
+        embed = season_recap_embed(season, stats, ai_tokens_used=ai_tokens_used)
+        await channel.send(embed=embed)
+        return f"✅ Season Recap posted to {channel.mention} for {season.get('code') or season.get('name')}."
+
+    async def _dispatch_hall_of_fame(self, interaction: discord.Interaction, season_id: int | None = None,
+                                      ai_tokens_used: str | None = None) -> str:
         """Fetches the target season, pulls the winner for all 9 HOF
         categories (each query already has its own >=8-match floor or
         explicit no-floor decision — see migration_024's header comment),
@@ -1429,6 +1468,7 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
 # the command decorator + one new entry here + one new _dispatch_* method,
 # nothing existing changes.
 _CATEGORY_HANDLERS = {
+    "season_recap": Admin._dispatch_season_recap,
     "hall_of_fame": Admin._dispatch_hall_of_fame,
 }
 

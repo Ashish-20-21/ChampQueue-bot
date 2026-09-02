@@ -1,6 +1,60 @@
 import discord
 
 from services import mmr_engine
+from typing import Optional
+
+
+def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> discord.Embed:
+    """Season-end Hall of Fame card, one field per category. `winners` maps
+    category key -> the row dict from the matching db.hof_* call (or None
+    if the >=8-match floor excluded everyone for that category — shown as
+    'Not enough matches this season' rather than silently omitting the
+    field, so it's visibly a real season-data outcome, not a bug).
+
+    Category value/units differ per category (win %, mmr/match, raw kill
+    count, K/D ratio, etc.) — each branch below formats its own row rather
+    than trying to force one generic formatter across incompatible units."""
+    season_label = season.get("code") or season.get("name") or "Season"
+    embed = discord.Embed(
+        title=f"🏆 Hall of Fame — {season_label}",
+        description="Top performers from the season that was.",
+        color=discord.Color.gold(),
+    )
+
+    def _line(row: Optional[dict], stat: str) -> str:
+        if not row:
+            return "*Not enough matches this season*"
+        return f"**{row['ign']}** — {stat}"
+
+    mc = winners.get("most_consistent")
+    embed.add_field(name="🎯 Most Consistent", value=_line(mc, f"{mc['win_rate_pct']}% win rate ({mc['matches_played']} matches)" if mc else ""), inline=False)
+
+    fc = winners.get("fastest_climber")
+    embed.add_field(name="📈 Fastest Climber", value=_line(fc, f"+{fc['mmr_per_match']} MMR/match ({fc['mmr_gained']} total)" if fc else ""), inline=False)
+
+    hk = winners.get("highest_total_kills")
+    embed.add_field(name="🔫 Highest Kills", value=_line(hk, f"{hk['total_kills']} kills ({hk['matches_played']} matches)" if hk else ""), inline=False)
+
+    bak = winners.get("best_avg_kills")
+    embed.add_field(name="💥 Best Avg Kills", value=_line(bak, f"{bak['avg_kills']} kills/match" if bak else ""), inline=False)
+
+    bad = winners.get("best_avg_deaths")
+    embed.add_field(name="🛡️ Best Avg Deaths", value=_line(bad, f"{bad['avg_deaths']} deaths/match (fewest)" if bad else ""), inline=False)
+
+    mv = winners.get("most_mvps")
+    embed.add_field(name="⭐ Most MVPs", value=_line(mv, f"{mv['mvp_count']} MVPs ({mv['matches_played']} matches)" if mv else ""), inline=False)
+
+    mp = winners.get("most_matches_played")
+    embed.add_field(name="🎮 Most Matches Played", value=_line(mp, f"{mp['matches_played']} matches" if mp else ""), inline=False)
+
+    kd = winners.get("best_kd")
+    embed.add_field(name="⚔️ Best K/D", value=_line(kd, f"{kd['kd_ratio']} K/D ({kd['total_kills']}/{kd['total_deaths']})" if kd else ""), inline=False)
+
+    hm = winners.get("highest_mmr")
+    embed.add_field(name="👑 Highest Rank/MMR", value=_line(hm, f"{hm['mmr']} MMR ({hm['current_rank']})" if hm else ""), inline=False)
+
+    embed.set_footer(text="Congratulations to everyone who competed this season! 🎉")
+    return embed
 
 
 def result_card(match: dict, match_players: list[dict]) -> discord.Embed:

@@ -712,7 +712,24 @@ class Queue(commands.Cog):
         team_b = result["team_b"]  # Attacker
 
         # Create match (no captains assigned)
-        match = await adb.create_match(is_bootstrap=bootstrap, queue_key=queue_key)
+        # season_id (2026-08): matches.season_id existed in schema but was
+        # never populated — create_match() always defaulted it to None.
+        # Fetch the active season here (one extra read per match formation,
+        # not a hot path) rather than caching it in memory, so a season
+        # transition takes effect on the very next match with no stale
+        # in-memory state to worry about. See migration_023_season_activation.sql
+        # and migration_025_season_2_transition.sql (the latter also adds
+        # a DB-level unique-active-season index, so this read can never
+        # come back with more than one candidate row).
+        active_season = await adb.get_active_season()
+        season_id = active_season["id"] if active_season else None
+        if season_id is None:
+            logger.warning(
+                "No active season found in `seasons` table — match %s will be created with season_id=NULL. "
+                "Run migration_023_season_activation.sql / migration_025_season_2_transition.sql if this is unexpected.",
+                queue_key,
+            )
+        match = await adb.create_match(is_bootstrap=bootstrap, queue_key=queue_key, season_id=season_id)
         await adb.update_match(match["id"], {
             "room_code_shared_by": host_player_id
         })

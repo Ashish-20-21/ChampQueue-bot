@@ -37,6 +37,7 @@ COGS = [
     "cogs.match",
     "cogs.stats",
     "cogs.admin",
+    "cogs.points",
     "cogs.digest",
 ]
 

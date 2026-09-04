@@ -991,6 +991,149 @@ class Admin(commands.Cog):
 
     # @approve.error and @reject.error removed (2026-08-15).
     # @recompute_stats.error removed (2026-08-15) — command commented out above.
+    # ── /admin-grant-shield (cash path, two-approval) ──────────
+    @admin_only()
+    @app_commands.command(
+        name="admin-grant-shield",
+        description="Grant a point shield (cash path) — requires HOD confirmation",
+    )
+    @app_commands.describe(user="The player to grant the shield to")
+    async def admin_grant_shield(self, interaction: discord.Interaction,
+                                  user: discord.Member) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        player = await adb.get_player_by_discord_id(str(user.id))
+        if not player:
+            await interaction.followup.send(f"{user.mention} is not registered.", ephemeral=True)
+            return
+
+        season = await adb.get_active_season()
+        if not season:
+            await interaction.followup.send("No active season.", ephemeral=True)
+            return
+
+        existing = await adb.get_active_shield(player["id"], season["id"])
+        if existing:
+            await interaction.followup.send(
+                f"{user.mention} already has an active shield. One at a time.",
+                ephemeral=True,
+            )
+            return
+
+        locked = await adb.is_season_points_locked(season["id"])
+        if locked:
+            await interaction.followup.send("Season points are locked — no more shields.", ephemeral=True)
+            return
+
+        if not config.HOD_APPROVAL_CHANNEL_ID:
+            await interaction.followup.send(
+                "HOD_APPROVAL_CHANNEL_ID not configured — cannot create pending approval.",
+                ephemeral=True,
+            )
+            return
+
+        shield = await with_retry(
+            adb.create_shield_cash_pending,
+            player["id"], season["id"], str(interaction.user.id)
+        )
+
+        from cogs.points import post_hod_approval_card
+        posted = await post_hod_approval_card(
+            self.bot, shield, player, str(interaction.user.id)
+        )
+
+        if posted:
+            await interaction.followup.send(
+                f"Shield grant for {user.mention} is **pending HOD confirmation** "
+                f"(shield ID: `{shield['id']}`). "
+                f"Check <#{config.HOD_APPROVAL_CHANNEL_ID}> for the approval card.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"Shield created (ID: `{shield['id']}`) but failed to post the HOD card. "
+                "Check channel permissions.",
+                ephemeral=True,
+            )
+
+    # ── /admin-recompute-points ──────────────────────────────
+    @admin_only()
+    @app_commands.command(
+        name="admin-recompute-points",
+        description="Recompute season points (single match or full season)",
+    )
+    @app_commands.describe(
+        match_id="Recompute for one match only (omit for full-season recompute)",
+    )
+    async def admin_recompute_points(self, interaction: discord.Interaction,
+                                      match_id: int | None = None) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        season = await adb.get_active_season()
+        if not season:
+            await interaction.followup.send("No active season.", ephemeral=True)
+            return
+
+        if match_id is not None:
+            match = await adb.get_match(match_id)
+            if not match:
+                await interaction.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
+                return
+            if match.get("status") != "completed":
+                await interaction.followup.send(
+                    f"Match `{match_id}` is `{match.get('status')}`, not completed — nothing to recompute.",
+                    ephemeral=True,
+                )
+                return
+
+            was_locked_before = await adb.is_season_points_locked(season["id"])
+            await with_retry(adb.recompute_season_points_for_match, match_id)
+            is_locked_after = await adb.is_season_points_locked(season["id"])
+
+            msg = f"✅ Points recomputed for match `{match_id}`."
+            if was_locked_before and not is_locked_after:
+                msg += (
+                    "\n\n⚠️ **SEASON UNLOCK TRIGGERED** — the recompute changed the "
+                    "season-end outcome. The season is now unlocked. Review the points "
+                    "leaderboard and decide on payout changes manually."
+                )
+                await incident_log.post(
+                    self.bot,
+                    category="SEASON_POINTS_UNLOCK",
+                    summary=(
+                        f"admin-recompute-points for match_id={match_id} "
+                        f"caused season {season['id']} to unlock — "
+                        f"original #1 no longer qualifies at >=2500"
+                    ),
+                )
+
+            await interaction.followup.send(msg, ephemeral=True)
+
+        else:
+            await interaction.followup.send(
+                f"⏳ Full-season recompute started for season `{season['name']}` "
+                f"(ID: {season['id']}). This may take a moment...",
+                ephemeral=True,
+            )
+
+            was_locked_before = await adb.is_season_points_locked(season["id"])
+            await with_retry(adb.recompute_all_season_points, season["id"])
+            is_locked_after = await adb.is_season_points_locked(season["id"])
+
+            msg = f"✅ Full-season points recomputed for `{season['name']}`."
+            if was_locked_before and not is_locked_after:
+                msg += "\n\n⚠️ **SEASON UNLOCK TRIGGERED** — review required."
+                await incident_log.post(
+                    self.bot,
+                    category="SEASON_POINTS_UNLOCK",
+                    summary=(
+                        f"admin-recompute-points (full season) "
+                        f"caused season {season['id']} to unlock"
+                    ),
+                )
+
+            await interaction.followup.send(msg, ephemeral=True)
+
     @review_queue.error
     @correct_round.error
     @force_approve.error
@@ -1005,6 +1148,8 @@ class Admin(commands.Cog):
     @queue_replace.error
     @map_change.error
     @dispatch.error
+    @admin_grant_shield.error
+    @admin_recompute_points.error
     async def on_admin_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(str(error), ephemeral=True)

@@ -1699,6 +1699,26 @@ class Match(commands.Cog):
                 )
 
         match = await adb.get_match(match_id)
+
+        # ── Season Points (migration_029) ──
+        # Points are already committed inside approve_match's SQL
+        # transaction (same commit as MMR). This Python-side code
+        # only handles the Discord-visible side effects: posting the
+        # point change summary to the match channel, and checking if
+        # the season just ended. A failure here never rolls back the
+        # already-committed points — same resilience pattern as the
+        # career-stats recompute above.
+        try:
+            from cogs.points import post_points_update_to_match_channel, check_and_announce_season_end
+            await post_points_update_to_match_channel(self.bot, match, match_players)
+            if match.get("season_id"):
+                await check_and_announce_season_end(self.bot, match["season_id"])
+        except Exception as exc:
+            logger.exception(
+                "Season points post-approval notification failed for match_id=%s (points already committed, this is cosmetic only)",
+                match_id, exc_info=exc,
+            )
+
         await self._run_post_approval_cleanup(guild, match)
         return True, "approved"
 

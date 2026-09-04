@@ -863,7 +863,7 @@ class Queue(commands.Cog):
         # match now, not three. map_pool stays a 1-element array
         # (["Summit"]), not a string - indexed [0] below rather than
         # changing the column type, per the RO1 migration plan.
-        maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=1)
+        maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=1, queue_key=queue_key)
         await adb.update_match(match["id"], {
             "map_pool": maps,
             "status": "awaiting_room"

@@ -213,15 +213,41 @@ class Database:
         the WHOLE rollback fails — the exact players this function exists
         to protect end up stuck in 'matched' with no path back into the
         queue, worse than the original failure it was recovering from.
-        Since this is the safety net, it needs to be defensive: clear any
-        pre-existing waiting row for these specific players first, so the
-        update can never collide."""
-        self.client.table("queue_entries").delete().in_(
-            "player_id", player_ids
-        ).eq("status", "waiting").execute()
-        self.client.table("queue_entries").update({"status": "waiting"}).in_(
-            "player_id", player_ids
-        ).eq("status", "matched").execute()
+        That fix added a defensive DELETE-then-UPDATE two-step.
+
+        Found live 2026-09-03: the 2026-07-19 fix wasn't enough — it was
+        still one bulk UPDATE ... WHERE player_id IN (...) statement, and
+        that has its own race window. The lock protecting queue_entries
+        is released right after queue_mark_matched() succeeds, before
+        _start_match_flow even starts (deliberately — see DECISIONS.md,
+        the 10062 write-up), so a player can click Join again on any
+        queue while their match is still silently being built in the
+        background. If _start_match_flow then fails and this rollback
+        fires, that player already has a legitimate fresh 'waiting' row
+        — and one collision among 10 caused Postgres to reject the
+        entire bulk statement, leaving all 10 stuck as 'matched' with no
+        channel (confirmed: DELETE succeeded, PATCH failed 177ms later
+        with a 23505 on one player_id, all 10 unrestored).
+
+        Fix: per-player, independently caught. A collision now only ever
+        excludes the ONE player who already recovered on their own —
+        never the other 9. Slower (N round trips instead of 1) but this
+        only runs on the rollback/failure path, not the hot path."""
+        for player_id in player_ids:
+            try:
+                self.client.table("queue_entries").delete().eq(
+                    "player_id", player_id
+                ).eq("status", "waiting").execute()
+                self.client.table("queue_entries").update({"status": "waiting"}).eq(
+                    "player_id", player_id
+                ).eq("status", "matched").execute()
+            except Exception:
+                logger.warning(
+                    "queue_mark_waiting: could not restore player_id=%s to waiting "
+                    "(likely already re-joined a queue on their own in the meantime) "
+                    "— skipping this player only, other players in this rollback are unaffected",
+                    player_id,
+                )
 
     def queue_clean_all(self, queue_key: str) -> int:
         """Bulk-wipe every 'waiting' row for one queue_key, flipping
@@ -291,6 +317,31 @@ class Database:
     def get_match(self, match_id: int) -> Optional[dict]:
         res = self.client.table("matches").select("*").eq("id", match_id).execute()
         return res.data[0] if res.data else None
+
+    def get_last_played_map(self, queue_key: str) -> Optional[str]:
+        """Returns the map_pool[0] of the most recently CREATED match in
+        this queue_key (ordered by id desc, not by any status filter —
+        includes forming/cancelled matches too, since the point is just
+        "what map did this queue's Start Match button pick last", not
+        "what map was actually completed"). Used by
+        matchmaking.pick_map_candidates() for the no-immediate-repeat
+        fix (2026-09-xx) — players were seeing the same map (e.g.
+        Takeoff, Arsenal) 2-3 times in a row under pure random.sample()
+        with only 5 maps in the pool, which is expected behavior for
+        true randomness over a small pool but felt broken to players.
+        Returns None if this queue has no match history yet (safe —
+        pick_map_candidates treats None as "nothing to exclude")."""
+        res = (
+            self.client.table("matches")
+            .select("map_pool")
+            .eq("queue_key", queue_key)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not res.data or not res.data[0].get("map_pool"):
+            return None
+        return res.data[0]["map_pool"][0]
 
     def get_match_by_code(self, match_code: str) -> Optional[dict]:
         res = self.client.table("matches").select("*").eq("match_id", match_code).execute()
@@ -938,3 +989,182 @@ def _insert_match_player_stats_batch(self: Database, rows: list[dict]) -> list[d
 
 Database.insert_match_round_results_batch = _insert_match_round_results_batch
 Database.insert_match_player_stats_batch = _insert_match_player_stats_batch
+# ── Season Points & Shields (migration_029) ──────────────────
+
+def _get_season_points(self: Database, player_id: int, season_id: int) -> Optional[dict]:
+    res = (self.client.table("season_points")
+           .select("*").eq("player_id", player_id).eq("season_id", season_id).execute())
+    return res.data[0] if res.data else None
+
+
+def _season_points_leaderboard(self: Database, season_id: int) -> list[dict]:
+    return self.client.rpc("season_points_leaderboard", {"p_season_id": season_id}).execute().data
+
+
+def _is_season_points_locked(self: Database, season_id: int) -> bool:
+    return self.client.rpc("is_season_points_locked", {"p_season_id": season_id}).execute().data
+
+
+def _recompute_player_season_points(self: Database, player_id: int, season_id: int) -> None:
+    self.client.rpc("recompute_player_season_points", {
+        "p_player_id": player_id, "p_season_id": season_id
+    }).execute()
+
+
+def _recompute_all_season_points(self: Database, season_id: int) -> None:
+    self.client.rpc("recompute_all_season_points", {"p_season_id": season_id}).execute()
+
+
+def _recompute_season_points_for_match(self: Database, match_id: int) -> None:
+    self.client.rpc("recompute_season_points_for_match", {"p_match_id": match_id}).execute()
+
+
+def _get_active_shield(self: Database, player_id: int, season_id: int) -> Optional[dict]:
+    """Return the currently active (not expired, not pending) shield for
+    this player in this season, or None. Checks timestamps in Python
+    since Supabase filters don't support now() comparisons easily."""
+    res = (self.client.table("point_shields")
+           .select("*")
+           .eq("player_id", player_id)
+           .eq("season_id", season_id)
+           .eq("status", "active")
+           .execute())
+    if not res.data:
+        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    for row in res.data:
+        ends = row.get("shield_ends_at")
+        if ends:
+            # supabase returns ISO strings
+            if isinstance(ends, str):
+                from datetime import datetime as dt
+                ends_dt = dt.fromisoformat(ends.replace("Z", "+00:00"))
+            else:
+                ends_dt = ends
+            if ends_dt > now:
+                return row
+    return None
+
+
+def _get_pending_shields(self: Database, season_id: int) -> list[dict]:
+    """All shields waiting for HOD confirmation."""
+    return (self.client.table("point_shields")
+            .select("*, players(ign, discord_id)")
+            .eq("season_id", season_id)
+            .eq("status", "pending_hod_confirmation")
+            .order("created_at")
+            .execute().data)
+
+
+def _create_shield_points_path(self: Database, player_id: int, season_id: int,
+                                cost_points: int) -> dict:
+    """Self-serve shield purchase with points. Deducts points from
+    season_points and creates an immediately-active shield."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    ends = now + timedelta(hours=config.SHIELD_DURATION_HOURS)
+
+    # Deduct points
+    sp = self._get_season_points_raw(player_id, season_id)
+    if not sp or sp["points"] < cost_points:
+        raise ValueError("Insufficient points")
+    new_points = sp["points"] - cost_points
+    self.client.table("season_points").update({
+        "points": new_points, "updated_at": now.isoformat()
+    }).eq("season_id", season_id).eq("player_id", player_id).execute()
+
+    # Create shield row
+    res = self.client.table("point_shields").insert({
+        "season_id": season_id,
+        "player_id": player_id,
+        "payment_method": "points",
+        "cost_points": cost_points,
+        "status": "active",
+        "shield_starts_at": now.isoformat(),
+        "shield_ends_at": ends.isoformat(),
+    }).execute()
+    return res.data[0]
+
+
+def _get_season_points_raw(self: Database, player_id: int, season_id: int) -> Optional[dict]:
+    """Internal helper — same as get_season_points but used within
+    other Database methods that need to check balance before writing."""
+    res = (self.client.table("season_points")
+           .select("*").eq("player_id", player_id).eq("season_id", season_id).execute())
+    return res.data[0] if res.data else None
+
+
+def _create_shield_cash_pending(self: Database, player_id: int, season_id: int,
+                                 initiated_by: str) -> dict:
+    """Admin initiates a cash-path shield — status = pending_hod_confirmation."""
+    res = self.client.table("point_shields").insert({
+        "season_id": season_id,
+        "player_id": player_id,
+        "payment_method": "cash",
+        "cost_rupees": config.SHIELD_COST_RUPEES,
+        "initiated_by": str(initiated_by),
+        "initiated_at": "now()",
+        "status": "pending_hod_confirmation",
+    }).execute()
+    return res.data[0]
+
+
+def _confirm_shield(self: Database, shield_id: int, confirmed_by: str) -> dict:
+    """HOD confirms a pending cash-path shield — activates it."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    ends = now + timedelta(hours=config.SHIELD_DURATION_HOURS)
+    res = self.client.table("point_shields").update({
+        "status": "active",
+        "confirmed_by": str(confirmed_by),
+        "confirmed_at": now.isoformat(),
+        "shield_starts_at": now.isoformat(),
+        "shield_ends_at": ends.isoformat(),
+    }).eq("id", shield_id).eq("status", "pending_hod_confirmation").execute()
+    return res.data[0] if res.data else {}
+
+
+def _reject_shield(self: Database, shield_id: int, rejected_by: str) -> dict:
+    """HOD rejects a pending cash-path shield."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    res = self.client.table("point_shields").update({
+        "status": "rejected",
+        "rejected_by": str(rejected_by),
+        "rejected_at": now.isoformat(),
+    }).eq("id", shield_id).eq("status", "pending_hod_confirmation").execute()
+    return res.data[0] if res.data else {}
+
+
+def _get_shield_by_id(self: Database, shield_id: int) -> Optional[dict]:
+    res = self.client.table("point_shields").select("*").eq("id", shield_id).execute()
+    return res.data[0] if res.data else None
+
+
+def _expire_shields(self: Database) -> int:
+    return self.client.rpc("expire_shields", {}).execute().data
+
+
+def _get_season_point_events_for_match(self: Database, match_id: int) -> list[dict]:
+    """Return all point events for a given match — used by recompute/audit."""
+    return (self.client.table("season_point_events")
+            .select("*").eq("match_id", match_id).execute().data)
+
+
+Database.get_season_points = _get_season_points
+Database.season_points_leaderboard = _season_points_leaderboard
+Database.is_season_points_locked = _is_season_points_locked
+Database.recompute_player_season_points = _recompute_player_season_points
+Database.recompute_all_season_points = _recompute_all_season_points
+Database.recompute_season_points_for_match = _recompute_season_points_for_match
+Database.get_active_shield = _get_active_shield
+Database.get_pending_shields = _get_pending_shields
+Database.create_shield_points_path = _create_shield_points_path
+Database.create_shield_cash_pending = _create_shield_cash_pending
+Database.confirm_shield = _confirm_shield
+Database.reject_shield = _reject_shield
+Database.get_shield_by_id = _get_shield_by_id
+Database.expire_shields = _expire_shields
+Database.get_season_point_events_for_match = _get_season_point_events_for_match
+Database._get_season_points_raw = _get_season_points_raw

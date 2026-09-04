@@ -195,7 +195,7 @@ def balance_teams(queued_players: list[dict], bootstrap: bool) -> dict[str, Any]
 
 
 async def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], bootstrap: bool,
-                               n: int = 1) -> list[str]:
+                               n: int = 1, queue_key: str | None = None) -> list[str]:
     """
     Pick n candidate maps for the vote. In bootstrap mode: pure random.
 
@@ -223,5 +223,26 @@ async def pick_map_candidates(team_a_ids: list[int], team_b_ids: list[int], boot
     selection is a safe, correct fallback in the meantime (bootstrap
     mode already proves random is an acceptable map-pick strategy), just
     not the smarter balanced pick that was originally intended here.
+
+    No-immediate-repeat (2026-09): players were seeing the same map
+    (Takeoff, Arsenal) 2-3 matches in a row — expected statistically
+    with pure random.sample() over only 5 maps (1-in-5 repeat chance
+    every single match), but it read as broken/unfair to players.
+    queue_key is optional and best-effort: if provided, the previous
+    match's map in that queue is excluded from the sample pool before
+    picking. If querying last-played fails for any reason, or queue_key
+    isn't passed, falls straight back to the original unrestricted
+    random.sample() — this is a UX nicety, never worth blocking or
+    crashing a match over. Only meaningfully changes behavior when
+    n < len(HARDPOINT_MAPS) (true today: n=1 over a 5-map pool); once
+    n reaches the full pool size there's nothing left to exclude.
     """
-    return random.sample(config.HARDPOINT_MAPS, k=min(n, len(config.HARDPOINT_MAPS)))
+    pool = config.HARDPOINT_MAPS
+    if queue_key:
+        try:
+            last_map = await adb.get_last_played_map(queue_key)
+        except Exception:
+            last_map = None
+        if last_map and last_map in pool and len(pool) > n:
+            pool = [m for m in pool if m != last_map]
+    return random.sample(pool, k=min(n, len(pool)))

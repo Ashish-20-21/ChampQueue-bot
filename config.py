@@ -256,3 +256,36 @@ OPERATOR_SKILLS = [
     "Tempest",
     "War Machine",
 ]
+# --- Season 2: Points System & Prize Pool (migration_029) ---
+# Points awarded per match — independent of MMR, no MVP bonus.
+POINTS_WIN = 5
+POINTS_LOSS = -3
+
+# First player to hit this threshold locks the season.
+SEASON_END_THRESHOLD = 2500
+
+# Prize pool (₹) — 1st is fixed, 2nd/3rd are min(points÷POINTS_TO_RUPEE, cap).
+PRIZE_1ST = 500
+PRIZE_2ND_CAP = 300
+PRIZE_3RD_CAP = 200
+POINTS_TO_RUPEE = 5  # 5 points = ₹1
+
+# Shield powers
+SHIELD_COST_POINTS = 500       # self-serve deduction
+SHIELD_COST_RUPEES = 100       # cash-path reference (actual payment is out-of-band)
+SHIELD_DURATION_HOURS = 48
+
+# Channels (same fail-open pattern — unset means features no-op with a warning)
+SHIELD_CHANNEL_ID = int(os.getenv("SHIELD_CHANNEL_ID")) if os.getenv("SHIELD_CHANNEL_ID") else None
+POINTS_LEADERBOARD_CHANNEL_ID = int(os.getenv("POINTS_LEADERBOARD_CHANNEL_ID")) if os.getenv("POINTS_LEADERBOARD_CHANNEL_ID") else None
+HOD_APPROVAL_CHANNEL_ID = int(os.getenv("HOD_APPROVAL_CHANNEL_ID")) if os.getenv("HOD_APPROVAL_CHANNEL_ID") else None
+
+# HOD role IDs — separate from ADMIN_ROLE_IDS. Used for the two-person
+# shield approval flow (cash path). An admin initiates, a different
+# person with an HOD role confirms. If unset, cash-path shield grants
+# are disabled (points path still works).
+HOD_ROLE_IDS = {int(x.strip()) for x in os.getenv("HOD_ROLE_IDS", "").split(",") if x.strip()}
+
+# Points leaderboard display
+POINTS_LEADERBOARD_PAGE_SIZE = 50
+POINTS_LEADERBOARD_COOLDOWN_SECONDS = 60  # per-user reload rate limit

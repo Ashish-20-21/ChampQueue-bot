@@ -322,6 +322,23 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
 
         await interaction.response.defer()
 
+        # Lazy status sweep: point_shields.status only ever gets set
+        # once (on creation/confirmation) and nothing else updates it
+        # as time passes — has_active_shield()/get_active_shield() are
+        # correct regardless since they check shield_ends_at directly,
+        # but the status column itself can sit on 'active' long after
+        # a shield has actually expired, which reads wrong for anyone
+        # eyeballing point_shields directly (exactly the audit-trail
+        # use case that table exists for). Rather than a background
+        # sweep task, ride this already-rate-limited button click —
+        # cheap, no new infrastructure, keeps status honest whenever
+        # anyone actually looks at the leaderboard. Best-effort: never
+        # blocks the render if it fails.
+        try:
+            await with_retry(adb.expire_shields)
+        except Exception:
+            logger.exception("expire_shields() sweep failed during leaderboard reload (non-fatal)")
+
         season = await adb.get_active_season()
         if not season:
             await interaction.followup.send("No active season.", ephemeral=True)

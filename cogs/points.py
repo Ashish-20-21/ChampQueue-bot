@@ -208,6 +208,18 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
         menu_view.message = msg
 
 
+def _role_mentions(*role_id_sets: set[int]) -> str:
+    """Build a mention string across multiple role-ID sets, deduped.
+    HOD_ROLE_IDS and ADMIN_ROLE_IDS can legitimately overlap by design
+    (an HOD role is often also given admin power so they can act when
+    no separate admin is around) — without dedup, an overlapping role
+    gets @mentioned twice in the same message."""
+    seen: set[int] = set()
+    for role_ids in role_id_sets:
+        seen |= role_ids
+    return " ".join(f"<@&{rid}>" for rid in seen)
+
+
 def _freeze_view(view: discord.ui.View, picked_label: str | None = None) -> None:
     """Disable every button on a completed/expired step's view so it
     visibly shows it's no longer actionable, instead of sitting there
@@ -486,15 +498,14 @@ class ShieldConsentView(discord.ui.View):
         )
 
         # Post to HOD approval channel — tagging both HOD and admin roles
-        hod_mentions = " ".join(f"<@&{rid}>" for rid in config.HOD_ROLE_IDS)
-        admin_mentions = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS)
+        role_mentions = _role_mentions(config.HOD_ROLE_IDS, config.ADMIN_ROLE_IDS)
 
         await _post_to_hod_channel(
             interaction.client, self.season_id,
             f"🛡️ **New Boost consent** — <@{interaction.user.id}> "
             f"has agreed to the **₹{self.rupees} Boost** ({self.sp_value} SP, 7-day shield).\n"
             f"Consent ID: `{consent['id']}` · Awaiting payment via <#{config.SUPPORT_CHANNEL_ID}>.\n\n"
-            f"{hod_mentions} {admin_mentions}"
+            f"{role_mentions}"
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -814,13 +825,12 @@ async def check_and_announce_season_end(
                 pass
 
     # Post to HOD approval channel — tagging HOD role for awareness
-    hod_mentions = " ".join(f"<@&{rid}>" for rid in config.HOD_ROLE_IDS)
-    admin_mentions = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS)
+    role_mentions = _role_mentions(config.HOD_ROLE_IDS, config.ADMIN_ROLE_IDS)
     await _post_to_hod_channel(
         bot, season_id,
         f"🏆 **SEASON ENDED** — <@{winner['discord_id']}> crossed {config.SEASON_END_THRESHOLD} SP.\n"
         f"Points table is now **frozen**. Prize payouts pending review.\n\n"
-        f"{hod_mentions} {admin_mentions}"
+        f"{role_mentions}"
     )
 
 

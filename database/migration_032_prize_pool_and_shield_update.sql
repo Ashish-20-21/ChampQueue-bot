@@ -179,7 +179,34 @@ $$;
 
 
 -- ────────────────────────────────────────────────────────────
--- 4. Grant service_role on new columns (defensive)
+-- 5. Fix chk_cash_requires_initiator — allow player_consented rows
+--    to have initiated_by = null
+-- ────────────────────────────────────────────────────────────
+-- Bug: this constraint was written when the ONLY cash-path insert
+-- was /admin-grant-shield (status='pending_hod_confirmation'),
+-- where initiated_by is always set at insert time. This migration
+-- added a new EARLIER insert stage — create_shield_consent(), status
+-- ='player_consented' — that fires the moment a player clicks "I
+-- Agree", before any admin has touched it. initiated_by is correctly
+-- null at that point; the old constraint didn't get updated to know
+-- about the new stage and rejected every consent insert outright.
+--
+-- Caught live 2026-09-07 testing on ebsleroxzikxxvqblzry: every
+-- "I Agree" click failed with 'violates check constraint
+-- "chk_cash_requires_initiator"' (23514).
+--
+-- Fix: initiated_by is only required once the row is NOT sitting in
+-- the pre-admin 'player_consented' stage.
+alter table point_shields drop constraint if exists chk_cash_requires_initiator;
+alter table point_shields add constraint chk_cash_requires_initiator check (
+    payment_method != 'cash'
+    or status = 'player_consented'
+    or initiated_by is not null
+);
+
+
+-- ────────────────────────────────────────────────────────────
+-- 6. Grant service_role on new columns (defensive)
 -- ────────────────────────────────────────────────────────────
 -- Not strictly needed (the table-level grant from migration_030
 -- covers new columns automatically), but explicit > implicit

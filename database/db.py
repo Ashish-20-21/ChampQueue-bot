@@ -1080,6 +1080,7 @@ def _create_shield_points_path(self: Database, player_id: int, season_id: int,
         "player_id": player_id,
         "payment_method": "points",
         "cost_points": cost_points,
+        "tier": "credits",
         "status": "active",
         "shield_starts_at": now.isoformat(),
         "shield_ends_at": ends.isoformat(),
@@ -1096,13 +1097,15 @@ def _get_season_points_raw(self: Database, player_id: int, season_id: int) -> Op
 
 
 def _create_shield_cash_pending(self: Database, player_id: int, season_id: int,
-                                 initiated_by: str) -> dict:
-    """Admin initiates a cash-path shield — status = pending_hod_confirmation."""
+                                 initiated_by: str, cost_rupees: int = 100,
+                                 tier: str = "boost_100") -> dict:
+    """Admin/HOD initiates a cash-path shield — status = pending_hod_confirmation."""
     res = self.client.table("point_shields").insert({
         "season_id": season_id,
         "player_id": player_id,
         "payment_method": "cash",
-        "cost_rupees": config.SHIELD_COST_RUPEES,
+        "cost_rupees": cost_rupees,
+        "tier": tier,
         "initiated_by": str(initiated_by),
         "initiated_at": "now()",
         "status": "pending_hod_confirmation",
@@ -1165,6 +1168,29 @@ Database.create_shield_cash_pending = _create_shield_cash_pending
 Database.confirm_shield = _confirm_shield
 Database.reject_shield = _reject_shield
 Database.get_shield_by_id = _get_shield_by_id
+
+
+def _create_shield_consent(self: Database, player_id: int, season_id: int,
+                            tier: str, cost_rupees: int) -> dict:
+    """Player clicked 'I Agree' on the consent screen — records their
+    intent to purchase a boost. No shield is activated yet; this row
+    sits at status='player_consented' until an admin/HOD runs
+    /admin-grant-shield and an HOD confirms."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    res = self.client.table("point_shields").insert({
+        "season_id": season_id,
+        "player_id": player_id,
+        "payment_method": "cash",
+        "cost_rupees": cost_rupees,
+        "tier": tier,
+        "status": "player_consented",
+        "consented_at": now.isoformat(),
+    }).execute()
+    return res.data[0]
+
+
+Database.create_shield_consent = _create_shield_consent
 Database.expire_shields = _expire_shields
 Database.get_season_point_events_for_match = _get_season_point_events_for_match
 Database._get_season_points_raw = _get_season_points_raw

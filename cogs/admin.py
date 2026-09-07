@@ -11,7 +11,7 @@ import config
 from database.db import db, adb, with_retry
 from services import reputation, mmr_engine
 from utils.embeds import verification_card, hall_of_fame_embed, season_recap_embed
-from utils.permissions import admin_only, is_admin
+from utils.permissions import admin_only, is_admin, hod_or_admin_only
 from utils import incident_log
 from cogs.queue import RegionQueueView, make_queue_embed
 
@@ -992,14 +992,27 @@ class Admin(commands.Cog):
     # @approve.error and @reject.error removed (2026-08-15).
     # @recompute_stats.error removed (2026-08-15) — command commented out above.
     # ── /admin-grant-shield (cash path, two-approval) ──────────
-    @admin_only()
+    # HOD members can ALSO initiate (not just admins) — they need to
+    # be able to start the grant flow themselves when no admin is
+    # available. The two-person Confirm/Reject step still enforces
+    # initiator ≠ confirmer, so an HOD who initiates still needs the
+    # OTHER HOD to approve.
+    @hod_or_admin_only()
     @app_commands.command(
         name="admin-grant-shield",
         description="Grant a point shield (cash path) — requires HOD confirmation",
     )
-    @app_commands.describe(user="The player to grant the shield to")
+    @app_commands.describe(
+        user="The player to grant the shield to",
+        tier="Boost tier — 100 (₹100/500 SP) or 200 (₹200/1000 SP)",
+    )
+    @app_commands.choices(tier=[
+        app_commands.Choice(name="₹100 Boost (500 SP)", value=100),
+        app_commands.Choice(name="₹200 Boost (1000 SP)", value=200),
+    ])
     async def admin_grant_shield(self, interaction: discord.Interaction,
-                                  user: discord.Member) -> None:
+                                  user: discord.Member,
+                                  tier: int = 100) -> None:
         await interaction.response.defer(ephemeral=True)
 
         player = await adb.get_player_by_discord_id(str(user.id))
@@ -1032,9 +1045,15 @@ class Admin(commands.Cog):
             )
             return
 
+        # Resolve tier to rupee/points values
+        tier_rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
+        tier_points = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
+        tier_label = f"boost_{tier}"
+
         shield = await with_retry(
             adb.create_shield_cash_pending,
-            player["id"], season["id"], str(interaction.user.id)
+            player["id"], season["id"], str(interaction.user.id),
+            cost_rupees=tier_rupees, tier=tier_label
         )
 
         from cogs.points import post_hod_approval_card

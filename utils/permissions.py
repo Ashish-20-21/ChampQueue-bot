@@ -22,3 +22,21 @@ def admin_only():
     def predicate(interaction: discord.Interaction) -> bool:
         return is_admin(interaction)
     return app_commands.check(predicate)
+
+
+def is_hod(interaction: discord.Interaction) -> bool:
+    """Check if the user has any configured HOD role (separate from admin)."""
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    if not config.HOD_ROLE_IDS:
+        return False
+    return any(role.id in config.HOD_ROLE_IDS for role in interaction.user.roles)
+
+
+def hod_or_admin_only():
+    """Permission gate that allows EITHER admin OR HOD role holders.
+    Used for /admin-grant-shield — HOD members need to be able to
+    initiate shield grants themselves, not just approve them."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        return is_admin(interaction) or is_hod(interaction)
+    return app_commands.check(predicate)

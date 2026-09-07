@@ -44,19 +44,17 @@ logger = logging.getLogger("champions_queue")
 def _shield_info_embed() -> discord.Embed:
     """The informational embed shown in the shield channel."""
     em = discord.Embed(
-        title="🛡️ Point Shield",
+        title="⚡ Shield Station",
         description=(
-            "Protect your season points from match losses for **48 hours**.\n\n"
-            "While a shield is active, losses cost you **0 points** instead of the usual **-3**. "
-            "Wins still give the normal **+5**. Your MMR is completely unaffected.\n\n"
-            "**How to get one:**\n"
-            "• **With points:** costs **500 points** — tap the button below.\n"
-            f"• **With cash:** costs **₹{config.SHIELD_COST_RUPEES}** — raise a ticket with an admin, "
-            "they'll handle it from there."
+            "Think you're climbing fast? Protect your grind.\n\n"
+            "A **Shield** blocks the **-3 SP penalty** on losses for a full **7 days**. "
+            "Wins still give you the normal **+5 SP**. Your MMR stays completely untouched — "
+            "this is a Season Points play only.\n\n"
+            "**One active shield at a time. Once purchased, it's final — no refunds, no reversals.**"
         ),
-        color=0x5865F2,  # Discord blurple
+        color=0x5865F2,
     )
-    em.set_footer(text="One active shield at a time · Shield starts the moment it's activated")
+    em.set_footer(text="Shield activates the moment it's confirmed • 7 days, no exceptions")
     return em
 
 
@@ -120,18 +118,19 @@ def _shield_hod_approval_embed(shield: dict, player_ign: str, player_discord_id:
 def _season_end_embed(winner_ign: str, winner_discord_id: str, winner_points: int,
                        second: dict | None, third: dict | None,
                        season_name: str) -> discord.Embed:
-    """The announcement embed when someone crosses 2500."""
+    """The announcement embed when someone crosses 3500."""
     desc = (
-        f"🎉 **{winner_ign}** (<@{winner_discord_id}>) has crossed "
-        f"**{config.SEASON_END_THRESHOLD}** points with **{winner_points}** pts!\n\n"
+        f"🏆 **{winner_ign}** (<@{winner_discord_id}>) has crossed "
+        f"**{config.SEASON_END_THRESHOLD}** SP with **{winner_points}** points "
+        f"and is declared the **Conqueror of {season_name}**!\n\n"
         f"🥇 **1st Place:** {winner_ign} — **₹{config.PRIZE_1ST}**\n"
     )
     if second:
-        desc += f"🥈 **2nd Place:** {second['ign']} — **₹{second.get('payout_rupees', 0)}** ({second['points']} pts)\n"
+        desc += f"🥈 **2nd Place:** {second['ign']} — **₹{second.get('payout_rupees', 0)}** ({second['points']} SP)\n"
     if third:
-        desc += f"🥉 **3rd Place:** {third['ign']} — **₹{third.get('payout_rupees', 0)}** ({third['points']} pts)\n"
+        desc += f"🥉 **3rd Place:** {third['ign']} — **₹{third.get('payout_rupees', 0)}** ({third['points']} SP)\n"
 
-    desc += "\n**All season points are now frozen.** MMR and matchmaking continue as normal."
+    desc += "\n**All Season Points are now frozen.** MMR and matchmaking continue as normal."
 
     em = discord.Embed(
         title=f"🏆 Season Ended — {season_name}",
@@ -147,14 +146,12 @@ def _season_end_embed(winner_ign: str, winner_discord_id: str, winner_points: in
 
 class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
                            template=r"shield:buy_points"):
-    """Self-serve shield purchase with points. Persistent across restarts.
-    Takes no per-instance parameters, so from_custom_id just re-creates
-    a fresh instance — same DynamicItem pattern as HostApprovalButton /
-    IssueResolveButton in cogs/match.py."""
+    """Main shield button — opens the 3-option menu (Use Credits / Boost / Cancel).
+    Persistent across restarts via DynamicItem."""
 
     def __init__(self) -> None:
         super().__init__(discord.ui.Button(
-            label="Buy Shield (500 pts)",
+            label="Shield",
             style=discord.ButtonStyle.primary,
             emoji="🛡️",
             custom_id="shield:buy_points",
@@ -176,10 +173,9 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
         season_id = season["id"]
         player = await adb.get_player_by_discord_id(str(interaction.user.id))
         if not player:
-            await interaction.followup.send("You need to be registered to buy a shield.", ephemeral=True)
+            await interaction.followup.send("You need to be registered first.", ephemeral=True)
             return
 
-        # Check: no existing active shield
         existing = await adb.get_active_shield(player["id"], season_id)
         if existing:
             ends = existing.get("shield_ends_at", "")
@@ -190,47 +186,94 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
             )
             return
 
-        # Check: season not locked
         locked = await adb.is_season_points_locked(season_id)
         if locked:
             await interaction.followup.send("Season points are locked — shields are no longer available.", ephemeral=True)
             return
 
-        # Check balance
         sp = await adb.get_season_points(player["id"], season_id)
         current_points = sp["points"] if sp else 0
-        if current_points < config.SHIELD_COST_POINTS:
-            await interaction.followup.send(
-                f"You have **{current_points}** points but need **{config.SHIELD_COST_POINTS}**. "
-                f"You can top up by purchasing with cash (₹{config.SHIELD_COST_RUPEES}) — "
-                "raise a ticket with an admin to get started.",
-                ephemeral=True,
-            )
-            return
 
-        # Confirmation step
-        confirm_view = ShieldConfirmView(player["id"], season_id, current_points)
+        menu_view = ShieldMenuView(player["id"], season_id, current_points)
         await interaction.followup.send(
-            f"**Confirm shield purchase?**\n\n"
-            f"This will deduct **{config.SHIELD_COST_POINTS} points** from your balance "
-            f"({current_points} → {current_points - config.SHIELD_COST_POINTS}).\n"
-            f"Your shield will be active for **{config.SHIELD_DURATION_HOURS} hours** starting now.\n\n"
-            "During this time, losses will cost **0 points** instead of -3.",
-            view=confirm_view,
+            "**⚡ How do you want to get your shield?**\n\n"
+            f"🎯 **Use Credits** — costs **{config.SHIELD_COST_POINTS} SP** from your balance "
+            f"(you have **{current_points}** SP)\n"
+            "💰 **Boost** — pay with cash (₹100 or ₹200) for a paid shield\n\n"
+            f"Both give you **{config.SHIELD_DURATION_HOURS // 24} days** of loss protection.",
+            view=menu_view,
             ephemeral=True,
         )
 
 
-class ShieldConfirmView(discord.ui.View):
-    """Ephemeral confirmation before deducting points."""
+class ShieldMenuView(discord.ui.View):
+    """The 3-option menu: Use Credits / Boost / Cancel."""
 
     def __init__(self, player_id: int, season_id: int, current_points: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)  # 5 minutes
         self.player_id = player_id
         self.season_id = season_id
         self.current_points = current_points
 
-    @discord.ui.button(label="Confirm Purchase", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(label="Use Credits", style=discord.ButtonStyle.success, emoji="🎯")
+    async def use_credits(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+
+        if self.current_points < config.SHIELD_COST_POINTS:
+            await interaction.followup.send(
+                f"You have **{self.current_points} SP** but need **{config.SHIELD_COST_POINTS}**.\n\n"
+                "You can get a shield through a **Boost** instead — click the shield button again "
+                "and choose **Boost** to see the cash options.",
+                ephemeral=True,
+            )
+            return
+
+        confirm_view = ShieldCreditsConfirmView(self.player_id, self.season_id, self.current_points)
+        await interaction.followup.send(
+            "**⚠️ Confirm credit purchase — this is irreversible**\n\n"
+            f"This will deduct **{config.SHIELD_COST_POINTS} SP** from your balance "
+            f"(**{self.current_points}** → **{self.current_points - config.SHIELD_COST_POINTS}** SP).\n"
+            f"Your shield will be active for **{config.SHIELD_DURATION_HOURS // 24} days** starting now.\n\n"
+            "Once purchased, this cannot be undone, refunded, or reversed. "
+            "No exceptions will be made for credit-based purchases.",
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Boost", style=discord.ButtonStyle.primary, emoji="💰")
+    async def boost(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+
+        tier_view = ShieldBoostTierView(self.player_id, self.season_id)
+        await interaction.followup.send(
+            "**⚡ Boost Your Season Points**\n\n"
+            "A Boost is a paid Shield — **7 days** of protection where your losses cost you nothing.\n\n"
+            f"**₹{config.SHIELD_BOOST_100_RUPEES} Boost** — {config.SHIELD_BOOST_100_POINTS} SP value\n"
+            f"**₹{config.SHIELD_BOOST_200_RUPEES} Boost** — {config.SHIELD_BOOST_200_POINTS} SP value\n\n"
+            "Payment is handled by an admin after you raise a ticket — "
+            "nothing is charged automatically. You'll confirm exactly what you're agreeing to on the next screen.",
+            view=tier_view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_menu(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message("No worries — shield menu closed.", ephemeral=True)
+        self.stop()
+
+
+class ShieldCreditsConfirmView(discord.ui.View):
+    """Irreversible confirmation before deducting points."""
+
+    def __init__(self, player_id: int, season_id: int, current_points: int) -> None:
+        super().__init__(timeout=300)
+        self.player_id = player_id
+        self.season_id = season_id
+        self.current_points = current_points
+
+    @discord.ui.button(label="Confirm Purchase", style=discord.ButtonStyle.danger, emoji="✅")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         self.stop()
@@ -246,7 +289,7 @@ class ShieldConfirmView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        except Exception as exc:
+        except Exception:
             logger.exception("Shield purchase failed for player_id=%s", self.player_id)
             await interaction.followup.send(
                 "Something went wrong processing your shield. Please try again or contact an admin.",
@@ -255,24 +298,130 @@ class ShieldConfirmView(discord.ui.View):
             return
 
         ends_ts = _iso_to_ts(shield.get("shield_ends_at", ""))
+        # Ephemeral confirmation to the buyer only
         await interaction.followup.send(
             f"🛡️ **Shield activated!** You're protected until <t:{ends_ts}:F> (<t:{ends_ts}:R>).\n"
-            f"Points deducted: **-{config.SHIELD_COST_POINTS}** "
-            f"(new balance: **{self.current_points - config.SHIELD_COST_POINTS}**).",
+            f"Points deducted: **-{config.SHIELD_COST_POINTS} SP** "
+            f"(new balance: **{self.current_points - config.SHIELD_COST_POINTS}** SP).",
             ephemeral=True,
         )
 
-        # Post to shield channel audit log
-        await _post_shield_audit(
+        # Post to HOD approval channel (team visibility)
+        await _post_to_hod_channel(
             interaction.client, self.season_id,
             f"🛡️ **Shield purchased** by <@{interaction.user.id}> "
-            f"(points path, -{config.SHIELD_COST_POINTS} pts) — "
+            f"(credits path, -{config.SHIELD_COST_POINTS} SP) — "
             f"active until <t:{ends_ts}:F>"
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_message("Shield purchase cancelled.", ephemeral=True)
+        self.stop()
+
+
+class ShieldBoostTierView(discord.ui.View):
+    """₹100 / ₹200 tier selection — leads to the consent screen."""
+
+    def __init__(self, player_id: int, season_id: int) -> None:
+        super().__init__(timeout=300)
+        self.player_id = player_id
+        self.season_id = season_id
+
+    @discord.ui.button(label="₹100 Boost", style=discord.ButtonStyle.primary)
+    async def tier_100(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+        await self._show_consent(interaction, tier=100)
+
+    @discord.ui.button(label="₹200 Boost", style=discord.ButtonStyle.primary)
+    async def tier_200(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+        await self._show_consent(interaction, tier=200)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message("Boost selection cancelled.", ephemeral=True)
+        self.stop()
+
+    async def _show_consent(self, interaction: discord.Interaction, tier: int) -> None:
+        rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
+        sp_value = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
+
+        consent_view = ShieldConsentView(self.player_id, self.season_id, tier, rupees, sp_value)
+        await interaction.followup.send(
+            f"**Confirm before you proceed — ₹{rupees} Boost**\n\n"
+            "Here's exactly what happens:\n"
+            f"• You're requesting a **7-day ({config.SHIELD_DURATION_HOURS} hour) shield**, "
+            f"worth **{sp_value} SP**, for **₹{rupees}**.\n"
+            f"• Payment is made directly to an admin via <#{config.SUPPORT_CHANNEL_ID}> — "
+            "ChampQueue never handles your money.\n"
+            "• Once an HOD confirms your payment, the shield activates immediately "
+            "and **cannot be cancelled, refunded, or reversed**.\n"
+            "• If you don't actually complete payment after this, no shield will be granted — "
+            "this step only records that you understood the terms.\n\n"
+            "By clicking **I Agree**, you confirm you understand the above "
+            f"and intend to proceed to <#{config.SUPPORT_CHANNEL_ID}> to arrange payment.",
+            view=consent_view,
+            ephemeral=True,
+        )
+
+
+class ShieldConsentView(discord.ui.View):
+    """Final consent gate — writes to DB and notifies HOD channel."""
+
+    def __init__(self, player_id: int, season_id: int, tier: int,
+                 rupees: int, sp_value: int) -> None:
+        super().__init__(timeout=300)
+        self.player_id = player_id
+        self.season_id = season_id
+        self.tier = tier
+        self.rupees = rupees
+        self.sp_value = sp_value
+
+    @discord.ui.button(label="I Agree — Go to #support", style=discord.ButtonStyle.danger, emoji="✅")
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+
+        tier_label = f"boost_{self.tier}"
+        try:
+            consent = await with_retry(
+                adb.create_shield_consent,
+                self.player_id, self.season_id, tier_label, self.rupees
+            )
+        except Exception:
+            logger.exception("Shield consent record failed for player_id=%s", self.player_id)
+            await interaction.followup.send(
+                "Something went wrong recording your consent. Please try again or contact an admin.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"✅ **Consent recorded** (Shield ID: `{consent['id']}`).\n\n"
+            f"Now head to <#{config.SUPPORT_CHANNEL_ID}> to raise a ticket and arrange your "
+            f"**₹{self.rupees}** payment. Once an admin verifies it, your shield will be activated by an HOD.\n\n"
+            "If you have any questions, ask in the ticket.",
+            ephemeral=True,
+        )
+
+        # Post to HOD approval channel — tagging both HOD and admin roles
+        hod_mentions = " ".join(f"<@&{rid}>" for rid in config.HOD_ROLE_IDS)
+        admin_mentions = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS)
+
+        await _post_to_hod_channel(
+            interaction.client, self.season_id,
+            f"🛡️ **New Boost consent** — <@{interaction.user.id}> "
+            f"has agreed to the **₹{self.rupees} Boost** ({self.sp_value} SP, 7-day shield).\n"
+            f"Consent ID: `{consent['id']}` · Awaiting payment via <#{config.SUPPORT_CHANNEL_ID}>.\n\n"
+            f"{hod_mentions} {admin_mentions}"
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message("Boost consent cancelled — nothing was recorded.", ephemeral=True)
         self.stop()
 
 
@@ -413,7 +562,7 @@ class HODApprovalView(discord.ui.View):
         await interaction.message.edit(embed=em, view=None)
 
         # Post audit log to shield channel
-        await _post_shield_audit(
+        await _post_to_hod_channel(
             interaction.client, shield["season_id"],
             f"🛡️ **Shield granted** to <@{player['discord_id']}> "
             f"(cash path, ₹{config.SHIELD_COST_RUPEES}) — "
@@ -469,7 +618,7 @@ class HODApprovalView(discord.ui.View):
         await interaction.message.edit(embed=em, view=None)
 
         # Audit
-        await _post_shield_audit(
+        await _post_to_hod_channel(
             interaction.client, shield["season_id"],
             f"❌ **Shield request rejected** for <@{player['discord_id']}> "
             f"(cash path) — rejected by <@{interaction.user.id}>"
@@ -571,6 +720,28 @@ async def check_and_announce_season_end(
             except discord.HTTPException:
                 pass
 
+    # Post to shield channel — public "Conqueror" announcement
+    if config.SHIELD_CHANNEL_ID:
+        ch = bot.get_channel(config.SHIELD_CHANNEL_ID)
+        if ch:
+            try:
+                await ch.send(
+                    f"🏆 **<@{winner['discord_id']}> has hit {config.SEASON_END_THRESHOLD} SP "
+                    f"and is declared the Conqueror of {season_name}!**"
+                )
+            except discord.HTTPException:
+                pass
+
+    # Post to HOD approval channel — tagging HOD role for awareness
+    hod_mentions = " ".join(f"<@&{rid}>" for rid in config.HOD_ROLE_IDS)
+    admin_mentions = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS)
+    await _post_to_hod_channel(
+        bot, season_id,
+        f"🏆 **SEASON ENDED** — <@{winner['discord_id']}> crossed {config.SEASON_END_THRESHOLD} SP.\n"
+        f"Points table is now **frozen**. Prize payouts pending review.\n\n"
+        f"{hod_mentions} {admin_mentions}"
+    )
+
 
 async def post_hod_approval_card(
     bot: commands.Bot,
@@ -624,11 +795,11 @@ def _iso_to_ts(iso_str: str) -> int:
         return 0
 
 
-async def _post_shield_audit(bot: commands.Bot, season_id: int, message: str) -> None:
-    """Post an audit line to the shield channel."""
-    if not config.SHIELD_CHANNEL_ID:
+async def _post_to_hod_channel(bot: commands.Bot, season_id: int, message: str) -> None:
+    """Post an audit/notification line to the HOD approval channel."""
+    if not config.HOD_APPROVAL_CHANNEL_ID:
         return
-    ch = bot.get_channel(config.SHIELD_CHANNEL_ID)
+    ch = bot.get_channel(config.HOD_APPROVAL_CHANNEL_ID)
     if not ch:
         return
     try:

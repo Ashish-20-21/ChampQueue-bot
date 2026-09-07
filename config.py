@@ -256,24 +256,33 @@ OPERATOR_SKILLS = [
     "Tempest",
     "War Machine",
 ]
-# --- Season 2: Points System & Prize Pool (migration_029) ---
+# --- Season 2: Points System & Prize Pool (migration_029, updated migration_032) ---
 # Points awarded per match — independent of MMR, no MVP bonus.
 POINTS_WIN = 5
 POINTS_LOSS = -3
 
 # First player to hit this threshold locks the season.
-SEASON_END_THRESHOLD = 2500
+SEASON_END_THRESHOLD = 3500
 
-# Prize pool (₹) — 1st is fixed, 2nd/3rd are min(points÷POINTS_TO_RUPEE, cap).
-PRIZE_1ST = 500
-PRIZE_2ND_CAP = 300
-PRIZE_3RD_CAP = 200
+# Prize pool ₹1500 — 1st is fixed, 2nd/3rd are min(points÷POINTS_TO_RUPEE, cap).
+PRIZE_1ST = 700
+PRIZE_2ND_CAP = 500
+PRIZE_3RD_CAP = 300
 POINTS_TO_RUPEE = 5  # 5 points = ₹1
 
-# Shield powers
-SHIELD_COST_POINTS = 500       # self-serve deduction
-SHIELD_COST_RUPEES = 100       # cash-path reference (actual payment is out-of-band)
-SHIELD_DURATION_HOURS = 48
+# Shield powers — 7-day (168h) protection window
+SHIELD_COST_POINTS = 500       # self-serve "Use Credits" deduction
+SHIELD_DURATION_HOURS = 168    # was 48h pre-migration_032
+
+# Boost tiers (cash path) — both give the same 168h shield,
+# difference is SP-equivalent value for pricing/audit only.
+SHIELD_BOOST_100_RUPEES = 100
+SHIELD_BOOST_100_POINTS = 500   # ₹100 = 500 SP equivalent
+SHIELD_BOOST_200_RUPEES = 200
+SHIELD_BOOST_200_POINTS = 1000  # ₹200 = 1000 SP equivalent
+
+# Support channel for ticket-based payments
+SUPPORT_CHANNEL_ID = 1524062713590976562
 
 # Channels (same fail-open pattern — unset means features no-op with a warning)
 SHIELD_CHANNEL_ID = int(os.getenv("SHIELD_CHANNEL_ID")) if os.getenv("SHIELD_CHANNEL_ID") else None

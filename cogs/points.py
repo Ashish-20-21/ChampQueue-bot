@@ -99,15 +99,17 @@ def _points_leaderboard_embed(rows: list[dict], season_name: str, is_locked: boo
 def _shield_hod_approval_embed(shield: dict, player_ign: str, player_discord_id: str,
                                 admin_discord_id: str) -> discord.Embed:
     """The HOD confirmation card for a cash-path shield grant."""
+    rupees = shield.get("cost_rupees") or "?"
     em = discord.Embed(
         title="🛡️ Shield Grant — Awaiting HOD Confirmation",
         description=(
             f"**Player:** {player_ign} (<@{player_discord_id}>)\n"
-            f"**Payment:** ₹{config.SHIELD_COST_RUPEES} (cash)\n"
+            f"**Payment:** ₹{rupees} (cash)\n"
             f"**Initiated by:** <@{admin_discord_id}>\n"
             f"**Shield ID:** `{shield['id']}`\n\n"
             "Confirm that payment has been verified. The shield activates "
-            "the moment you click **Confirm** — the 48-hour window starts then."
+            f"the moment you click **Confirm** — the {config.SHIELD_DURATION_HOURS}-hour "
+            f"({config.SHIELD_DURATION_HOURS // 24}-day) window starts then."
         ),
         color=0xFFA500,
     )
@@ -427,12 +429,30 @@ class ShieldBoostTierView(discord.ui.View):
         rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
         sp_value = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
 
+        # Tier-specific SP mechanics line — the ₹200 tier's day-1
+        # boost is a genuinely different mechanic from the ₹100 tier's
+        # flat rate, so this isn't just a number swap, the wording
+        # itself needs to differ. Both tiers explicitly state "no
+        # negative SP" since that's the actual value being sold here
+        # and shouldn't be left implicit on a consent screen.
+        if tier == 200:
+            mechanics_line = (
+                "• **Day 1:** every win gives **+50 SP** (10x boost) — losses cost **0 SP**.\n"
+                "• **Days 2–7:** every win gives the normal **+5 SP** — losses still cost **0 SP**.\n"
+                "• **No negative SP at any point during the 7 days.**\n"
+            )
+        else:
+            mechanics_line = (
+                "• Every win gives the normal **+5 SP**, every day, for all 7 days.\n"
+                "• **Losses cost 0 SP the entire time — no negative SP at any point.**\n"
+            )
+
         consent_view = ShieldConsentView(self.player_id, self.season_id, tier, rupees, sp_value)
         msg = await interaction.followup.send(
             f"**Confirm before you proceed — ₹{rupees} Boost**\n\n"
             "Here's exactly what happens:\n"
-            f"• You're requesting a **7-day ({config.SHIELD_DURATION_HOURS} hour) shield**, "
-            f"worth **{sp_value} SP**, for **₹{rupees}**.\n"
+            f"• You're requesting a **7-day ({config.SHIELD_DURATION_HOURS} hour) shield** for **₹{rupees}**.\n"
+            f"{mechanics_line}"
             f"• Payment is made directly to an admin via <#{config.SUPPORT_CHANNEL_ID}> — "
             "ChampQueue never handles your money.\n"
             "• Once an HOD confirms your payment, the shield activates immediately "
@@ -657,7 +677,7 @@ class HODApprovalView(discord.ui.View):
         await _post_to_hod_channel(
             interaction.client, shield["season_id"],
             f"🛡️ **Shield granted** to <@{player['discord_id']}> "
-            f"(cash path, ₹{config.SHIELD_COST_RUPEES}) — "
+            f"(cash path, ₹{shield.get('cost_rupees') or '?'}) — "
             f"initiated by <@{self.initiated_by}>, "
             f"confirmed by <@{interaction.user.id}> — "
             f"active until <t:{ends_ts}:F>"
@@ -876,13 +896,38 @@ def _has_hod_role(member: discord.Member | discord.User) -> bool:
 
 
 def _iso_to_ts(iso_str: str) -> int:
-    """Convert an ISO datetime string to a Unix timestamp for Discord formatting."""
+    """Convert an ISO datetime string (as returned by Supabase/Postgres)
+    to a Unix timestamp for Discord's <t:...> formatting.
+
+    Falls back to 0 (renders as 1 Jan 1970 in Discord) only if truly
+    unparseable — but logs when that happens, since a silent fallback
+    here means a wrong date gets shown to real people without anyone
+    knowing why.
+
+    Caught live 2026-09-07: a shield-granted message showed 1970
+    instead of the real 7-day expiry. Root cause confirmed: Postgres
+    returned "2026-09-07 14:42:32.4923+00" — space-separated (not
+    'T'), and critically a UTC offset with NO COLON ("+00" not
+    "+00:00"). Python's datetime.fromisoformat() on 3.10 (this
+    project's runtime) rejects colonless offsets outright — that
+    became fully ISO 8601 compliant only in 3.11. The original
+    version of this function had no normalization for that case and
+    silently swallowed the ValueError."""
     if not iso_str:
+        logger.warning("_iso_to_ts called with empty/None iso_str — will render as 1970 epoch")
         return 0
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        cleaned = iso_str.replace("Z", "+00:00")
+        cleaned = cleaned.replace(" ", "T", 1)  # Postgres space-separator -> ISO 'T'
+        # Normalize a colonless UTC offset ("+00" or "-05") to
+        # "+00:00"/"-05:00" — Python 3.10's fromisoformat rejects the
+        # colonless form even though 3.11+ accepts it.
+        import re as _re
+        cleaned = _re.sub(r'([+-]\d{2})$', r'\1:00', cleaned)
+        dt = datetime.fromisoformat(cleaned)
         return int(dt.timestamp())
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError) as exc:
+        logger.warning("_iso_to_ts failed to parse %r — falling back to 1970 epoch: %s", iso_str, exc)
         return 0
 
 

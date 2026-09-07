@@ -1032,14 +1032,27 @@ def _get_active_shield(self: Database, player_id: int, season_id: int) -> Option
     if not res.data:
         return None
     from datetime import datetime, timezone
+    import re as _re
     now = datetime.now(timezone.utc)
     for row in res.data:
         ends = row.get("shield_ends_at")
         if ends:
-            # supabase returns ISO strings
             if isinstance(ends, str):
-                from datetime import datetime as dt
-                ends_dt = dt.fromisoformat(ends.replace("Z", "+00:00"))
+                # Same parsing shape as cogs/points.py's _iso_to_ts —
+                # normalize Z, space-vs-T separator, and a colonless
+                # UTC offset (Python 3.10's fromisoformat rejects
+                # "+00" but accepts "+00:00"; this project runs 3.10).
+                # This exact bug crashed a live shield-active check
+                # uncaught on 2026-09-07 before this fix.
+                cleaned = ends.replace("Z", "+00:00").replace(" ", "T", 1)
+                cleaned = _re.sub(r'([+-]\d{2})$', r'\1:00', cleaned)
+                try:
+                    ends_dt = datetime.fromisoformat(cleaned)
+                except (ValueError, AttributeError, TypeError):
+                    # Unparseable — treat as not-active rather than
+                    # crash the caller. A shield we can't confirm the
+                    # expiry of should not silently protect someone.
+                    continue
             else:
                 ends_dt = ends
             if ends_dt > now:
@@ -1099,7 +1112,46 @@ def _get_season_points_raw(self: Database, player_id: int, season_id: int) -> Op
 def _create_shield_cash_pending(self: Database, player_id: int, season_id: int,
                                  initiated_by: str, cost_rupees: int = 100,
                                  tier: str = "boost_100") -> dict:
-    """Admin/HOD initiates a cash-path shield — status = pending_hod_confirmation."""
+    """Admin/HOD initiates a cash-path shield — status = pending_hod_confirmation.
+
+    If the player already has a matching 'player_consented' row (they
+    clicked "I Agree" on the consent screen before the admin ran this
+    command — the normal flow), that row is UPDATED in place rather
+    than a second row being inserted. Before this fix, every consent
+    click + admin grant produced two permanently-orphaned rows in
+    point_shields — the original consent row never got linked to or
+    touched by the actual grant, defeating the point of recording
+    consent at all (no way to trace which consent led to which grant)
+    and leaving dead rows accumulating in what's meant to be a clean
+    audit trail for real-money transactions.
+
+    Falls back to a fresh insert if no matching consent row exists —
+    e.g. an admin grants a shield without the player having gone
+    through the consent screen first (edge case, still supported)."""
+    existing = (self.client.table("point_shields")
+                .select("*")
+                .eq("player_id", player_id)
+                .eq("season_id", season_id)
+                .eq("status", "player_consented")
+                .eq("tier", tier)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute())
+
+    if existing.data:
+        shield_id = existing.data[0]["id"]
+        res = self.client.table("point_shields").update({
+            "cost_rupees": cost_rupees,
+            "initiated_by": str(initiated_by),
+            "initiated_at": "now()",
+            "status": "pending_hod_confirmation",
+        }).eq("id", shield_id).eq("status", "player_consented").execute()
+        if res.data:
+            return res.data[0]
+        # Fell through — the consent row was claimed by another grant
+        # attempt between our select and update (race condition).
+        # Fall back to a fresh insert rather than fail the command.
+
     res = self.client.table("point_shields").insert({
         "season_id": season_id,
         "player_id": player_id,

@@ -195,7 +195,7 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
         current_points = sp["points"] if sp else 0
 
         menu_view = ShieldMenuView(player["id"], season_id, current_points)
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             "**⚡ How do you want to get your shield?**\n\n"
             f"🎯 **Use Credits** — costs **{config.SHIELD_COST_POINTS} SP** from your balance "
             f"(you have **{current_points}** SP)\n"
@@ -203,7 +203,25 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
             f"Both give you **{config.SHIELD_DURATION_HOURS // 24} days** of loss protection.",
             view=menu_view,
             ephemeral=True,
+            wait=True,
         )
+        menu_view.message = msg
+
+
+def _freeze_view(view: discord.ui.View, picked_label: str | None = None) -> None:
+    """Disable every button on a completed/expired step's view so it
+    visibly shows it's no longer actionable, instead of sitting there
+    looking clickable while silently dead underneath (the "ChampQueue
+    didn't respond in time" symptom a stale-but-visible button gives).
+    If picked_label is given, that specific button's label gets a
+    checkmark prefix so the message also shows which choice was made.
+    Mutates in place — caller still needs to push the updated view via
+    edit_message()/edit_original_response()/message.edit()."""
+    for child in view.children:
+        if isinstance(child, discord.ui.Button):
+            child.disabled = True
+            if picked_label is not None and child.label == picked_label:
+                child.label = f"✓ {child.label}"
 
 
 class ShieldMenuView(discord.ui.View):
@@ -214,11 +232,24 @@ class ShieldMenuView(discord.ui.View):
         self.player_id = player_id
         self.season_id = season_id
         self.current_points = current_points
+        self.message: discord.WebhookMessage | discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        # Natural 5-minute expiry — disable in place instead of leaving
+        # dead-but-visible buttons on an ephemeral message nobody will
+        # ever see updated otherwise.
+        _freeze_view(self)
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Use Credits", style=discord.ButtonStyle.success, emoji="🎯")
     async def use_credits(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Use Credits")
+        await interaction.response.edit_message(view=self)
 
         if self.current_points < config.SHIELD_COST_POINTS:
             await interaction.followup.send(
@@ -230,7 +261,7 @@ class ShieldMenuView(discord.ui.View):
             return
 
         confirm_view = ShieldCreditsConfirmView(self.player_id, self.season_id, self.current_points)
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             "**⚠️ Confirm credit purchase — this is irreversible**\n\n"
             f"This will deduct **{config.SHIELD_COST_POINTS} SP** from your balance "
             f"(**{self.current_points}** → **{self.current_points - config.SHIELD_COST_POINTS}** SP).\n"
@@ -239,15 +270,18 @@ class ShieldMenuView(discord.ui.View):
             "No exceptions will be made for credit-based purchases.",
             view=confirm_view,
             ephemeral=True,
+            wait=True,
         )
+        confirm_view.message = msg
 
     @discord.ui.button(label="Boost", style=discord.ButtonStyle.primary, emoji="💰")
     async def boost(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Boost")
+        await interaction.response.edit_message(view=self)
 
         tier_view = ShieldBoostTierView(self.player_id, self.season_id)
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             "**⚡ Boost Your Season Points**\n\n"
             "A Boost is a paid Shield — **7 days** of protection where your losses cost you nothing.\n\n"
             f"**₹{config.SHIELD_BOOST_100_RUPEES} Boost** — {config.SHIELD_BOOST_100_POINTS} SP value\n"
@@ -256,12 +290,17 @@ class ShieldMenuView(discord.ui.View):
             "nothing is charged automatically. You'll confirm exactly what you're agreeing to on the next screen.",
             view=tier_view,
             ephemeral=True,
+            wait=True,
         )
+        tier_view.message = msg
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_menu(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message("No worries — shield menu closed.", ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Cancel")
+        await interaction.response.edit_message(
+            content="No worries — shield menu closed.", view=self
+        )
 
 
 class ShieldCreditsConfirmView(discord.ui.View):
@@ -272,11 +311,21 @@ class ShieldCreditsConfirmView(discord.ui.View):
         self.player_id = player_id
         self.season_id = season_id
         self.current_points = current_points
+        self.message: discord.WebhookMessage | discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        _freeze_view(self)
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Confirm Purchase", style=discord.ButtonStyle.danger, emoji="✅")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Confirm Purchase")
+        await interaction.response.edit_message(view=self)
 
         try:
             shield = await with_retry(
@@ -316,8 +365,11 @@ class ShieldCreditsConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message("Shield purchase cancelled.", ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Cancel")
+        await interaction.response.edit_message(
+            content="Shield purchase cancelled.", view=self
+        )
 
 
 class ShieldBoostTierView(discord.ui.View):
@@ -327,30 +379,44 @@ class ShieldBoostTierView(discord.ui.View):
         super().__init__(timeout=300)
         self.player_id = player_id
         self.season_id = season_id
+        self.message: discord.WebhookMessage | discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        _freeze_view(self)
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="₹100 Boost", style=discord.ButtonStyle.primary)
     async def tier_100(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="₹100 Boost")
+        await interaction.response.edit_message(view=self)
         await self._show_consent(interaction, tier=100)
 
     @discord.ui.button(label="₹200 Boost", style=discord.ButtonStyle.primary)
     async def tier_200(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="₹200 Boost")
+        await interaction.response.edit_message(view=self)
         await self._show_consent(interaction, tier=200)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message("Boost selection cancelled.", ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Cancel")
+        await interaction.response.edit_message(
+            content="Boost selection cancelled.", view=self
+        )
 
     async def _show_consent(self, interaction: discord.Interaction, tier: int) -> None:
         rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
         sp_value = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
 
         consent_view = ShieldConsentView(self.player_id, self.season_id, tier, rupees, sp_value)
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             f"**Confirm before you proceed — ₹{rupees} Boost**\n\n"
             "Here's exactly what happens:\n"
             f"• You're requesting a **7-day ({config.SHIELD_DURATION_HOURS} hour) shield**, "
@@ -365,7 +431,9 @@ class ShieldBoostTierView(discord.ui.View):
             f"and intend to proceed to <#{config.SUPPORT_CHANNEL_ID}> to arrange payment.",
             view=consent_view,
             ephemeral=True,
+            wait=True,
         )
+        consent_view.message = msg
 
 
 class ShieldConsentView(discord.ui.View):
@@ -379,11 +447,21 @@ class ShieldConsentView(discord.ui.View):
         self.tier = tier
         self.rupees = rupees
         self.sp_value = sp_value
+        self.message: discord.WebhookMessage | discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        _freeze_view(self)
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="I Agree — Go to #support", style=discord.ButtonStyle.danger, emoji="✅")
     async def agree(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="I Agree — Go to #support")
+        await interaction.response.edit_message(view=self)
 
         tier_label = f"boost_{self.tier}"
         try:
@@ -421,8 +499,11 @@ class ShieldConsentView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message("Boost consent cancelled — nothing was recorded.", ephemeral=True)
         self.stop()
+        _freeze_view(self, picked_label="Cancel")
+        await interaction.response.edit_message(
+            content="Boost consent cancelled — nothing was recorded.", view=self
+        )
 
 
 class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],

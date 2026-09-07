@@ -511,7 +511,7 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         title=f"Match {match['match_id']} — Verification",
         description=(
             "Review the round against your own screenshot. Only the Match Host can approve. "
-            "**MMR values are proposed** — nothing is applied until Approve is clicked."
+            "**MMR and SP values are proposed** — nothing is applied until Approve is clicked."
         ),
         color=discord.Color.gold(),
     )
@@ -560,12 +560,36 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             f"Team B\n```\n{chr(10).join(team_lines.get('B', [])) or '(no readable rows)'}\n```"
 
     mmr_line = ""
+    sp_line = ""
     if results:
         team_a_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
             (r for r in results if r["team"] == "A"), key=lambda r: r["position"]))
         team_b_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
             (r for r in results if r["team"] == "B"), key=lambda r: r["position"]))
         mmr_line = f"\n*MMR (proposed): A {team_a_deltas}  ·  B {team_b_deltas}*"
+
+        # SP (Season Points) preview — same fixed rule as
+        # update_season_points_for_match() in migration_029: win/loss
+        # derived from mmr_delta with the MVP bonus stripped first
+        # (the same signal recompute_player_career_stats trusts), no
+        # per-player breakdown since every winner gets the same +5 and
+        # every loser gets the same -3 (no MVP bonus on points) — a
+        # single team-level number is the whole story, unlike MMR
+        # which varies per position. This is a preview only, same as
+        # MMR (proposed) above — nothing is written until Approve.
+        def _team_won(team_results: list[dict]) -> bool:
+            # Majority of a team's rows will agree on win/loss (they're
+            # on the same side), just check the first row's signal.
+            r0 = team_results[0]
+            base_delta = r0["mmr_delta"] - (5 if r0.get("is_mvp") else 0)
+            return base_delta > 0
+
+        team_a_results = [r for r in results if r["team"] == "A" and not r.get("afk")]
+        team_b_results = [r for r in results if r["team"] == "B" and not r.get("afk")]
+        if team_a_results and team_b_results:
+            a_sp = "+5" if _team_won(team_a_results) else "-3"
+            b_sp = "+5" if _team_won(team_b_results) else "-3"
+            sp_line = f"\n*SP (proposed): A {a_sp}  ·  B {b_sp}*"
 
     # Mentions don't render inside code fences (where the "(AFK — left
     # match)" placeholder line above lives), so the actual @mention is
@@ -579,7 +603,7 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
     final_score = extraction.get("final_score") or "—"
     embed.add_field(
         name=f"{map_name} ({final_score})",
-        value=block + mmr_line + afk_line,
+        value=block + mmr_line + sp_line + afk_line,
         inline=False,
     )
     return embed

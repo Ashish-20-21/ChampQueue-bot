@@ -1651,7 +1651,8 @@ class Match(commands.Cog):
         if text_channel:
             try:
                 await text_channel.send(
-                    "🏆 **GG — result's locked in.** MMR is updated, this channel closes in about an hour. "
+                    "🏆 **GG — result's locked in.** MMR and Season Points (SP) are updated, "
+                    "this channel closes in about an hour. "
                     "Head back to the queue whenever you're ready for the next one."
                 )
             except discord.HTTPException:
@@ -1702,20 +1703,23 @@ class Match(commands.Cog):
 
         # ── Season Points (migration_029) ──
         # Points are already committed inside approve_match's SQL
-        # transaction (same commit as MMR). This Python-side code
-        # only handles the Discord-visible side effects: posting the
-        # point change summary to the match channel, and checking if
-        # the season just ended. A failure here never rolls back the
-        # already-committed points — same resilience pattern as the
-        # career-stats recompute above.
+        # transaction (same commit as MMR). The per-player point
+        # summary is no longer posted separately here — it now lives
+        # as an "SP (proposed)" line on the pre-approval verification
+        # card itself (utils/embeds.py's verification_card), same
+        # place the "MMR (proposed)" line already was, so the host
+        # sees it before approving rather than as an extra card after.
+        # This block now only handles the season-end check — did this
+        # match just push someone over the 2500 threshold. A failure
+        # here never rolls back the already-committed points — same
+        # resilience pattern as the career-stats recompute above.
         try:
-            from cogs.points import post_points_update_to_match_channel, check_and_announce_season_end
-            await post_points_update_to_match_channel(self.bot, match, match_players)
             if match.get("season_id"):
+                from cogs.points import check_and_announce_season_end
                 await check_and_announce_season_end(self.bot, match["season_id"])
         except Exception as exc:
             logger.exception(
-                "Season points post-approval notification failed for match_id=%s (points already committed, this is cosmetic only)",
+                "Season-end check failed for match_id=%s (points already committed, this is cosmetic only)",
                 match_id, exc_info=exc,
             )
 

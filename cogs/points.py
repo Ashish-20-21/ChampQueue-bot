@@ -2,14 +2,20 @@
 
 This cog owns:
   - The persistent Shield Channel panel (buy-with-points self-serve button)
-  - The Points Leaderboard channel (persistent message + reload button)
+  - The Points Leaderboard channel (persistent message + reload button,
+    per-user 60s cooldown same as the region leaderboard)
   - The HOD approval card for cash-path shield grants (Confirm/Reject)
-  - Post-approval points notification in the match text channel
+  - Season-end lock/announcement check, called from match.py after approval
 
 It does NOT own:
   - /admin-grant-shield (lives in admin.py)
   - /admin-recompute-points (lives in admin.py)
   - The approve_match() points hook (that's SQL-level, inside the RPC)
+  - Per-match point-change display — that's now the "SP (proposed)" line
+    on the pre-approval verification card (utils/embeds.py), not a
+    separate post here. There used to be a standalone post-approval
+    summary; removed since two point-related messages in one channel
+    (verification card + a second points card) was one too many.
 """
 
 from __future__ import annotations
@@ -274,7 +280,16 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
                                      template=r"points_lb:reload"):
     """Persistent reload button for the points leaderboard. No
     per-instance parameters, same reconstruction pattern as
-    ShieldPurchaseButton above."""
+    ShieldPurchaseButton above.
+
+    Rate-limited per-user via the same CooldownMapping primitive
+    LeaderboardView (cogs/stats.py) already uses for the region
+    leaderboard — same reasoning: Discord/discord.py already has a
+    correct rate limiter, no need to hand-roll a DB-tracked one."""
+
+    _cooldown = commands.CooldownMapping.from_cooldown(
+        1, config.POINTS_LEADERBOARD_COOLDOWN_SECONDS, commands.BucketType.user
+    )
 
     def __init__(self) -> None:
         super().__init__(discord.ui.Button(
@@ -290,8 +305,21 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls()
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        # Rate limit — per-user cooldown
-        # (simple in-memory check; resets on bot restart, acceptable)
+        # commands.CooldownMapping expects something message-shaped
+        # (reads .author.id for BucketType.user) — a raw Interaction
+        # has .user, not .author. Same shim LeaderboardView.reload_callback
+        # already uses in cogs/stats.py.
+        class _Ctx:
+            author = interaction.user
+        bucket = PointsLeaderboardReloadButton._cooldown.get_bucket(_Ctx())
+        retry_after = bucket.update_rate_limit()
+        if retry_after:
+            await interaction.response.send_message(
+                f"Leaderboard was just reloaded — try again in {retry_after:.0f}s.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer()
 
         season = await adb.get_active_season()
@@ -475,57 +503,6 @@ class PointsCog(commands.Cog):
 # ======================================================================
 # MODULE-LEVEL HELPERS (used by other cogs too)
 # ======================================================================
-
-async def post_points_update_to_match_channel(
-    bot: commands.Bot,
-    match: dict,
-    match_players: list[dict],
-) -> None:
-    """Called from match.py's _do_approve after MMR commit.
-    Posts a summary of point changes to the match text channel."""
-    season_id = match.get("season_id")
-    if not season_id:
-        return
-
-    locked = await adb.is_season_points_locked(season_id)
-    if locked:
-        return  # points were already frozen before this match
-
-    events = await adb.get_season_point_events_for_match(match["id"])
-    if not events:
-        return
-
-    # Build a quick summary
-    lines = []
-    for ev in events:
-        # Find the player's IGN from match_players
-        mp = next((m for m in match_players if m["player_id"] == ev["player_id"]), None)
-        if not mp:
-            continue
-        ign = mp.get("players", {}).get("ign", "???") if isinstance(mp.get("players"), dict) else "???"
-        delta = ev["delta"]
-        shield_tag = " 🛡️" if ev.get("was_shielded") else ""
-        sign = "+" if delta >= 0 else ""
-        lines.append(f"  {ign}: **{sign}{delta}** pts{shield_tag}")
-
-    if not lines:
-        return
-
-    text_channel_id = match.get("text_channel_id")
-    if not text_channel_id:
-        return
-
-    ch = bot.get_channel(int(text_channel_id))
-    if not ch:
-        return
-
-    try:
-        await ch.send(
-            "📊 **Season Points:**\n" + "\n".join(lines)
-        )
-    except discord.HTTPException:
-        pass
-
 
 async def check_and_announce_season_end(
     bot: commands.Bot,

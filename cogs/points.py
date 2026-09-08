@@ -74,7 +74,20 @@ def _points_leaderboard_embed(rows: list[dict], season_name: str, is_locked: boo
     lines = []
     for row in rows[:config.POINTS_LEADERBOARD_PAGE_SIZE]:
         rank = row["rank"]
-        medal = medals.get(rank, f"`{rank:>2}.`")
+        # Rank prefix removed for non-medal rows (2026-09): only 🥇🥈🥉
+        # mark position now, ranks 4+ just list in order with no
+        # `NN.` prefix — saves ~4-5 chars/row (backticks + padding +
+        # digits + period) across up to 50 rows in the embed
+        # description.
+        #
+        # <@discord_id> mention also dropped (2026-09): IGN alone is
+        # the clean/readable label — the mention added @username noise
+        # without adding info most viewers needed. discord_id is still
+        # pulled from the row (kept in the loop, just unused in the
+        # line below) in case a future need reintroduces it — cheap to
+        # keep the variable, no reason to touch the RPC/row shape for
+        # a display-only change.
+        medal = medals.get(rank, "")
         ign = row["ign"]
         pts = row["points"]
         discord_id = row["discord_id"]
@@ -83,7 +96,8 @@ def _points_leaderboard_embed(rows: list[dict], season_name: str, is_locked: boo
         if is_locked and row.get("payout_rupees"):
             prize_tag = f" — **₹{row['payout_rupees']}**"
 
-        lines.append(f"{medal} **{ign}** (<@{discord_id}>) — **{pts}** pts{prize_tag}")
+        prefix = f"{medal} " if medal else ""
+        lines.append(f"{prefix}**{ign}** — **{pts}** pts{prize_tag}")
 
     status = "🔒 **SEASON LOCKED** — prize positions final" if is_locked else "🟢 Season active"
 

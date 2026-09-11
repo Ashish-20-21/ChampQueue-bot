@@ -1158,7 +1158,17 @@ class Queue(commands.Cog):
         matches table, not in a coroutine's memory. See DECISIONS.md."""
         now_iso = discord.utils.utcnow().isoformat()
         try:
-            due = await adb.get_due_cleanups(now_iso)
+            # with_retry (2026-09-11): was a bare adb call — a single
+            # transient network blip (RemoteProtocolError,
+            # ReadError, etc.) skipped this ENTIRE sweep cycle rather
+            # than just retrying the one call, unlike every other DB
+            # call site in this file. Confirmed live 4 times (Sept
+            # 3-7) via MATCH_APPROVAL_SWEEP_FAIL's sibling category on
+            # this exact call. Low real-world impact (next sweep runs
+            # CLEANUP_SWEEP_INTERVAL_MINUTES later and catches the same
+            # due matches), but free to fix — with_retry is already
+            # imported and used everywhere else in this file.
+            due = await with_retry(adb.get_due_cleanups, now_iso)
         except Exception:
             logger.exception("cleanup_sweep: get_due_cleanups failed")
             return

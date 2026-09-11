@@ -1785,7 +1785,14 @@ class Match(commands.Cog):
         cost doesn't scale with concurrent match count."""
         now_iso = discord.utils.utcnow().isoformat()
         try:
-            overdue = await adb.get_overdue_pending_matches(now_iso)
+            # with_retry (2026-09-11): was a bare adb call — a single
+            # transient network blip skipped this ENTIRE sweep cycle
+            # instead of just retrying the one call, unlike every other
+            # DB call site in this file. Confirmed live 5 times (Sept
+            # 3-7) as MATCH_APPROVAL_SWEEP_FAIL. Low real-world impact
+            # (next sweep runs APPROVAL_SWEEP_INTERVAL_SECONDS later
+            # and catches the same overdue matches), but free to fix.
+            overdue = await with_retry(adb.get_overdue_pending_matches, now_iso)
         except Exception as exc:
             logger.exception("approval_sweep: get_overdue_pending_matches failed")
             await incident_log.post(

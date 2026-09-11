@@ -208,6 +208,58 @@ class Admin(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(name="admin-adjust-sp", description="[Admin] Manually adjust a player's Season Points (disciplinary or correction)")
+    @app_commands.describe(
+        user="The player to adjust",
+        delta="Points to add or subtract — negative for a penalty, positive for a correction/bonus",
+        reason="Why (required — this is logged and shown to other admins later)",
+        season_id="Optional — adjust a specific past season instead of whichever is currently active",
+    )
+    @admin_only()
+    async def adjust_sp(self, interaction: discord.Interaction, user: discord.Member, delta: int,
+                         reason: str, season_id: int | None = None):
+        player = await adb.get_player_by_discord_id(user.id)
+        if not player:
+            await interaction.response.send_message("Player not found.", ephemeral=True)
+            return
+
+        if season_id is None:
+            season = await adb.get_active_season()
+            if not season:
+                await interaction.response.send_message("No active season, and no `season_id` given.", ephemeral=True)
+                return
+            season_id = season["id"]
+
+        try:
+            updated = await with_retry(
+                adb.apply_sp_adjustment, player["id"], season_id, delta, reason, str(interaction.user.id)
+            )
+        except Exception as exc:
+            # apply_sp_adjustment raises (SQL `raise exception`) if the
+            # season's points are already locked — same guard
+            # update_season_points_for_match applies to match-driven
+            # point changes. Surface that plainly instead of a raw
+            # postgrest traceback.
+            msg = str(exc)
+            if "locked" in msg.lower():
+                await interaction.response.send_message(
+                    f"Season `{season_id}` points are locked — prize positions are final, can't adjust.",
+                    ephemeral=True,
+                )
+                return
+            logger.exception("adjust_sp: apply_sp_adjustment failed for player_id=%s season_id=%s", player["id"], season_id)
+            await interaction.response.send_message(
+                "Something went wrong applying that adjustment. Nothing was changed — check logs.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"**{player['ign']}** Season Points now **{updated['points']}** ({'+' if delta >= 0 else ''}{delta}, reason: {reason}) "
+            f"— logged, run by {interaction.user.mention}.",
+            ephemeral=True,
+        )
+
     # /admin-ign-change — COMMENTED OUT (2026-08-15). Replaced by
     # /ign-change below which is shared between admins and players
     # (admins unlimited, players rate-limited to 2/week). The old
@@ -1158,6 +1210,7 @@ class Admin(commands.Cog):
     @force_approve.error
     @adjust_reputation.error
     @adjust_mmr.error
+    @adjust_sp.error
     @ign_change.error
     @scrap_match.error
     @reset_match.error

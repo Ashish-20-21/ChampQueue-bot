@@ -526,7 +526,20 @@ class Database:
         row with match_id=null (mirrors update_season_points_for_match's
         write shape) so it survives any future recompute. Raises if the
         season's points are already locked — same guard match-driven
-        point changes respect. See migration_035_sp_adjustment.sql."""
+        point changes respect. See migration_035_sp_adjustment.sql.
+
+        The RPC's RETURNS TABLE columns are named out_player_id/
+        out_season_id/out_points, not player_id/season_id/points —
+        deliberately renamed in SQL to dodge a PL/pgSQL "column
+        reference season_id is ambiguous" error (confirmed live
+        2026-09-11, code 42702) against the function's own output
+        column of that name. RETURN QUERY maps its SELECT list to the
+        output columns POSITIONALLY, not by alias, so the SQL side
+        can't rename its way back to friendly keys internally — this
+        translation has to happen here instead, so every caller
+        (adjust_sp in admin.py, and anything else added later) can
+        keep reading ['player_id']/['season_id']/['points'] without
+        needing to know this SQL-layer detail exists."""
         res = self.client.rpc("apply_sp_adjustment", {
             "p_player_id": player_id,
             "p_season_id": season_id,
@@ -534,7 +547,14 @@ class Database:
             "p_reason": reason,
             "p_adjusted_by": str(adjusted_by),
         }).execute()
-        return res.data[0] if res.data else None
+        if not res.data:
+            return None
+        row = res.data[0]
+        return {
+            "player_id": row["out_player_id"],
+            "season_id": row["out_season_id"],
+            "points": row["out_points"],
+        }
 
     def get_sp_adjustment_log(self, player_id: int, season_id: int | None = None,
                                limit: int = 10) -> list[dict]:

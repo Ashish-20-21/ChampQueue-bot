@@ -1246,3 +1246,28 @@ Database.create_shield_consent = _create_shield_consent
 Database.expire_shields = _expire_shields
 Database.get_season_point_events_for_match = _get_season_point_events_for_match
 Database._get_season_points_raw = _get_season_points_raw
+
+
+# ── /cs-stats (2026-09-11) ────────────────────────────────────────
+def _current_season_stats(self: Database, player_id: int, season_id: int) -> Optional[dict]:
+    """Season-scoped equivalent of the player row's all-time stat
+    columns (total_matches/avg_kills/wins/losses/mvp_count/etc) —
+    computed fresh via the current_season_stats() SQL function
+    (migration_034), same pattern as the hof_* calls above (no
+    precomputed table exists for this, unlike season_points). Win/loss
+    uses the mmr_delta-minus-MVP-bonus signal, same as
+    recompute_player_career_stats() — see engineering-rules' MVP-sign-
+    flip trap: a losing team's position-1 MVP scores -3+5=+2, positive
+    despite losing, so win/loss is never inferred from mmr_delta sign
+    alone. Returns None if the player has zero completed matches this
+    season, so callers can show an explicit empty state rather than a
+    card full of zeros."""
+    res = self.client.rpc("current_season_stats", {
+        "p_player_id": player_id, "p_season_id": season_id
+    }).execute()
+    if not res.data or not res.data[0] or res.data[0]["matches"] == 0:
+        return None
+    return res.data[0]
+
+
+Database.current_season_stats = _current_season_stats

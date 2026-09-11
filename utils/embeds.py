@@ -399,6 +399,56 @@ def player_stats_card(player: dict, weekly: dict[str, dict]) -> discord.Embed:
     return embed
 
 
+def cs_stats_card(player: dict, season: dict, season_stats: dict | None) -> discord.Embed:
+    """Current-season equivalent of player_stats_card (added for
+    /cs-stats, 2026-09-11). Same field order/formulas — MVPs, KD, Avg
+    obj time, Avg kills, Total matches, Battles (win %) — but every
+    number comes from adb.current_season_stats() (SQL RPC, migration_034
+    — see database/db.py) instead of the player row's all-time columns.
+    No precomputed per-season stat table exists for these fields (unlike
+    season_points), so this is computed fresh on every call, same as the
+    hof_* Hall of Fame reads.
+
+    peak_mmr is deliberately omitted — it's a lifetime value, not
+    season-scoped, and showing it here would misrepresent it as this
+    season's peak. Region/current-MMR are also left off for the same
+    reason: this card exists specifically to show season-only truth,
+    not a repeat of the all-time card with a different title.
+
+    season_stats is None when the player has zero completed matches this
+    season (see current_season_stats' docstring) — shown as an explicit
+    empty state rather than a card full of zeros, since 0 kills/0
+    matches could otherwise read as a data bug rather than "hasn't
+    played yet"."""
+    season_label = season.get("code") or season.get("name") or "Season"
+    embed = discord.Embed(
+        title=f"{player['ign']} — {season_label} Stats",
+        color=discord.Color.gold(),
+    )
+
+    if not season_stats:
+        embed.description = "*No completed matches yet this season.*"
+        return embed
+
+    def _pair(name1, value1, name2, value2):
+        embed.add_field(name=name1, value=value1, inline=True)
+        embed.add_field(name=name2, value=value2, inline=True)
+
+    deaths = season_stats["total_deaths"] or 0
+    kills = season_stats["total_kills"] or 0
+    kd = round(kills / deaths, 2) if deaths else float(kills)
+    _pair("MVPs", str(season_stats["mvps"]), "KD", f"{kd:.2f}")
+
+    _pair("Avg obj time", f"{season_stats['avg_hill_time']}s", "Avg kills", f"{season_stats['avg_kills']}")
+
+    total = season_stats["matches"]
+    wl_total = season_stats["wins"] + season_stats["losses"]
+    wr = f"{(season_stats['wins'] / wl_total * 100):.1f}%" if wl_total else "—"
+    _pair("Total matches", str(total), "Battles (win %)", f"{season_stats['wins']}W - {season_stats['losses']}L ({wr})")
+
+    return embed
+
+
 def rank_progress_card(player: dict, tier: str) -> discord.Embed:
     """/rank-progress initial card (2026-08, revised after live design
     review). Deliberately does NOT show the full ladder up front — locked

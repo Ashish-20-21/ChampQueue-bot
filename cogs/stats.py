@@ -8,7 +8,7 @@ from database.db import adb
 from services import mmr_engine
 from utils.embeds import (
     player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed,
-    achievements_card, achievements_browse_embed,
+    achievements_card, achievements_browse_embed, cs_stats_card,
 )
 from utils.permissions import admin_only
 
@@ -262,6 +262,27 @@ class Stats(commands.Cog):
         # this card was public before P6 and that was a real gap, not the
         # intended behavior.
         await interaction.response.send_message(embed=player_stats_card(player, weekly), ephemeral=True)
+
+    @app_commands.command(name="cs-stats", description="View your (or another player's) stats for the current season")
+    @app_commands.describe(user="Leave blank to see your own stats, or mention someone else to see theirs")
+    async def cs_stats(self, interaction: discord.Interaction, user: discord.Member | None = None):
+        # Season-scoped sibling of /player-stats (2026-09-11). Same
+        # registered-player guard, same ephemeral visibility. Numbers
+        # come from adb.current_season_stats() (migration_034), computed
+        # fresh — no precomputed per-season stat table for these fields,
+        # unlike season_points. See cs_stats_card's docstring in
+        # utils/embeds.py for the exact field set / what's omitted.
+        target = user or interaction.user
+        player = await adb.get_player_by_discord_id(target.id)
+        if not player:
+            await interaction.response.send_message(f"{target.mention} isn't registered.", ephemeral=True)
+            return
+        season = await adb.get_active_season()
+        if not season:
+            await interaction.response.send_message("No active season right now.", ephemeral=True)
+            return
+        season_stats = await adb.current_season_stats(player["id"], season["id"])
+        await interaction.response.send_message(embed=cs_stats_card(player, season, season_stats), ephemeral=True)
 
     @app_commands.command(name="leaderboard-post", description="Post the persistent unified leaderboard panel")
     @admin_only()

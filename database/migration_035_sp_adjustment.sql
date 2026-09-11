@@ -176,6 +176,23 @@ as $$
 $$;
 
 
+-- ────────────────────────────────────────────────────────────
+-- 5. Grant service_role access to the new table.
+--    Same class of miss as migration_030 already had to fix once
+--    for season_points/point_shields/season_point_events — Supabase's
+--    service_role doesn't automatically get table access on CREATE
+--    TABLE, and this project has hit that gap three times now (018,
+--    029->030, and this one). Caught live 2026-09-11 testing on
+--    ebsleroxzikxxvqblzry: "permission denied for table
+--    sp_adjustment_log" (42501) from apply_sp_adjustment(). Functions
+--    with default (invoker) rights run as whatever role calls them,
+--    so no separate GRANT EXECUTE needed — this is purely the
+--    underlying table grant, same as migration_030's own finding.
+-- ────────────────────────────────────────────────────────────
+grant select, insert, update, delete on public.sp_adjustment_log to service_role;
+grant usage, select on sequence public.sp_adjustment_log_id_seq to service_role;
+
+
 -- Sanity checks (run manually after applying, adjust IDs to real
 -- values from your own DB before running):
 -- select apply_sp_adjustment(121, 2, -10, 'test: AFK penalty', '111111111111111111');

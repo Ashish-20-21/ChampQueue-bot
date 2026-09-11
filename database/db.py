@@ -505,6 +505,47 @@ class Database:
         return res.data
 
     # ------------------------------------------------------------------
+    # SEASON POINTS — ADMIN ADJUSTMENTS (disciplinary, not match-driven)
+    # ------------------------------------------------------------------
+    # NOTE: deliberately NOT a plain table insert + field update like
+    # apply_mmr_adjustment above. Season points, unlike MMR, gets
+    # routinely rebuilt from scratch by recompute_player_season_points()
+    # / recompute_all_season_points() (both sum(delta) purely from
+    # season_point_events) — a manual adjustment written only to a
+    # side audit table would silently vanish the next time anyone runs
+    # /admin-recompute-points. So this goes through the
+    # apply_sp_adjustment() RPC (migration_035), which writes a real
+    # season_point_events row (match_id = null) alongside the audit
+    # log — the adjustment IS part of the same sum() recompute already
+    # trusts, not a special case sitting outside it.
+    def apply_sp_adjustment(self, player_id: int, season_id: int, delta: int,
+                             reason: str, adjusted_by: str) -> dict:
+        """Admin-issued Season Points change (e.g. disciplinary penalty
+        or a manual correction) — logged in sp_adjustment_log (who/why,
+        mirrors mmr_adjustment_log) AND written as a season_point_events
+        row with match_id=null (mirrors update_season_points_for_match's
+        write shape) so it survives any future recompute. Raises if the
+        season's points are already locked — same guard match-driven
+        point changes respect. See migration_035_sp_adjustment.sql."""
+        res = self.client.rpc("apply_sp_adjustment", {
+            "p_player_id": player_id,
+            "p_season_id": season_id,
+            "p_delta": delta,
+            "p_reason": reason,
+            "p_adjusted_by": str(adjusted_by),
+        }).execute()
+        return res.data[0] if res.data else None
+
+    def get_sp_adjustment_log(self, player_id: int, season_id: int | None = None,
+                               limit: int = 10) -> list[dict]:
+        res = self.client.rpc("get_sp_adjustment_log", {
+            "p_player_id": player_id,
+            "p_season_id": season_id,
+            "p_limit": limit,
+        }).execute()
+        return res.data
+
+    # ------------------------------------------------------------------
     # MATCH ABANDONMENT / CLEANUP SWEEP
     # ------------------------------------------------------------------
     def mark_match_abandoned(self, match_id: int, cleanup_at: str) -> dict:

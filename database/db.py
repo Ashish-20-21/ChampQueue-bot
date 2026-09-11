@@ -44,6 +44,27 @@ _RETRYABLE_EXCEPTIONS = (
     # to retry. See incident note comparing this to CQ-8758 (2026-08-16
     # session) for why these are two distinct bugs, not one.
     httpx.ReadError,
+    # 2026-09-11: same broken-pipe/reset-by-peer transport flake as
+    # ReadError above, but on the write side — httpx.WriteError.
+    # Confirmed live hitting recompute_player_career_stats's concurrent
+    # asyncio.gather burst (one write per player, 5-10 at once per
+    # match) as "Connection reset by peer" on match_id=598 and again on
+    # match_id=612. WriteError was never in this tuple, so every
+    # occurrence fell straight through on attempt 1/3 — zero retries
+    # ever ran — and landed in MATCH_STAT_RECOMPUTE_FAIL looking like
+    # exhausted retries when none were attempted. Confirmed via
+    # httpx's exception hierarchy that WriteError is a sibling of
+    # ReadError under NetworkError, not a subclass of anything already
+    # listed here — this was a genuine gap, not redundant.
+    #
+    # NOTE: httpx.WriteTimeout and httpx.CloseError sit in the exact
+    # same sibling position (NetworkError / TimeoutException family)
+    # and have the identical uncovered gap. Not added here since
+    # neither has a confirmed live occurrence yet, matching this
+    # project's established pattern of adding entries only against a
+    # real incident (see every comment above) — but worth watching for
+    # in future MATCH_STAT_RECOMPUTE_FAIL reports.
+    httpx.WriteError,
 )
 
 

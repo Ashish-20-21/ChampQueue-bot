@@ -1782,20 +1782,27 @@ class Match(commands.Cog):
         # card itself (utils/embeds.py's verification_card), same
         # place the "MMR (proposed)" line already was, so the host
         # sees it before approving rather than as an extra card after.
-        # This block now only handles the season's lazy checks
+        # This block only handles the season's lazy checks
         # (migration_036) — did this match just cross the 2000 SP
         # pool-unlock threshold, or push the season past its deadline.
-        # A failure here never rolls back the already-committed
-        # points — same resilience pattern as the career-stats
-        # recompute above.
-        try:
-            if match.get("season_id"):
-                from cogs.points import run_season_lazy_checks
-                await run_season_lazy_checks(self.bot, match["season_id"])
-        except Exception as exc:
-            logger.exception(
-                "Season-end check failed for match_id=%s (points already committed, this is cosmetic only)",
-                match_id, exc_info=exc,
+        #
+        # Fired via spawn_background, NOT awaited — confirmed live
+        # 2026-09-16 that awaiting this added ~400ms+ to every single
+        # Approve click (3 sequential DB round trips at ~140ms each)
+        # for a check whose own result is purely cosmetic to this
+        # function: it never affects whether the match approval itself
+        # succeeded, which has already fully committed by this point.
+        # If the bot restarts mid-check, nothing is lost beyond a
+        # delay — the very next match approval or leaderboard reload
+        # re-runs this same lazy check and catches it up. See
+        # spawn_background's docstring (cogs/points.py) for the full
+        # reasoning and the asyncio pitfalls it specifically guards
+        # against.
+        if match.get("season_id"):
+            from cogs.points import run_season_lazy_checks, spawn_background
+            spawn_background(
+                run_season_lazy_checks(self.bot, match["season_id"]),
+                error_label=f"run_season_lazy_checks for match_id={match_id}",
             )
 
         await self._run_post_approval_cleanup(guild, match)

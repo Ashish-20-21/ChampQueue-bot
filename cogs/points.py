@@ -43,18 +43,24 @@ logger = logging.getLogger("champions_queue")
 
 def _shield_info_embed() -> discord.Embed:
     """The informational embed shown in the shield channel."""
+    t = config.SHIELD_TIERS
     em = discord.Embed(
         title="⚡ Shield Station",
         description=(
             "Think you're climbing fast? Protect your grind.\n\n"
-            "A **Shield** blocks the **-3 SP penalty** on losses for a full **7 days**. "
-            "Wins still give you the normal **+5 SP**. Your MMR stays completely untouched — "
-            "this is a Season Points play only.\n\n"
+            "A **Shield** blocks the **-3 SP penalty** on losses — and boosts your win rate too. "
+            "Your MMR stays completely untouched — this is a Season Points play only.\n\n"
+            f"🛡️ **{t['normal']['label']}** — {t['normal']['duration_hours']}h · "
+            f"+{t['normal']['win_sp']} SP/win · 0 SP on loss\n"
+            f"🛡️🛡️ **{t['2x_normal']['label']}** — {t['2x_normal']['duration_hours']}h · "
+            f"same protection, bundle price\n"
+            f"🛡️✨ **{t['premium']['label']}** — {t['premium']['duration_hours']}h · "
+            f"+{t['premium']['day1_win_sp']} SP/win on day 1, then +{t['premium']['win_sp']}\n\n"
             "**One active shield at a time. Once purchased, it's final — no refunds, no reversals.**"
         ),
         color=0x5865F2,
     )
-    em.set_footer(text="Shield activates the moment it's confirmed • 7 days, no exceptions")
+    em.set_footer(text="Shield activates the moment it's confirmed • protection length depends on tier")
     return em
 
 
@@ -114,16 +120,21 @@ def _shield_hod_approval_embed(shield: dict, player_ign: str, player_discord_id:
                                 admin_discord_id: str) -> discord.Embed:
     """The HOD confirmation card for a cash-path shield grant."""
     rupees = shield.get("cost_rupees") or "?"
+    tier = shield.get("tier")
+    tier_cfg = config.SHIELD_TIERS.get(tier, {})
+    tier_label = tier_cfg.get("label", tier or "?")
+    duration_hours = tier_cfg.get("duration_hours")
+    duration_txt = f"{duration_hours}-hour ({duration_hours // 24}-day)" if duration_hours else "?"
     em = discord.Embed(
         title="🛡️ Shield Grant — Awaiting HOD Confirmation",
         description=(
             f"**Player:** {player_ign} (<@{player_discord_id}>)\n"
+            f"**Tier:** {tier_label}\n"
             f"**Payment:** ₹{rupees} (cash)\n"
             f"**Initiated by:** <@{admin_discord_id}>\n"
             f"**Shield ID:** `{shield['id']}`\n\n"
             "Confirm that payment has been verified. The shield activates "
-            f"the moment you click **Confirm** — the {config.SHIELD_DURATION_HOURS}-hour "
-            f"({config.SHIELD_DURATION_HOURS // 24}-day) window starts then."
+            f"the moment you click **Confirm** — the {duration_txt} window starts then."
         ),
         color=0xFFA500,
     )
@@ -131,22 +142,52 @@ def _shield_hod_approval_embed(shield: dict, player_ign: str, player_discord_id:
     return em
 
 
-def _season_end_embed(winner_ign: str, winner_discord_id: str, winner_points: int,
-                       second: dict | None, third: dict | None,
-                       season_name: str) -> discord.Embed:
-    """The announcement embed when someone crosses 3500."""
-    desc = (
-        f"🏆 **{winner_ign}** (<@{winner_discord_id}>) has crossed "
-        f"**{config.SEASON_END_THRESHOLD}** SP with **{winner_points}** points "
-        f"and is declared the **Conqueror of {season_name}**!\n\n"
-        f"🥇 **1st Place:** {winner_ign} — **₹{config.PRIZE_1ST}**\n"
+def _pool_unlocked_embed(season_name: str) -> discord.Embed:
+    """Fired once, the first time any player crosses
+    SEASON_POOL_UNLOCK_THRESHOLD this season — an awareness ping, not
+    an end-of-season announcement. The race for 1st/2nd/3rd keeps
+    going until the deadline."""
+    em = discord.Embed(
+        title="🏆 Pool Unlocked!",
+        description=(
+            f"A player has crossed **{config.SEASON_POOL_UNLOCK_THRESHOLD} SP** in **{season_name}** — "
+            f"the full **₹{config.PRIZE_1ST + config.PRIZE_2ND + config.PRIZE_3RD}** prize pool is now "
+            "locked in and will be paid out in full.\n\n"
+            "**The season isn't over.** Whoever holds 1st/2nd/3rd place at the end still wins those spots — "
+            "the race is very much still on."
+        ),
+        color=0xFFD700,
     )
+    return em
+
+
+def _season_end_embed(rows: list[dict], season_name: str, pool_unlocked: bool) -> discord.Embed:
+    """The announcement embed when the season locks at its deadline.
+
+    No single "winner crossed a threshold" framing anymore — the
+    season ends on the date, and whoever holds rank 1/2/3 at that
+    moment gets paid, using whichever formula pool_unlocked selects."""
+    winner = next((r for r in rows if r.get("locked_rank") == 1), None)
+    second = next((r for r in rows if r.get("locked_rank") == 2), None)
+    third = next((r for r in rows if r.get("locked_rank") == 3), None)
+
+    if pool_unlocked:
+        formula_note = "Pool was unlocked this season — payouts are the fixed ₹700/₹500/₹300 by final rank."
+    else:
+        formula_note = (
+            f"Pool was never unlocked (nobody reached {config.SEASON_POOL_UNLOCK_THRESHOLD} SP) — "
+            f"payouts are SP÷{config.POINTS_TO_RUPEE} for each of the top 3, uncapped."
+        )
+
+    desc = f"**{season_name}** has reached its end date. Final standings are locked.\n\n"
+    if winner:
+        desc += f"🥇 **1st Place:** {winner['ign']} — **₹{winner.get('payout_rupees', 0)}** ({winner['points']} SP)\n"
     if second:
         desc += f"🥈 **2nd Place:** {second['ign']} — **₹{second.get('payout_rupees', 0)}** ({second['points']} SP)\n"
     if third:
         desc += f"🥉 **3rd Place:** {third['ign']} — **₹{third.get('payout_rupees', 0)}** ({third['points']} SP)\n"
 
-    desc += "\n**All Season Points are now frozen.** MMR and matchmaking continue as normal."
+    desc += f"\n{formula_note}\n\n**All Season Points are now frozen.** MMR and matchmaking continue as normal."
 
     em = discord.Embed(
         title=f"🏆 Season Ended — {season_name}",
@@ -210,13 +251,19 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
         sp = await adb.get_season_points(player["id"], season_id)
         current_points = sp["points"] if sp else 0
 
+        normal_cost = config.SHIELD_TIERS["normal"]["credits_cost"]
+        normal_r = config.SHIELD_TIERS["normal"]["boost_rupees"]
+        twox_r = config.SHIELD_TIERS["2x_normal"]["boost_rupees"]
+        premium_r = config.SHIELD_TIERS["premium"]["boost_rupees"]
+
         menu_view = ShieldMenuView(player["id"], season_id, current_points)
         msg = await interaction.followup.send(
             "**⚡ How do you want to get your shield?**\n\n"
-            f"🎯 **Use Credits** — costs **{config.SHIELD_COST_POINTS} SP** from your balance "
+            f"🎯 **Use Credits** — Normal Shield only, costs **{normal_cost} SP** from your balance "
             f"(you have **{current_points}** SP)\n"
-            "💰 **Boost** — pay with cash (₹100 or ₹200) for a paid shield\n\n"
-            f"Both give you **{config.SHIELD_DURATION_HOURS // 24} days** of loss protection.",
+            f"💰 **Boost** — pay with cash for any shield tier: "
+            f"₹{normal_r} Normal · ₹{twox_r} 2x Normal · ₹{premium_r} Premium\n\n"
+            "Protection and perks vary by shield — pick Boost to see the breakdown.",
             view=menu_view,
             ephemeral=True,
             wait=True,
@@ -279,21 +326,27 @@ class ShieldMenuView(discord.ui.View):
         _freeze_view(self, picked_label="Use Credits")
         await interaction.response.edit_message(view=self)
 
-        if self.current_points < config.SHIELD_COST_POINTS:
+        # Use Credits is Normal-Shield-only — 2x_normal and premium
+        # have no credits_cost in config.SHIELD_TIERS, Boost-only.
+        cost = config.SHIELD_TIERS["normal"]["credits_cost"]
+
+        if self.current_points < cost:
             await interaction.followup.send(
-                f"You have **{self.current_points} SP** but need **{config.SHIELD_COST_POINTS}**.\n\n"
-                "You can get a shield through a **Boost** instead — click the shield button again "
-                "and choose **Boost** to see the cash options.",
+                f"You have **{self.current_points} SP** but need **{cost}**.\n\n"
+                "You can still get a Normal Shield through **Boost** instead — click the shield button "
+                "again and choose **Boost** for the cash options.",
                 ephemeral=True,
             )
             return
 
         confirm_view = ShieldCreditsConfirmView(self.player_id, self.season_id, self.current_points)
+        duration_hours = config.SHIELD_TIERS["normal"]["duration_hours"]
         msg = await interaction.followup.send(
             "**⚠️ Confirm credit purchase — this is irreversible**\n\n"
-            f"This will deduct **{config.SHIELD_COST_POINTS} SP** from your balance "
-            f"(**{self.current_points}** → **{self.current_points - config.SHIELD_COST_POINTS}** SP).\n"
-            f"Your shield will be active for **{config.SHIELD_DURATION_HOURS // 24} days** starting now.\n\n"
+            f"This will deduct **{cost} SP** from your balance "
+            f"(**{self.current_points}** → **{self.current_points - cost}** SP) for a **Normal Shield**.\n"
+            f"Your shield will be active for **{duration_hours} hours** starting now — "
+            f"**+{config.SHIELD_TIERS['normal']['win_sp']} SP** per win, **0 SP** on any loss.\n\n"
             "Once purchased, this cannot be undone, refunded, or reversed. "
             "No exceptions will be made for credit-based purchases.",
             view=confirm_view,
@@ -308,12 +361,18 @@ class ShieldMenuView(discord.ui.View):
         _freeze_view(self, picked_label="Boost")
         await interaction.response.edit_message(view=self)
 
+        t = config.SHIELD_TIERS
         tier_view = ShieldBoostTierView(self.player_id, self.season_id)
         msg = await interaction.followup.send(
             "**⚡ Boost Your Season Points**\n\n"
-            "A Boost is a paid Shield — **7 days** of protection where your losses cost you nothing.\n\n"
-            f"**₹{config.SHIELD_BOOST_100_RUPEES} Boost** — {config.SHIELD_BOOST_100_POINTS} SP value\n"
-            f"**₹{config.SHIELD_BOOST_200_RUPEES} Boost** — {config.SHIELD_BOOST_200_POINTS} SP value\n\n"
+            "A Boost is a paid Shield.\n\n"
+            f"**₹{t['normal']['boost_rupees']} — Normal Shield:** {t['normal']['duration_hours']}h. "
+            f"+{t['normal']['win_sp']} SP on every win, 0 lost on any loss.\n"
+            f"**₹{t['2x_normal']['boost_rupees']} — 2x Normal Shield:** {t['2x_normal']['duration_hours']}h "
+            "of the same protection, discounted vs. buying two Normal Shields.\n"
+            f"**₹{t['premium']['boost_rupees']} — Premium Shield:** Day 1 wins pay "
+            f"+{t['premium']['day1_win_sp']} SP. Days 2–3 continue at +{t['premium']['win_sp']} SP per win, "
+            "0 on loss.\n\n"
             "Payment is handled by an admin after you raise a ticket — "
             "nothing is charged automatically. You'll confirm exactly what you're agreeing to on the next screen.",
             view=tier_view,
@@ -355,14 +414,21 @@ class ShieldCreditsConfirmView(discord.ui.View):
         _freeze_view(self, picked_label="Confirm Purchase")
         await interaction.response.edit_message(view=self)
 
+        cost = config.SHIELD_TIERS["normal"]["credits_cost"]
         try:
             shield = await with_retry(
                 adb.create_shield_points_path,
-                self.player_id, self.season_id, config.SHIELD_COST_POINTS
+                self.player_id, self.season_id, "normal"
             )
-        except ValueError:
+        except ValueError as exc:
+            # purchase_shield_with_credits raises for: insufficient
+            # balance (may have changed since this screen opened),
+            # already has an active shield, or season points locked.
+            # db.py's wrapper preserves the original message — show it
+            # directly rather than a generic failure, it's already
+            # written to be player-facing.
             await interaction.followup.send(
-                "Purchase failed — your points balance may have changed. Please try again.",
+                f"Purchase failed: {exc}. Please try again.",
                 ephemeral=True,
             )
             return
@@ -377,9 +443,9 @@ class ShieldCreditsConfirmView(discord.ui.View):
         ends_ts = _iso_to_ts(shield.get("shield_ends_at", ""))
         # Ephemeral confirmation to the buyer only
         await interaction.followup.send(
-            f"🛡️ **Shield activated!** You're protected until <t:{ends_ts}:F> (<t:{ends_ts}:R>).\n"
-            f"Points deducted: **-{config.SHIELD_COST_POINTS} SP** "
-            f"(new balance: **{self.current_points - config.SHIELD_COST_POINTS}** SP).",
+            f"🛡️ **Normal Shield activated!** You're protected until <t:{ends_ts}:F> (<t:{ends_ts}:R>).\n"
+            f"Points deducted: **-{cost} SP** "
+            f"(new balance: **{self.current_points - cost}** SP).",
             ephemeral=True,
         )
 
@@ -387,7 +453,7 @@ class ShieldCreditsConfirmView(discord.ui.View):
         await _post_to_hod_channel(
             interaction.client, self.season_id,
             f"🛡️ **Shield purchased** by <@{interaction.user.id}> "
-            f"(credits path, -{config.SHIELD_COST_POINTS} SP) — "
+            f"(credits path, Normal Shield, -{cost} SP) — "
             f"active until <t:{ends_ts}:F>"
         )
 
@@ -401,7 +467,10 @@ class ShieldCreditsConfirmView(discord.ui.View):
 
 
 class ShieldBoostTierView(discord.ui.View):
-    """₹100 / ₹200 tier selection — leads to the consent screen."""
+    """Normal / 2x Normal / Premium tier selection — leads to the
+    consent screen. All three are cash-only (no credits path) —
+    consistent with config.SHIELD_TIERS, where only 'normal' has a
+    credits_cost."""
 
     def __init__(self, player_id: int, season_id: int) -> None:
         super().__init__(timeout=300)
@@ -417,19 +486,26 @@ class ShieldBoostTierView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-    @discord.ui.button(label="₹100 Boost", style=discord.ButtonStyle.primary)
-    async def tier_100(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="₹30 Normal", style=discord.ButtonStyle.primary)
+    async def tier_normal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        _freeze_view(self, picked_label="₹100 Boost")
+        _freeze_view(self, picked_label="₹30 Normal")
         await interaction.response.edit_message(view=self)
-        await self._show_consent(interaction, tier=100)
+        await self._show_consent(interaction, tier="normal")
 
-    @discord.ui.button(label="₹200 Boost", style=discord.ButtonStyle.primary)
-    async def tier_200(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="₹50 2x Normal", style=discord.ButtonStyle.primary)
+    async def tier_2x(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        _freeze_view(self, picked_label="₹200 Boost")
+        _freeze_view(self, picked_label="₹50 2x Normal")
         await interaction.response.edit_message(view=self)
-        await self._show_consent(interaction, tier=200)
+        await self._show_consent(interaction, tier="2x_normal")
+
+    @discord.ui.button(label="₹60 Premium", style=discord.ButtonStyle.primary)
+    async def tier_premium(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        _freeze_view(self, picked_label="₹60 Premium")
+        await interaction.response.edit_message(view=self)
+        await self._show_consent(interaction, tier="premium")
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -439,33 +515,34 @@ class ShieldBoostTierView(discord.ui.View):
             content="Boost selection cancelled.", view=self
         )
 
-    async def _show_consent(self, interaction: discord.Interaction, tier: int) -> None:
-        rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
-        sp_value = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
+    async def _show_consent(self, interaction: discord.Interaction, tier: str) -> None:
+        tier_cfg = config.SHIELD_TIERS[tier]
+        rupees = tier_cfg["boost_rupees"]
+        duration_hours = tier_cfg["duration_hours"]
 
-        # Tier-specific SP mechanics line — the ₹200 tier's day-1
-        # boost is a genuinely different mechanic from the ₹100 tier's
-        # flat rate, so this isn't just a number swap, the wording
-        # itself needs to differ. Both tiers explicitly state "no
-        # negative SP" since that's the actual value being sold here
-        # and shouldn't be left implicit on a consent screen.
-        if tier == 200:
+        # Tier-specific SP mechanics line — Premium's day-1 rate is a
+        # genuinely different mechanic from Normal/2x's flat rate, so
+        # this isn't just a number swap, the wording itself needs to
+        # differ. All three explicitly state "no negative SP" since
+        # that's the actual value being sold here and shouldn't be
+        # left implicit on a consent screen.
+        if tier == "premium":
             mechanics_line = (
-                "• **Day 1:** every win gives **+50 SP** (10x boost) — losses cost **0 SP**.\n"
-                "• **Days 2–7:** every win gives the normal **+5 SP** — losses still cost **0 SP**.\n"
-                "• **No negative SP at any point during the 7 days.**\n"
+                f"• **Day 1:** every win gives **+{tier_cfg['day1_win_sp']} SP** — losses cost **0 SP**.\n"
+                f"• **Days 2–3:** every win gives **+{tier_cfg['win_sp']} SP** — losses still cost **0 SP**.\n"
+                "• **No negative SP at any point during the 3 days.**\n"
             )
         else:
             mechanics_line = (
-                "• Every win gives the normal **+5 SP**, every day, for all 7 days.\n"
+                f"• Every win gives **+{tier_cfg['win_sp']} SP**, every day, for the full {duration_hours}h.\n"
                 "• **Losses cost 0 SP the entire time — no negative SP at any point.**\n"
             )
 
-        consent_view = ShieldConsentView(self.player_id, self.season_id, tier, rupees, sp_value)
+        consent_view = ShieldConsentView(self.player_id, self.season_id, tier, rupees)
         msg = await interaction.followup.send(
-            f"**Confirm before you proceed — ₹{rupees} Boost**\n\n"
+            f"**Confirm before you proceed — ₹{rupees} {tier_cfg['label']}**\n\n"
             "Here's exactly what happens:\n"
-            f"• You're requesting a **7-day ({config.SHIELD_DURATION_HOURS} hour) shield** for **₹{rupees}**.\n"
+            f"• You're requesting a **{duration_hours}-hour {tier_cfg['label']}** for **₹{rupees}**.\n"
             f"{mechanics_line}"
             f"• Payment is made directly to an admin via <#{config.SUPPORT_CHANNEL_ID}> — "
             "ChampQueue never handles your money.\n"
@@ -485,14 +562,12 @@ class ShieldBoostTierView(discord.ui.View):
 class ShieldConsentView(discord.ui.View):
     """Final consent gate — writes to DB and notifies HOD channel."""
 
-    def __init__(self, player_id: int, season_id: int, tier: int,
-                 rupees: int, sp_value: int) -> None:
+    def __init__(self, player_id: int, season_id: int, tier: str, rupees: int) -> None:
         super().__init__(timeout=300)
         self.player_id = player_id
         self.season_id = season_id
-        self.tier = tier
+        self.tier = tier  # 'normal' / '2x_normal' / 'premium' — stored directly, no prefix needed
         self.rupees = rupees
-        self.sp_value = sp_value
         self.message: discord.WebhookMessage | discord.Message | None = None
 
     async def on_timeout(self) -> None:
@@ -509,11 +584,10 @@ class ShieldConsentView(discord.ui.View):
         _freeze_view(self, picked_label="I Agree — Go to #support")
         await interaction.response.edit_message(view=self)
 
-        tier_label = f"boost_{self.tier}"
         try:
             consent = await with_retry(
                 adb.create_shield_consent,
-                self.player_id, self.season_id, tier_label, self.rupees
+                self.player_id, self.season_id, self.tier, self.rupees
             )
         except Exception:
             logger.exception("Shield consent record failed for player_id=%s", self.player_id)
@@ -533,11 +607,13 @@ class ShieldConsentView(discord.ui.View):
 
         # Post to HOD approval channel — tagging both HOD and admin roles
         role_mentions = _role_mentions(config.HOD_ROLE_IDS, config.ADMIN_ROLE_IDS)
+        tier_label = config.SHIELD_TIERS[self.tier]["label"]
+        duration_hours = config.SHIELD_TIERS[self.tier]["duration_hours"]
 
         await _post_to_hod_channel(
             interaction.client, self.season_id,
             f"🛡️ **New Boost consent** — <@{interaction.user.id}> "
-            f"has agreed to the **₹{self.rupees} Boost** ({self.sp_value} SP, 7-day shield).\n"
+            f"has agreed to the **₹{self.rupees} {tier_label}** ({duration_hours}h shield).\n"
             f"Consent ID: `{consent['id']}` · Awaiting payment via <#{config.SUPPORT_CHANNEL_ID}>.\n\n"
             f"{role_mentions}"
         )
@@ -618,6 +694,17 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
         if not season:
             await interaction.followup.send("No active season.", ephemeral=True)
             return
+
+        # Lazy deadline-lock + pool-unlock check (migration_036) — the
+        # SAME piggyback pattern as expire_shields() above, riding this
+        # already-rate-limited click instead of a scheduled job. Also
+        # runs from match approval (cogs/match.py) — see
+        # run_season_lazy_checks' docstring for why both call sites
+        # exist. Best-effort: a failure here never blocks the render.
+        try:
+            await run_season_lazy_checks(interaction.client, season["id"])
+        except Exception:
+            logger.exception("run_season_lazy_checks failed during leaderboard reload (non-fatal)")
 
         rows = await with_retry(adb.season_points_leaderboard, season["id"])
         locked = await adb.is_season_points_locked(season["id"])
@@ -796,37 +883,89 @@ class PointsCog(commands.Cog):
 # MODULE-LEVEL HELPERS (used by other cogs too)
 # ======================================================================
 
-async def check_and_announce_season_end(
-    bot: commands.Bot,
-    season_id: int,
-) -> None:
-    """Called after points update — checks if the season just locked
-    and announces the results."""
-    locked = await adb.is_season_points_locked(season_id)
-    if not locked:
-        return
+async def run_season_lazy_checks(bot: commands.Bot, season_id: int) -> None:
+    """The lazy-lock/lazy-unlock entry point (migration_036) — called
+    from exactly two places, deliberately: cogs/match.py right after a
+    match is approved, and PointsLeaderboardReloadButton's callback
+    above. No scheduled job exists or is needed; between these two
+    triggers the season locks itself within minutes of its deadline in
+    practice, worst case whenever someone next opens the leaderboard —
+    same "piggyback an already-frequent action" pattern this file
+    already uses for expire_shields().
 
+    Two independent lazy checks live here:
+      1. Pool-unlock — did any player just cross
+         SEASON_POOL_UNLOCK_THRESHOLD? Doesn't end anything, just
+         flips a flag and announces once.
+      2. Deadline lock — has the season's end_date passed? THE only
+         thing that actually freezes points and assigns final ranks.
+
+    Each check's underlying DB function (check_and_unlock_pool /
+    check_and_lock_season_by_deadline) only returns True for the ONE
+    call that actually performed the state change — so under
+    concurrent triggers (a match approval and a leaderboard click
+    landing at the same moment), only one of them proceeds to
+    announce. The mark_*_announced() guards below are a second,
+    independent layer of the same protection, specifically to fix
+    ChampQueue_Audit_2026-09-13.md §6.3 ("season-end announcement
+    repeats on every subsequent match") — that bug existed because the
+    old version of this check had no announced-guard at all and fired
+    on every call once the season was locked, not just the first."""
     season = await adb.get_active_season()
     if not season or season["id"] != season_id:
+        return
+    season_name = season.get("name", "Season")
+
+    # ── 1. Pool-unlock ──
+    try:
+        just_unlocked = await with_retry(adb.check_and_unlock_pool, season_id)
+    except Exception:
+        logger.exception("check_and_unlock_pool failed for season_id=%s", season_id)
+        just_unlocked = False
+
+    if just_unlocked:
+        try:
+            should_announce = await with_retry(adb.mark_pool_unlock_announced, season_id)
+        except Exception:
+            logger.exception("mark_pool_unlock_announced failed for season_id=%s", season_id)
+            should_announce = False
+        if should_announce:
+            em = _pool_unlocked_embed(season_name)
+            if config.SHIELD_CHANNEL_ID:
+                ch = bot.get_channel(config.SHIELD_CHANNEL_ID)
+                if ch:
+                    try:
+                        await ch.send(content="@everyone", embed=em)
+                    except discord.HTTPException:
+                        pass
+
+    # ── 2. Deadline lock ──
+    try:
+        just_locked = await with_retry(adb.check_and_lock_season_by_deadline, season_id)
+    except Exception:
+        logger.exception("check_and_lock_season_by_deadline failed for season_id=%s", season_id)
+        just_locked = False
+
+    if not just_locked:
+        return
+
+    try:
+        should_announce = await with_retry(adb.mark_season_end_announced, season_id)
+    except Exception:
+        logger.exception("mark_season_end_announced failed for season_id=%s", season_id)
+        return
+    if not should_announce:
         return
 
     rows = await with_retry(adb.season_points_leaderboard, season_id)
     if not rows:
         return
-
-    # Find the top 3
     winner = next((r for r in rows if r.get("locked_rank") == 1), None)
-    second = next((r for r in rows if r.get("locked_rank") == 2), None)
-    third = next((r for r in rows if r.get("locked_rank") == 3), None)
-
     if not winner:
         return
 
-    season_name = season.get("name", "Season")
-    em = _season_end_embed(
-        winner["ign"], winner["discord_id"], winner["points"],
-        second, third, season_name,
-    )
+    pool_unlocked = bool(season.get("sp_pool_unlocked"))
+    em = _season_end_embed(rows, season_name, pool_unlocked)
 
     # Post to points leaderboard channel
     if config.POINTS_LEADERBOARD_CHANNEL_ID:
@@ -846,14 +985,14 @@ async def check_and_announce_season_end(
             except discord.HTTPException:
                 pass
 
-    # Post to shield channel — public "Conqueror" announcement
+    # Post to shield channel — public announcement
     if config.SHIELD_CHANNEL_ID:
         ch = bot.get_channel(config.SHIELD_CHANNEL_ID)
         if ch:
             try:
                 await ch.send(
-                    f"🏆 **<@{winner['discord_id']}> has hit {config.SEASON_END_THRESHOLD} SP "
-                    f"and is declared the Conqueror of {season_name}!**"
+                    f"🏆 **{season_name} has ended!** <@{winner['discord_id']}> takes 1st place. "
+                    "Full results above."
                 )
             except discord.HTTPException:
                 pass
@@ -862,7 +1001,7 @@ async def check_and_announce_season_end(
     role_mentions = _role_mentions(config.HOD_ROLE_IDS, config.ADMIN_ROLE_IDS)
     await _post_to_hod_channel(
         bot, season_id,
-        f"🏆 **SEASON ENDED** — <@{winner['discord_id']}> crossed {config.SEASON_END_THRESHOLD} SP.\n"
+        f"🏆 **SEASON ENDED** (deadline reached) — <@{winner['discord_id']}> holds 1st place.\n"
         f"Points table is now **frozen**. Prize payouts pending review.\n\n"
         f"{role_mentions}"
     )

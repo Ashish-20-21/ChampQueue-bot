@@ -1156,34 +1156,63 @@ def _get_pending_shields(self: Database, season_id: int) -> list[dict]:
 
 
 def _create_shield_points_path(self: Database, player_id: int, season_id: int,
-                                cost_points: int) -> dict:
-    """Self-serve shield purchase with points. Deducts points from
-    season_points and creates an immediately-active shield."""
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    ends = now + timedelta(hours=config.SHIELD_DURATION_HOURS)
+                                tier: str = "normal") -> dict:
+    """Self-serve shield purchase with SP credits (migration_036).
 
-    # Deduct points
-    sp = self._get_season_points_raw(player_id, season_id)
-    if not sp or sp["points"] < cost_points:
-        raise ValueError("Insufficient points")
-    new_points = sp["points"] - cost_points
-    self.client.table("season_points").update({
-        "points": new_points, "updated_at": now.isoformat()
-    }).eq("season_id", season_id).eq("player_id", player_id).execute()
+    Only tiers with a credits_cost in config.SHIELD_TIERS are
+    reachable this way — currently just 'normal'. Delegates to the
+    purchase_shield_with_credits() RPC, which does the balance
+    check + deduction + shield row atomically (row-locked, so two
+    concurrent purchase attempts can't both pass the balance check
+    against the same stale balance) and writes a real
+    season_point_events row for the deduction.
 
-    # Create shield row
-    res = self.client.table("point_shields").insert({
-        "season_id": season_id,
-        "player_id": player_id,
-        "payment_method": "points",
-        "cost_points": cost_points,
-        "tier": "credits",
-        "status": "active",
-        "shield_starts_at": now.isoformat(),
-        "shield_ends_at": ends.isoformat(),
-    }).execute()
-    return res.data[0]
+    FIX vs. the pre-migration_036 version of this function: the old
+    version deducted points with a direct UPDATE on
+    season_points.points and wrote NO season_point_events row — so
+    any future recompute_player_season_points() call (which rebuilds
+    points as sum(delta) from season_point_events) silently handed
+    the spent SP back, refunding the shield for free. Confirmed in
+    ChampQueue_Audit_2026-09-13.md §6.2 as high-severity ("near the
+    threshold, that decides who wins ₹700"). The RPC's event insert
+    is what makes this recompute-safe — same pattern
+    apply_sp_adjustment (migration_035) already established for
+    manual SP corrections."""
+    tier_cfg = config.SHIELD_TIERS.get(tier)
+    if not tier_cfg or tier_cfg.get("credits_cost") is None:
+        raise ValueError(f"Tier {tier!r} is not purchasable with credits")
+
+    try:
+        res = self.client.rpc("purchase_shield_with_credits", {
+            "p_player_id": player_id,
+            "p_season_id": season_id,
+            "p_tier": tier,
+            "p_cost_points": tier_cfg["credits_cost"],
+            "p_duration_hours": tier_cfg["duration_hours"],
+        }).execute()
+    except Exception as exc:
+        # The RPC uses `raise exception` for every expected failure
+        # (insufficient balance, already has a shield, season locked)
+        # — supabase-py surfaces that as a generic API error, not a
+        # ValueError. Re-raise as ValueError with the original message
+        # preserved, so callers (points.py) can keep using a plain
+        # `except ValueError` for "expected, show a friendly message"
+        # without needing to string-match error text themselves.
+        raise ValueError(str(exc)) from exc
+    if not res.data:
+        raise ValueError("Purchase failed")
+    row = res.data[0]
+    # RPC returns out_-prefixed columns (RETURNS TABLE binds
+    # positionally, not by the SELECT's own aliases — see the SQL
+    # function's docstring) — normalize back to plain names so
+    # callers don't need to know about that RPC-specific quirk.
+    return {
+        "id": row["out_id"],
+        "tier": row["out_tier"],
+        "cost_points": row["out_cost_points"],
+        "shield_starts_at": row["out_shield_starts_at"],
+        "shield_ends_at": row["out_shield_ends_at"],
+    }
 
 
 def _get_season_points_raw(self: Database, player_id: int, season_id: int) -> Optional[dict]:
@@ -1251,10 +1280,25 @@ def _create_shield_cash_pending(self: Database, player_id: int, season_id: int,
 
 
 def _confirm_shield(self: Database, shield_id: int, confirmed_by: str) -> dict:
-    """HOD confirms a pending cash-path shield — activates it."""
+    """HOD confirms a pending cash-path shield — activates it.
+
+    Duration is tier-specific (migration_036), looked up from the
+    shield's own stored tier via config.SHIELD_TIERS — NOT a single
+    global constant. The pre-migration_036 version of this function
+    applied the same flat SHIELD_DURATION_HOURS (168h) to every
+    shield regardless of tier; that's wrong now that normal/
+    2x_normal/premium have genuinely different durations (72h/144h/
+    72h). Falls back to 72h only if the stored tier is somehow
+    missing/unrecognized — should never happen for a shield created
+    through the normal purchase flow, but a missing duration should
+    never silently become a 0-hour or unbounded shield either."""
+    shield = self._get_shield_by_id(shield_id)
+    tier_cfg = config.SHIELD_TIERS.get((shield or {}).get("tier"), {})
+    duration_hours = tier_cfg.get("duration_hours", 72)
+
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
-    ends = now + timedelta(hours=config.SHIELD_DURATION_HOURS)
+    ends = now + timedelta(hours=duration_hours)
     res = self.client.table("point_shields").update({
         "status": "active",
         "confirmed_by": str(confirmed_by),
@@ -1282,6 +1326,80 @@ def _get_shield_by_id(self: Database, shield_id: int) -> Optional[dict]:
     return res.data[0] if res.data else None
 
 
+def _get_all_active_shields(self: Database, season_id: int) -> list[dict]:
+    """All currently-active shields this season, for /admin-active-shield.
+
+    Verified by timestamp (shield_ends_at > now()), NOT by trusting
+    the status column at face value — status only ever gets flipped to
+    'expired' by the lazy expire_shields() sweep (piggybacked on the
+    leaderboard reload button), so a shield can be long past its real
+    expiry while still reading status='active' here between sweeps.
+    Same pattern get_active_shield() already uses for exactly this
+    reason."""
+    res = (self.client.table("point_shields")
+           .select("*, players(ign, discord_id)")
+           .eq("season_id", season_id)
+           .eq("status", "active")
+           .execute())
+    if not res.data:
+        return []
+    from datetime import datetime, timezone
+    import re as _re
+    now = datetime.now(timezone.utc)
+    active = []
+    for row in res.data:
+        ends = row.get("shield_ends_at")
+        if not ends:
+            continue
+        if isinstance(ends, str):
+            # Same Python-3.10 fromisoformat normalization as
+            # get_active_shield() above — see that function's comment
+            # for the exact bug this avoids.
+            cleaned = ends.replace("Z", "+00:00").replace(" ", "T", 1)
+            cleaned = _re.sub(r'([+-]\d{2})$', r'\1:00', cleaned)
+            try:
+                ends_dt = datetime.fromisoformat(cleaned)
+            except (ValueError, AttributeError, TypeError):
+                continue
+        else:
+            ends_dt = ends
+        if ends_dt > now:
+            active.append(row)
+    # Soonest-expiring first — most actionable ordering for an admin
+    # glancing at this list.
+    active.sort(key=lambda r: r.get("shield_ends_at") or "")
+    return active
+
+
+def _check_and_unlock_pool(self: Database, season_id: int) -> bool:
+    """True only if THIS call is the one that flipped the pool-unlock
+    flag (migration_036) — race-safe, see the SQL function's comment."""
+    return self.client.rpc("check_and_unlock_pool", {"p_season_id": season_id}).execute().data
+
+
+def _check_and_lock_season_by_deadline(self: Database, season_id: int) -> bool:
+    """True only if THIS call is the one that locked the season
+    (migration_036) — no-op/False if end_date isn't set yet, hasn't
+    passed, or the season is already locked."""
+    return self.client.rpc("check_and_lock_season_by_deadline", {"p_season_id": season_id}).execute().data
+
+
+def _mark_pool_unlock_announced(self: Database, season_id: int) -> bool:
+    """True only if THIS call is the one that flipped the
+    announced-guard — use this to gate the actual Discord post so a
+    concurrent caller can never double-announce (audit finding 6.3's
+    fix, applied to the new pool-unlock event too)."""
+    return self.client.rpc("mark_pool_unlock_announced", {"p_season_id": season_id}).execute().data
+
+
+def _mark_season_end_announced(self: Database, season_id: int) -> bool:
+    """Same guard as mark_pool_unlock_announced, for the season-end
+    (deadline lock) announcement — this is the direct fix for
+    ChampQueue_Audit_2026-09-13.md §6.3 ("Season-end announcement
+    repeats on every subsequent match")."""
+    return self.client.rpc("mark_season_end_announced", {"p_season_id": season_id}).execute().data
+
+
 def _expire_shields(self: Database) -> int:
     return self.client.rpc("expire_shields", {}).execute().data
 
@@ -1305,6 +1423,11 @@ Database.create_shield_cash_pending = _create_shield_cash_pending
 Database.confirm_shield = _confirm_shield
 Database.reject_shield = _reject_shield
 Database.get_shield_by_id = _get_shield_by_id
+Database.get_all_active_shields = _get_all_active_shields
+Database.check_and_unlock_pool = _check_and_unlock_pool
+Database.check_and_lock_season_by_deadline = _check_and_lock_season_by_deadline
+Database.mark_pool_unlock_announced = _mark_pool_unlock_announced
+Database.mark_season_end_announced = _mark_season_end_announced
 
 
 def _create_shield_consent(self: Database, player_id: int, season_id: int,

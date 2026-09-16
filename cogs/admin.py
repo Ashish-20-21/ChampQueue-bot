@@ -13,6 +13,7 @@ from services import reputation, mmr_engine
 from utils.embeds import verification_card, hall_of_fame_embed, season_recap_embed
 from utils.permissions import admin_only, is_admin, hod_or_admin_only
 from utils import incident_log
+from utils.timeutil import iso_to_ts
 from cogs.queue import RegionQueueView, make_queue_embed
 
 logger = logging.getLogger("champions_queue")
@@ -1056,15 +1057,16 @@ class Admin(commands.Cog):
     )
     @app_commands.describe(
         user="The player to grant the shield to",
-        tier="Boost tier — 100 (₹100/500 SP) or 200 (₹200/1000 SP)",
+        tier="Shield tier — see config.SHIELD_TIERS for exact price/duration/win-bonus per tier",
     )
     @app_commands.choices(tier=[
-        app_commands.Choice(name="₹100 Boost (500 SP)", value=100),
-        app_commands.Choice(name="₹200 Boost (1000 SP)", value=200),
+        app_commands.Choice(name="₹30 Normal Shield (72h)", value="normal"),
+        app_commands.Choice(name="₹50 2x Normal Shield (144h)", value="2x_normal"),
+        app_commands.Choice(name="₹60 Premium Shield (72h, +50 SP/win day 1)", value="premium"),
     ])
     async def admin_grant_shield(self, interaction: discord.Interaction,
                                   user: discord.Member,
-                                  tier: int = 100) -> None:
+                                  tier: str = "normal") -> None:
         await interaction.response.defer(ephemeral=True)
 
         player = await adb.get_player_by_discord_id(str(user.id))
@@ -1097,15 +1099,15 @@ class Admin(commands.Cog):
             )
             return
 
-        # Resolve tier to rupee/points values
-        tier_rupees = config.SHIELD_BOOST_200_RUPEES if tier == 200 else config.SHIELD_BOOST_100_RUPEES
-        tier_points = config.SHIELD_BOOST_200_POINTS if tier == 200 else config.SHIELD_BOOST_100_POINTS
-        tier_label = f"boost_{tier}"
+        tier_cfg = config.SHIELD_TIERS.get(tier)
+        if not tier_cfg:
+            await interaction.followup.send(f"Unknown tier `{tier}`.", ephemeral=True)
+            return
 
         shield = await with_retry(
             adb.create_shield_cash_pending,
             player["id"], season["id"], str(interaction.user.id),
-            cost_rupees=tier_rupees, tier=tier_label
+            cost_rupees=tier_cfg["boost_rupees"], tier=tier
         )
 
         from cogs.points import post_hod_approval_card
@@ -1115,7 +1117,7 @@ class Admin(commands.Cog):
 
         if posted:
             await interaction.followup.send(
-                f"Shield grant for {user.mention} is **pending HOD confirmation** "
+                f"Shield grant ({tier_cfg['label']}) for {user.mention} is **pending HOD confirmation** "
                 f"(shield ID: `{shield['id']}`). "
                 f"Check <#{config.HOD_APPROVAL_CHANNEL_ID}> for the approval card.",
                 ephemeral=True,
@@ -1126,6 +1128,57 @@ class Admin(commands.Cog):
                 "Check channel permissions.",
                 ephemeral=True,
             )
+
+    # ── /admin-active-shield ────────────────────────────────────
+    # Lists everyone with a currently active shield, and which tier.
+    # Deliberately reads via get_all_active_shields() (timestamp-
+    # verified) rather than a plain status='active' select — the
+    # status column is only ever flipped by the lazy expire_shields()
+    # sweep (piggybacked on the leaderboard reload button), so it can
+    # read 'active' well past a shield's actual expiry between
+    # sweeps. See db.py's get_all_active_shields docstring.
+    @admin_only()
+    @app_commands.command(
+        name="admin-active-shield",
+        description="List every player with a currently active shield, and which tier",
+    )
+    async def admin_active_shield(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        season = await adb.get_active_season()
+        if not season:
+            await interaction.followup.send("No active season.", ephemeral=True)
+            return
+
+        shields = await with_retry(adb.get_all_active_shields, season["id"])
+        if not shields:
+            await interaction.followup.send("No active shields right now.", ephemeral=True)
+            return
+
+        tier_emoji = {"normal": "🛡️", "2x_normal": "🛡️🛡️", "premium": "🛡️✨"}
+        lines = []
+        for row in shields:
+            player_info = row.get("players") or {}
+            ign = player_info.get("ign", "?")
+            discord_id = player_info.get("discord_id", "?")
+            tier = row.get("tier", "?")
+            tier_cfg = config.SHIELD_TIERS.get(tier, {})
+            tier_label = tier_cfg.get("label", tier)
+            emoji = tier_emoji.get(tier, "🛡️")
+            ends_ts = iso_to_ts(row.get("shield_ends_at", ""))
+            lines.append(
+                f"{emoji} **{ign}** (<@{discord_id}>) — {tier_label} — "
+                f"expires <t:{ends_ts}:R>"
+            )
+
+        em = discord.Embed(
+            title="🛡️ Active Shields",
+            description="\n".join(lines),
+            color=0x5865F2,
+        )
+        em.set_footer(text=f"{len(shields)} active shield(s) · {season.get('name', 'Season')}")
+        await interaction.followup.send(embed=em, ephemeral=True)
+
 
     # ── /admin-recompute-points ──────────────────────────────
     @admin_only()

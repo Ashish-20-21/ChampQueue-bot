@@ -1709,14 +1709,16 @@ class Match(commands.Cog):
         # card itself (utils/embeds.py's verification_card), same
         # place the "MMR (proposed)" line already was, so the host
         # sees it before approving rather than as an extra card after.
-        # This block now only handles the season-end check — did this
-        # match just push someone over the 2500 threshold. A failure
-        # here never rolls back the already-committed points — same
-        # resilience pattern as the career-stats recompute above.
+        # This block now only handles the season's lazy checks
+        # (migration_036) — did this match just cross the 2000 SP
+        # pool-unlock threshold, or push the season past its deadline.
+        # A failure here never rolls back the already-committed
+        # points — same resilience pattern as the career-stats
+        # recompute above.
         try:
             if match.get("season_id"):
-                from cogs.points import check_and_announce_season_end
-                await check_and_announce_season_end(self.bot, match["season_id"])
+                from cogs.points import run_season_lazy_checks
+                await run_season_lazy_checks(self.bot, match["season_id"])
         except Exception as exc:
             logger.exception(
                 "Season-end check failed for match_id=%s (points already committed, this is cosmetic only)",

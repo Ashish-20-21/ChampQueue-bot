@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import random
 import re
 from collections import Counter
 from datetime import timedelta
@@ -522,6 +523,78 @@ class Match(commands.Cog):
         if not config.RESULT_UPLOAD_CHANNEL_ID:
             return True
         return interaction.channel_id == config.RESULT_UPLOAD_CHANNEL_ID
+
+    @app_commands.command(name="host-roll-map", description="Host: reroll this match's map to a different random one")
+    @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)")
+    @app_commands.checks.cooldown(1, config.HOST_ROLL_MAP_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.channel_id))
+    async def host_roll_map(self, interaction: discord.Interaction, match_id: str):
+        """Lets the match's own Host (or an admin, same override precedent
+        as /correction-result and the scoreboard-upload-on-host's-behalf
+        exception — see utils/permissions.py) reroll the map if players
+        are bored of a repeat, without touching balance/MMR at all —
+        this only ever changes matches.map_pool.
+
+        Gated to awaiting_room/awaiting_result: before a room exists
+        there's nothing meaningful to reroll yet, and once a result is
+        in (pending_verification onward) the map is now a fact about a
+        match that was actually played, not something to silently swap
+        out from under an already-submitted scoreboard."""
+        match = await adb.get_match_by_code(normalize_match_code(match_id))
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+
+        player = await adb.get_player_by_discord_id(interaction.user.id)
+        is_host = bool(player) and match.get("room_code_shared_by") == player["id"]
+        if not is_host and not is_admin(interaction):
+            await interaction.response.send_message(
+                "Only the Match Host (or an admin) can reroll this match's map.", ephemeral=True
+            )
+            return
+
+        if match["status"] not in ("awaiting_room", "awaiting_result"):
+            await interaction.response.send_message(
+                "This match's map can't be rerolled at this stage — it's either not started yet "
+                "or already has a result submitted.",
+                ephemeral=True,
+            )
+            return
+
+        current_maps = match.get("map_pool") or []
+        # Exclude every map already assigned to this match — not just
+        # current_maps[0] — so a reroll never lands back on the same
+        # map even if map_pool ever holds more than one entry again
+        # (RO3-style multi-round matches).
+        pool = [m for m in config.HARDPOINT_MAPS if m not in current_maps]
+        if not pool:
+            await interaction.response.send_message(
+                "No other map to roll to — every map in the configured pool is already assigned to this match.",
+                ephemeral=True,
+            )
+            return
+
+        new_map = random.choice(pool)
+        updated = await with_retry(adb.update_match, match["id"], {"map_pool": [new_map]})
+        if not updated:
+            await interaction.response.send_message("Failed to reroll the map — please try again.", ephemeral=True)
+            return
+
+        old_map_txt = current_maps[0] if current_maps else "?"
+        await interaction.response.send_message(
+            f"🎲 Rolled — new map is **{new_map}** (was {old_map_txt}).", ephemeral=True
+        )
+
+        # Public announcement in the match's own text channel — always,
+        # regardless of where the command was run from, so everyone in
+        # the lobby sees the change, not just whoever ran it.
+        ch_id = match.get("text_channel_id")
+        if ch_id:
+            ch = self.bot.get_channel(int(ch_id))
+            if ch:
+                try:
+                    await ch.send(f"🎲 **Map rerolled by <@{interaction.user.id}>** — new map: **{new_map}**")
+                except discord.HTTPException:
+                    pass
 
     @app_commands.command(name="correction-result", description="Host: flag a problem with this match's result before or after approval")
     @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)")

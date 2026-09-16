@@ -812,9 +812,12 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
         # run_season_lazy_checks' docstring for why both call sites
         # exist. Best-effort: a failure here never blocks the render.
         try:
-            await run_season_lazy_checks(interaction.client, season["id"])
+            spawn_background(
+                run_season_lazy_checks(interaction.client, season["id"]),
+                error_label=f"run_season_lazy_checks for season_id={season['id']} (leaderboard reload)",
+            )
         except Exception:
-            logger.exception("run_season_lazy_checks failed during leaderboard reload (non-fatal)")
+            logger.exception("Failed to spawn run_season_lazy_checks during leaderboard reload (non-fatal)")
 
         rows = await with_retry(adb.season_points_leaderboard, season["id"])
         locked = await adb.is_season_points_locked(season["id"])
@@ -1003,6 +1006,52 @@ class PointsCog(commands.Cog):
 # MODULE-LEVEL HELPERS (used by other cogs too)
 # ======================================================================
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+def spawn_background(coro, error_label: str) -> None:
+    """Fire-and-forget a coroutine WITHOUT the caller waiting for it —
+    used specifically for run_season_lazy_checks (below), whose own
+    result is genuinely cosmetic: a missed run here is caught
+    automatically by the very next match approval or leaderboard
+    reload, both of which call this exact same lazy check again. There
+    is no correctness reason to make the approving host, or someone
+    just reloading the leaderboard, sit through ~3 sequential DB round
+    trips (~400ms+, confirmed from live logs) for a check whose
+    failure changes nothing about what they were actually doing.
+
+    Two things a naive `asyncio.create_task(coro)` would get wrong,
+    both handled here:
+    1. asyncio only holds a WEAK reference to a task it isn't
+       otherwise tracking — a task with no strong reference anywhere
+       can be silently garbage-collected mid-execution (documented
+       asyncio behavior, not theoretical). _background_tasks holds a
+       real reference until the task's own done-callback removes it,
+       so it always runs to completion.
+    2. An exception inside a task nobody ever awaits doesn't propagate
+       anywhere useful — it becomes an "exception was never retrieved"
+       warning at garbage-collection time, easy to miss entirely. The
+       inner wrapper here catches and logs it explicitly instead, same
+       visibility as if it had been awaited.
+
+    Deliberately NOT a general pattern for this codebase — every other
+    background-ish call site elsewhere still uses asyncio.gather(...,
+    return_exceptions=True), which keeps the caller's own reliability
+    guarantee (nothing can be silently dropped by a bot restart
+    mid-task). This one is a narrow, deliberate exception, specific to
+    a check that already self-heals on its own next trigger — not a
+    template for other hot-path work."""
+    async def _wrapped() -> None:
+        try:
+            await coro
+        except Exception:
+            logger.exception("Background task failed: %s", error_label)
+
+    task = asyncio.ensure_future(_wrapped())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def run_season_lazy_checks(bot: commands.Bot, season_id: int) -> None:
     """The lazy-lock/lazy-unlock entry point (migration_036) — called
     from exactly two places, deliberately: cogs/match.py right after a
@@ -1013,6 +1062,11 @@ async def run_season_lazy_checks(bot: commands.Bot, season_id: int) -> None:
     same "piggyback an already-frequent action" pattern this file
     already uses for expire_shields().
 
+    Both call sites fire this via spawn_background(), not a direct
+    await — see that function's docstring for why waiting on this
+    specific check was pure added latency with no correctness benefit
+    (confirmed live: ~400ms+ added to every single match approval,
+    2026-09-16).
     Two independent lazy checks live here:
       1. Pool-unlock — did any player just cross
          SEASON_POOL_UNLOCK_THRESHOLD? Doesn't end anything, just

@@ -1497,5 +1497,4 @@ def _current_season_stats(self: Database, player_id: int, season_id: int) -> Opt
         return None
     return res.data[0]
 
-
 Database.current_season_stats = _current_season_stats

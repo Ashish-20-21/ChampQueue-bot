@@ -131,6 +131,12 @@ APPROVAL_SWEEP_INTERVAL_SECONDS = 30  # how often the sweep checks for overdue m
 # match try to flag something around the same time.
 CORRECTION_COMMAND_COOLDOWN_SECONDS = 8
 
+# Per-channel cooldown on /host-roll-map — cheap guard against a host
+# reroll-spamming to try to land a specific map, not a hard limit on
+# how many times a match's map can be rerolled overall (no cap on that
+# by design — see the command's docstring).
+HOST_ROLL_MAP_COOLDOWN_SECONDS = 15
+
 # How often the abandoned/completed-match channel cleanup sweep runs.
 # Independent of the 1hr cleanup delay itself — this just controls how
 # often the bot checks "is anything due yet".

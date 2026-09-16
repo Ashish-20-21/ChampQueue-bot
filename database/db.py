@@ -851,7 +851,10 @@ def _create_match_issue(self: Database, match_id: int, reported_by: int, reason:
 
 def _resolve_match_issue(self: Database, issue_id: int, resolved_by: int, resolution_note: str | None = None) -> dict:
     payload = {"status": "resolved", "resolved_by": resolved_by, "resolved_at": "now()", "resolution_note": resolution_note}
-    return self.client.table("match_issues").update(payload).eq("id", issue_id).execute().data[0]
+    result = self.client.table("match_issues").update(payload).eq("id", issue_id).eq("status", "open").execute()
+    if not result.data:
+        raise ValueError(f"Match issue {issue_id} was already resolved or not found")
+    return result.data[0]
 
 
 def _get_match_issue(self: Database, issue_id: int) -> Optional[dict]:

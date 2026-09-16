@@ -1291,9 +1291,29 @@ def _confirm_shield(self: Database, shield_id: int, confirmed_by: str) -> dict:
     72h). Falls back to 72h only if the stored tier is somehow
     missing/unrecognized — should never happen for a shield created
     through the normal purchase flow, but a missing duration should
-    never silently become a 0-hour or unbounded shield either."""
-    shield = self._get_shield_by_id(shield_id)
-    tier_cfg = config.SHIELD_TIERS.get((shield or {}).get("tier"), {})
+    never silently become a 0-hour or unbounded shield either.
+
+    Guards against a real duplicate-grant race: an admin can grant a
+    shield, then (mistakenly) grant a SECOND one for the same player
+    before the first is confirmed — both then sit pending, and if an
+    HOD confirms both, the player ends up holding two active shields
+    simultaneously (confirmed live as an actual, if rare, admin-
+    workflow slip). This raises rather than silently activating a
+    second shield on top of an already-active one — the caller
+    (HODApprovalView.confirm) surfaces the message so the HOD knows to
+    reject the duplicate instead."""
+    shield = self.get_shield_by_id(shield_id)
+    if not shield:
+        return {}
+
+    existing = self.get_active_shield(shield["player_id"], shield["season_id"])
+    if existing and existing["id"] != shield_id:
+        raise ValueError(
+            f"This player already has a different active shield (id={existing['id']}) — "
+            "reject this request instead of confirming it."
+        )
+
+    tier_cfg = config.SHIELD_TIERS.get(shield.get("tier"), {})
     duration_hours = tier_cfg.get("duration_hours", 72)
 
     from datetime import datetime, timezone, timedelta

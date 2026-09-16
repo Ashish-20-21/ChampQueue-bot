@@ -47,16 +47,19 @@ def _shield_info_embed() -> discord.Embed:
     em = discord.Embed(
         title="⚡ Shield Station",
         description=(
-            "Think you're climbing fast? Protect your grind.\n\n"
-            "A **Shield** blocks the **-3 SP penalty** on losses — and boosts your win rate too. "
-            "Your MMR stays completely untouched — this is a Season Points play only.\n\n"
-            f"🛡️ **{t['normal']['label']}** — {t['normal']['duration_hours']}h · "
+            "Every match is a swing — one bad round and the grind you put in resets. "
+            "A **Shield** ends that risk: **+10 SP on every win, 0 SP lost on every loss** — "
+            "while everyone else is still stuck on the standard +5/-3. Your MMR stays completely "
+            "untouched, this is a Season Points play only.\n\n"
+            f"🛡️ **{t['normal']['label']}** — {t['normal']['duration_hours'] // 24} days · "
             f"+{t['normal']['win_sp']} SP/win · 0 SP on loss\n"
-            f"🛡️🛡️ **{t['2x_normal']['label']}** — {t['2x_normal']['duration_hours']}h · "
-            f"same protection, bundle price\n"
-            f"🛡️✨ **{t['premium']['label']}** — {t['premium']['duration_hours']}h · "
-            f"+{t['premium']['day1_win_sp']} SP/win on day 1, then +{t['premium']['win_sp']}\n\n"
-            "**One active shield at a time. Once purchased, it's final — no refunds, no reversals.**"
+            f"🛡️🛡️ **{t['2x_normal']['label']}** — {t['2x_normal']['duration_hours'] // 24} days · "
+            f"same +{t['2x_normal']['win_sp']} SP/win · 0 on loss as Normal, just twice the runway, bundle price\n"
+            f"🛡️✨ **{t['premium']['label']}** — {t['premium']['duration_hours'] // 24} days · "
+            f"+{t['premium']['day1_win_sp']} SP/win on day 1, then +{t['premium']['win_sp']} SP/win "
+            f"for the remaining {t['premium']['duration_hours'] // 24 - 1} days\n\n"
+            "**One active shield at a time. Once purchased, it's final — no refunds, no reversals.**\n"
+            "Tap **Info** below for the full breakdown before you buy."
         ),
         color=0x5865F2,
     )
@@ -271,6 +274,88 @@ class ShieldPurchaseButton(discord.ui.DynamicItem[discord.ui.Button],
         menu_view.message = msg
 
 
+def _shield_full_info_embed() -> discord.Embed:
+    """The exhaustive reference shown by the Info button — distinct
+    from _shield_info_embed() (the inviting channel-post version):
+    this one exists to answer "which tiers can I buy with credits,
+    which need cash, and exactly what do I get" with nothing left
+    implicit, since that's the whole point of a dedicated Info
+    button rather than making players re-read the channel post."""
+    t = config.SHIELD_TIERS
+    normal, twox, premium = t["normal"], t["2x_normal"], t["premium"]
+    em = discord.Embed(
+        title="🛡️ Shield — Full Breakdown",
+        description=(
+            "Baseline (no shield): **+5 SP** on a win, **-3 SP** on a loss.\n"
+            "Every shield below replaces that with a flat **0 SP on any loss** — "
+            "the only differences between tiers are the win bonus and how long it lasts.\n"
+        ),
+        color=0x5865F2,
+    )
+    em.add_field(
+        name=f"🛡️ {normal['label']}",
+        value=(
+            f"**{normal['duration_hours'] // 24} days** · **+{normal['win_sp']} SP**/win · 0 on loss\n"
+            f"🎯 Use Credits: **{normal['credits_cost']} SP** · 💰 Boost: **₹{normal['boost_rupees']}**"
+        ),
+        inline=False,
+    )
+    em.add_field(
+        name=f"🛡️🛡️ {twox['label']}",
+        value=(
+            f"**{twox['duration_hours'] // 24} days** · identical **+{twox['win_sp']} SP**/win · 0 on loss "
+            f"as Normal — just twice the days.\n"
+            f"💰 Boost only: **₹{twox['boost_rupees']}** (credits can't buy this tier)"
+        ),
+        inline=False,
+    )
+    em.add_field(
+        name=f"🛡️✨ {premium['label']}",
+        value=(
+            f"**{premium['duration_hours'] // 24} days** · **Day 1: +{premium['day1_win_sp']} SP**/win, "
+            f"then **+{premium['win_sp']} SP**/win for the remaining "
+            f"{premium['duration_hours'] // 24 - 1} days · 0 on loss throughout.\n"
+            f"💰 Boost only: **₹{premium['boost_rupees']}** (credits can't buy this tier)"
+        ),
+        inline=False,
+    )
+    em.add_field(
+        name="Rules that apply to every tier",
+        value=(
+            "• One active shield at a time — you can't stack or queue a second one.\n"
+            "• Once purchased, it's final: no refunds, no reversals, no cancellations.\n"
+            "• MMR is never affected — this only changes Season Points."
+        ),
+        inline=False,
+    )
+    em.set_footer(text="Use Credits = instant, spends your own SP · Boost = cash via an admin, needs HOD confirmation")
+    return em
+
+
+class ShieldInfoButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"shield:info"):
+    """Secondary button next to Shield — posts the full tier
+    breakdown on demand (_shield_full_info_embed) without spending
+    or committing to anything. Persistent across restarts via
+    DynamicItem, same pattern as ShieldPurchaseButton."""
+
+    def __init__(self) -> None:
+        super().__init__(discord.ui.Button(
+            label="Info",
+            style=discord.ButtonStyle.secondary,
+            emoji="ℹ️",
+            custom_id="shield:info",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button,
+                              match: "re.Match[str]") -> "ShieldInfoButton":
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=_shield_full_info_embed(), ephemeral=True)
+
+
 def _role_mentions(*role_id_sets: set[int]) -> str:
     """Build a mention string across multiple role-ID sets, deduped.
     HOD_ROLE_IDS and ADMIN_ROLE_IDS can legitimately overlap by design
@@ -340,12 +425,12 @@ class ShieldMenuView(discord.ui.View):
             return
 
         confirm_view = ShieldCreditsConfirmView(self.player_id, self.season_id, self.current_points)
-        duration_hours = config.SHIELD_TIERS["normal"]["duration_hours"]
+        duration_days = config.SHIELD_TIERS["normal"]["duration_hours"] // 24
         msg = await interaction.followup.send(
             "**⚠️ Confirm credit purchase — this is irreversible**\n\n"
             f"This will deduct **{cost} SP** from your balance "
             f"(**{self.current_points}** → **{self.current_points - cost}** SP) for a **Normal Shield**.\n"
-            f"Your shield will be active for **{duration_hours} hours** starting now — "
+            f"Your shield will be active for **{duration_days} days** starting now — "
             f"**+{config.SHIELD_TIERS['normal']['win_sp']} SP** per win, **0 SP** on any loss.\n\n"
             "Once purchased, this cannot be undone, refunded, or reversed. "
             "No exceptions will be made for credit-based purchases.",
@@ -366,13 +451,14 @@ class ShieldMenuView(discord.ui.View):
         msg = await interaction.followup.send(
             "**⚡ Boost Your Season Points**\n\n"
             "A Boost is a paid Shield.\n\n"
-            f"**₹{t['normal']['boost_rupees']} — Normal Shield:** {t['normal']['duration_hours']}h. "
+            f"**₹{t['normal']['boost_rupees']} — Normal Shield:** {t['normal']['duration_hours'] // 24} days. "
             f"+{t['normal']['win_sp']} SP on every win, 0 lost on any loss.\n"
-            f"**₹{t['2x_normal']['boost_rupees']} — 2x Normal Shield:** {t['2x_normal']['duration_hours']}h "
-            "of the same protection, discounted vs. buying two Normal Shields.\n"
+            f"**₹{t['2x_normal']['boost_rupees']} — 2x Normal Shield:** {t['2x_normal']['duration_hours'] // 24} "
+            f"days of the exact same +{t['2x_normal']['win_sp']} SP/win · 0-on-loss protection as Normal — "
+            "just double the days, at a discount vs. buying two Normal Shields back to back.\n"
             f"**₹{t['premium']['boost_rupees']} — Premium Shield:** Day 1 wins pay "
-            f"+{t['premium']['day1_win_sp']} SP. Days 2–3 continue at +{t['premium']['win_sp']} SP per win, "
-            "0 on loss.\n\n"
+            f"+{t['premium']['day1_win_sp']} SP. The remaining {t['premium']['duration_hours'] // 24 - 1} days "
+            f"continue at +{t['premium']['win_sp']} SP per win, 0 on loss.\n\n"
             "Payment is handled by an admin after you raise a ticket — "
             "nothing is charged automatically. You'll confirm exactly what you're agreeing to on the next screen.",
             view=tier_view,
@@ -441,13 +527,30 @@ class ShieldCreditsConfirmView(discord.ui.View):
             return
 
         ends_ts = _iso_to_ts(shield.get("shield_ends_at", ""))
-        # Ephemeral confirmation to the buyer only
+        duration_days = config.SHIELD_TIERS["normal"]["duration_hours"] // 24
+        # Ephemeral confirmation to the buyer only — keeps their exact
+        # new balance private, unlike the public post below.
         await interaction.followup.send(
             f"🛡️ **Normal Shield activated!** You're protected until <t:{ends_ts}:F> (<t:{ends_ts}:R>).\n"
             f"Points deducted: **-{cost} SP** "
             f"(new balance: **{self.current_points - cost}** SP).",
             ephemeral=True,
         )
+
+        # Public announcement in the shield channel — so other players
+        # can see who's shielded and with what, same visibility the
+        # cash/Boost path already gets via HODApprovalView.confirm()
+        # below. The credits path had no equivalent post before this.
+        if config.SHIELD_CHANNEL_ID:
+            ch = interaction.client.get_channel(config.SHIELD_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send(
+                        f"🛡️ <@{interaction.user.id}> just activated a **Normal Shield** "
+                        f"({duration_days} days, credits) — protected until <t:{ends_ts}:F>."
+                    )
+                except discord.HTTPException:
+                    pass
 
         # Post to HOD approval channel (team visibility)
         await _post_to_hod_channel(
@@ -518,7 +621,7 @@ class ShieldBoostTierView(discord.ui.View):
     async def _show_consent(self, interaction: discord.Interaction, tier: str) -> None:
         tier_cfg = config.SHIELD_TIERS[tier]
         rupees = tier_cfg["boost_rupees"]
-        duration_hours = tier_cfg["duration_hours"]
+        duration_days = tier_cfg["duration_hours"] // 24
 
         # Tier-specific SP mechanics line — Premium's day-1 rate is a
         # genuinely different mechanic from Normal/2x's flat rate, so
@@ -529,12 +632,19 @@ class ShieldBoostTierView(discord.ui.View):
         if tier == "premium":
             mechanics_line = (
                 f"• **Day 1:** every win gives **+{tier_cfg['day1_win_sp']} SP** — losses cost **0 SP**.\n"
-                f"• **Days 2–3:** every win gives **+{tier_cfg['win_sp']} SP** — losses still cost **0 SP**.\n"
-                "• **No negative SP at any point during the 3 days.**\n"
+                f"• **Days 2–{duration_days}** (the remaining {duration_days - 1} days): every win gives "
+                f"**+{tier_cfg['win_sp']} SP** — losses still cost **0 SP**.\n"
+                f"• **No negative SP at any point during the {duration_days} days.**\n"
+            )
+        elif tier == "2x_normal":
+            mechanics_line = (
+                f"• Identical protection to the Normal Shield — **+{tier_cfg['win_sp']} SP** on every win, "
+                "**0 SP** on every loss — just running for twice as many days.\n"
+                "• **Losses cost 0 SP the entire time — no negative SP at any point.**\n"
             )
         else:
             mechanics_line = (
-                f"• Every win gives **+{tier_cfg['win_sp']} SP**, every day, for the full {duration_hours}h.\n"
+                f"• Every win gives **+{tier_cfg['win_sp']} SP**, every day, for the full {duration_days} days.\n"
                 "• **Losses cost 0 SP the entire time — no negative SP at any point.**\n"
             )
 
@@ -542,7 +652,7 @@ class ShieldBoostTierView(discord.ui.View):
         msg = await interaction.followup.send(
             f"**Confirm before you proceed — ₹{rupees} {tier_cfg['label']}**\n\n"
             "Here's exactly what happens:\n"
-            f"• You're requesting a **{duration_hours}-hour {tier_cfg['label']}** for **₹{rupees}**.\n"
+            f"• You're requesting a **{duration_days}-day {tier_cfg['label']}** for **₹{rupees}**.\n"
             f"{mechanics_line}"
             f"• Payment is made directly to an admin via <#{config.SUPPORT_CHANNEL_ID}> — "
             "ChampQueue never handles your money.\n"
@@ -608,12 +718,12 @@ class ShieldConsentView(discord.ui.View):
         # Post to HOD approval channel — tagging both HOD and admin roles
         role_mentions = _role_mentions(config.HOD_ROLE_IDS, config.ADMIN_ROLE_IDS)
         tier_label = config.SHIELD_TIERS[self.tier]["label"]
-        duration_hours = config.SHIELD_TIERS[self.tier]["duration_hours"]
+        duration_days = config.SHIELD_TIERS[self.tier]["duration_hours"] // 24
 
         await _post_to_hod_channel(
             interaction.client, self.season_id,
             f"🛡️ **New Boost consent** — <@{interaction.user.id}> "
-            f"has agreed to the **₹{self.rupees} {tier_label}** ({duration_hours}h shield).\n"
+            f"has agreed to the **₹{self.rupees} {tier_label}** ({duration_days}-day shield).\n"
             f"Consent ID: `{consent['id']}` · Awaiting payment via <#{config.SUPPORT_CHANNEL_ID}>.\n\n"
             f"{role_mentions}"
         )
@@ -753,7 +863,14 @@ class HODApprovalView(discord.ui.View):
             await interaction.followup.send("This shield request is no longer pending.", ephemeral=True)
             return
 
-        confirmed = await with_retry(adb.confirm_shield, self.shield_id, str(interaction.user.id))
+        try:
+            confirmed = await with_retry(adb.confirm_shield, self.shield_id, str(interaction.user.id))
+        except ValueError as exc:
+            # Duplicate-grant guard tripped (see db.py's docstring) —
+            # surface it plainly so the HOD knows to Reject this card
+            # instead of retrying Confirm.
+            await interaction.followup.send(f"❌ Cannot confirm: {exc}", ephemeral=True)
+            return
         if not confirmed:
             await interaction.followup.send("Failed to confirm — the request may have been handled already.", ephemeral=True)
             return
@@ -761,12 +878,14 @@ class HODApprovalView(discord.ui.View):
         # Notify the player
         player = await adb.get_player_by_id(shield["player_id"])
         ends_ts = _iso_to_ts(confirmed.get("shield_ends_at", ""))
+        tier_label = config.SHIELD_TIERS.get(shield.get("tier"), {}).get("label", shield.get("tier", "Shield"))
 
         # Update the HOD card
         em = discord.Embed(
             title="🛡️ Shield Grant — CONFIRMED",
             description=(
                 f"**Player:** {player['ign']} (<@{player['discord_id']}>)\n"
+                f"**Tier:** {tier_label}\n"
                 f"**Confirmed by:** <@{interaction.user.id}>\n"
                 f"**Active until:** <t:{ends_ts}:F>"
             ),
@@ -778,7 +897,7 @@ class HODApprovalView(discord.ui.View):
         await _post_to_hod_channel(
             interaction.client, shield["season_id"],
             f"🛡️ **Shield granted** to <@{player['discord_id']}> "
-            f"(cash path, ₹{shield.get('cost_rupees') or '?'}) — "
+            f"({tier_label}, cash path, ₹{shield.get('cost_rupees') or '?'}) — "
             f"initiated by <@{self.initiated_by}>, "
             f"confirmed by <@{interaction.user.id}> — "
             f"active until <t:{ends_ts}:F>"
@@ -790,7 +909,7 @@ class HODApprovalView(discord.ui.View):
             if ch:
                 try:
                     await ch.send(
-                        f"🛡️ <@{player['discord_id']}> — your shield is now **active**! "
+                        f"🛡️ <@{player['discord_id']}> — your **{tier_label}** is now **active**! "
                         f"Protected until <t:{ends_ts}:F> (<t:{ends_ts}:R>)."
                     )
                 except discord.HTTPException:
@@ -848,7 +967,7 @@ class PointsCog(commands.Cog):
 
     async def cog_load(self) -> None:
         # Register persistent dynamic items
-        self.bot.add_dynamic_items(ShieldPurchaseButton, PointsLeaderboardReloadButton)
+        self.bot.add_dynamic_items(ShieldPurchaseButton, ShieldInfoButton, PointsLeaderboardReloadButton)
 
     # ── Admin: post the shield panel ─────────────────────────
     @app_commands.command(name="shield-post", description="Post the shield purchase panel in this channel")
@@ -856,6 +975,7 @@ class PointsCog(commands.Cog):
     async def shield_post(self, interaction: discord.Interaction) -> None:
         view = discord.ui.View(timeout=None)
         view.add_item(ShieldPurchaseButton())
+        view.add_item(ShieldInfoButton())
         await interaction.channel.send(embed=_shield_info_embed(), view=view)
         await interaction.response.send_message("Shield panel posted.", ephemeral=True)
 

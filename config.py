@@ -256,30 +256,79 @@ OPERATOR_SKILLS = [
     "Tempest",
     "War Machine",
 ]
-# --- Season 2: Points System & Prize Pool (migration_029, updated migration_032) ---
+# --- Season 2: Points System & Prize Pool ---
+# (originally migration_029/032/035 — reworked by migration_036 into
+#  the 2000-SP-pool-unlock + Oct-10-deadline model. See that file's
+#  header for the full model description before touching any of this.)
 # Points awarded per match — independent of MMR, no MVP bonus.
 POINTS_WIN = 5
 POINTS_LOSS = -3
 
-# First player to hit this threshold locks the season.
-SEASON_END_THRESHOLD = 3500
+# The FIRST player to reach this SP total permanently flips the
+# season's "pool unlocked" flag (seasons.sp_pool_unlocked). This is
+# NOT a lock trigger — it doesn't end the season or freeze anyone's
+# points. The race for rank 1/2/3 keeps going until SEASON_END_DATE
+# regardless of who tripped this. It only changes the PAYOUT FORMULA
+# applied once the season eventually locks: flat PRIZE_1ST/2ND/3RD by
+# final rank, instead of SP-proportional. See migration_036.
+SEASON_POOL_UNLOCK_THRESHOLD = 2000
 
-# Prize pool ₹1500 — 1st is fixed, 2nd/3rd are min(points÷POINTS_TO_RUPEE, cap).
+# The ONLY thing that actually locks the season now is a date —
+# seasons.end_date on the active season row, checked lazily (match
+# approval + leaderboard reload, no cron) via
+# check_and_lock_season_by_deadline(). Not a Python constant: the live
+# value always comes from the DB, and until it's set there the season
+# simply never locks. Set it explicitly, converting the real-world EOD
+# cutoff to its UTC-equivalent instant:
+#   update seasons set end_date = '2026-10-10 23:59:59+05:30' where id = <season_id>;
+
+# Prize pool ₹1500 total, split three ways — but the split branches on
+# whether the pool was ever unlocked this season (see
+# SEASON_POOL_UNLOCK_THRESHOLD above):
+#   - pool unlocked:  flat payouts by final rank, regardless of exact SP.
+#   - never unlocked: top 3 by final SP get points÷POINTS_TO_RUPEE each,
+#     UNCAPPED, no floor up to ₹1500 — a low-scoring season can
+#     legitimately pay out less than the full pool in this branch.
 PRIZE_1ST = 700
-PRIZE_2ND_CAP = 500
-PRIZE_3RD_CAP = 300
-POINTS_TO_RUPEE = 5  # 5 points = ₹1
+PRIZE_2ND = 500
+PRIZE_3RD = 300
+POINTS_TO_RUPEE = 5  # 5 points = ₹1 (only matters in the never-unlocked branch)
 
-# Shield powers — 7-day (168h) protection window
-SHIELD_COST_POINTS = 500       # self-serve "Use Credits" deduction
-SHIELD_DURATION_HOURS = 168    # was 48h pre-migration_032
-
-# Boost tiers (cash path) — both give the same 168h shield,
-# difference is SP-equivalent value for pricing/audit only.
-SHIELD_BOOST_100_RUPEES = 100
-SHIELD_BOOST_100_POINTS = 500   # ₹100 = 500 SP equivalent
-SHIELD_BOOST_200_RUPEES = 200
-SHIELD_BOOST_200_POINTS = 1000  # ₹200 = 1000 SP equivalent
+# Shield tiers (migration_036) — three tiers, each with its own
+# duration and win bonus. All three give 0 SP lost on any loss; they
+# differ in win bonus, duration, and price. Premium's day-1 +50 (vs
+# +10 on days 2-3) is applied automatically — compared in SQL against
+# the shield's own shield_starts_at, no manual admin top-up needed
+# (unlike the old boost_200 tier's day-1 bonus this replaces, which
+# HAD to be manual because no per-shield start timestamp existed to
+# check against at the time).
+#
+# credits_cost: SP price via the free "Use Credits" path. Only
+# 'normal' has one — 2x_normal and premium are Boost(cash)-only.
+SHIELD_TIERS = {
+    "normal": {
+        "label": "Normal Shield",
+        "duration_hours": 72,
+        "win_sp": 10,
+        "credits_cost": 150,
+        "boost_rupees": 30,
+    },
+    "2x_normal": {
+        "label": "2x Normal Shield",
+        "duration_hours": 144,   # 6 days — bundle discount vs. buying two Normal Shields (₹60) separately
+        "win_sp": 10,
+        "credits_cost": None,    # Boost-only
+        "boost_rupees": 50,
+    },
+    "premium": {
+        "label": "Premium Shield",
+        "duration_hours": 72,
+        "win_sp": 10,            # days 2-3 rate
+        "day1_win_sp": 50,       # first 24h from shield_starts_at, applied automatically
+        "credits_cost": None,    # Boost-only
+        "boost_rupees": 60,
+    },
+}
 
 # Support channel for ticket-based payments
 SUPPORT_CHANNEL_ID = 1524062713590976562

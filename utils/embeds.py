@@ -665,25 +665,37 @@ def ign_confirmation_embed(
     ign_failures: list[dict],
     unmatched: list[dict],
     screenshot_url: str,
+    leavers: list[dict] | None = None,
 ) -> discord.Embed:
     """Rich embed for the IGN confirmation flow. Shows:
     1. What happened (how many IGNs failed)
     2. The OCR-read IGNs that couldn't be resolved
     3. The unmatched roster players (numbered, for the N≥2 modal)
-    4. The full roster for context
-    5. The screenshot as embed image
+    4. Any co-occurring leavers (2026-09, CQ-6867 fix) — shown
+       separately for visibility only; these are auto-resolved as AFK
+       on confirm, never something the admin maps an OCR name onto
+    5. The full roster for context
+    6. The screenshot as embed image
 
-    For N=1 the mapping is unambiguous and shown explicitly.
-    For N≥2 the numbered unmatched list is what the admin references
-    when typing roster numbers in the modal."""
+    For N=1 the mapping is unambiguous and shown explicitly."""
+    leavers = leavers or []
     n = len(ign_failures)
+    description = (
+        f"OCR read the scoreboard but **{n}** player name{'s' if n > 1 else ''} "
+        f"couldn't be matched to the roster. All other data (stats, teams, "
+        f"score) validated fine — this is an IGN-reading issue only."
+    )
+    if leavers:
+        description += (
+            f"\n\n**{len(leavers)}** additional roster player"
+            f"{'s were' if len(leavers) > 1 else ' was'} not on the "
+            f"scoreboard at all — see below. Confirming the mapping "
+            f"will auto-apply the standard no-show penalty to them, "
+            f"same as any other leaver."
+        )
     embed = discord.Embed(
         title=f"Match {match['match_id']} — IGN Confirmation Needed",
-        description=(
-            f"OCR read the scoreboard but **{n}** player name{'s' if n > 1 else ''} "
-            f"couldn't be matched to the roster. All other data (stats, teams, "
-            f"score) validated fine — this is an IGN-reading issue only."
-        ),
+        description=description,
         color=discord.Color.gold(),
     )
 
@@ -715,6 +727,18 @@ def ign_confirmation_embed(
                 f"**{unmatched[0]['players']['ign']}** "
                 f"<@{unmatched[0]['players']['discord_id']}>"
             ),
+            inline=False,
+        )
+
+    # Co-occurring leavers (2026-09, CQ-6867 fix) — informational only,
+    # never a mapping target. Auto-resolved as AFK on confirm.
+    if leavers:
+        leaver_lines = "\n".join(
+            f"• {mp['players']['ign']}  <@{mp['players']['discord_id']}>" for mp in leavers
+        )
+        embed.add_field(
+            name="🚪 Not On Scoreboard (auto no-show)",
+            value=leaver_lines,
             inline=False,
         )
 

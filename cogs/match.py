@@ -999,14 +999,84 @@ class Match(commands.Cog):
             # player — one click for N=1, a short modal for N=2-5.
             # Cap at 5 (Discord modal limit); 6+ unresolved is too messy
             # for a quick confirmation and goes to full manual review.
+            #
+            # AFK/leaver split (2026-09, closes CQ-6867 deferred fix):
+            # "unmatched roster player" used to be one flat bucket, but
+            # it conflates two structurally different cases —
+            #   (a) a roster player with NO row in the OCR extraction at
+            #       all (they weren't on the scoreboard — a genuine
+            #       leaver, same as the existing clean-9/10 AFK path,
+            #       just co-occurring here with an unrelated IGN miss)
+            #   (b) a roster player still unaccounted for because some
+            #       OTHER OCR row named a player OCR couldn't resolve
+            #       (the actual IGN-mismatch case this flow exists for)
+            # CQ-6867 (2026-09-04): both landed in the same "unmatched"
+            # list with no way to tell them apart, so the admin's
+            # proposed-mapping UI could pair the IGN-miss's stats onto
+            # the wrong (absent) player and vice versa — confirmed to
+            # have actually happened once (toenail6767 / Aa丨War).
+            #
+            # total_ocr_rows tells us how many roster players are true
+            # leavers: the roster is always exactly 10, so any shortfall
+            # below 10 rows is players who were never on the scoreboard,
+            # full stop — independent of whatever else did or didn't
+            # resolve by name. Only that many of "unmatched" are treated
+            # as leavers (offered the existing -9 AFK treatment); the
+            # remainder are the genuine IGN-mismatch case this flow was
+            # built for (offered a mapping to an OCR name).
             resolved_ids = {r["player_id"] for r in round_data[0]["results"]}
             unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
+            total_ocr_rows = len(ordered_extractions[0].get("players", []))
+            true_leaver_count = max(0, len(match_players) - total_ocr_rows)
+            # WHICH unmatched players are leavers, not just how many:
+            # an unmatched roster player counts as an IGN-mismatch
+            # candidate only if their own IGN is a plausible fuzzy
+            # neighbor of at least one OCR string that failed to
+            # resolve — i.e. _fuzzy_lookup's own cutoff, applied here
+            # just to rank/split rather than to accept a match outright.
+            # Anyone left over with no such neighbor has nothing on the
+            # scoreboard that could plausibly be them — a likely leaver.
+            ocr_fail_strings = [str(f.get("ocr_ign") or "").strip().lower() for f in ign_failures]
+            def _resembles_any_failure(mp: dict) -> bool:
+                candidate = mp["players"]["ign"].strip().lower()
+                return any(
+                    difflib.SequenceMatcher(None, candidate, ocr).ratio() >= 0.5
+                    for ocr in ocr_fail_strings if ocr
+                )
+            mismatch_candidates = [mp for mp in unmatched if _resembles_any_failure(mp)]
+            no_signal = [mp for mp in unmatched if mp not in mismatch_candidates]
+            if len(no_signal) == true_leaver_count:
+                # Clean case: resemblance signal exactly accounts for
+                # every unmatched slot — auto-split with confidence,
+                # leavers never shown as mapping candidates at all.
+                leavers = no_signal
+                ign_mismatch_unmatched = mismatch_candidates
+            else:
+                # Ambiguous case (2026-09, CQ-6867 follow-up): e.g. the
+                # OCR name genuinely belongs to NONE of the roster (an
+                # unregistered/wrong-lobby name), so resemblance finds
+                # zero matches even though a real IGN-mismatch case
+                # still exists among the unmatched players — a "no
+                # signal" count that overshoots true_leaver_count is
+                # not proof everyone in it is a leaver. Rather than
+                # silently guess (risk: wrongly AFK someone who played)
+                # or silently give up to full review (worse UX for a
+                # case an admin can resolve in five seconds by eye),
+                # surface EVERY unmatched player as a mapping candidate
+                # and let the admin pick who mamaa/etc actually is —
+                # whichever candidates they don't map are then treated
+                # as the leavers. See _complete_ign_confirmed for the
+                # "unmapped candidates become leavers" completion side
+                # of this same logic.
+                leavers = []
+                ign_mismatch_unmatched = unmatched
             if (ign_failures and not has_non_ign_issue
-                    and len(ign_failures) == len(unmatched)
-                    and 1 <= len(ign_failures) <= 5):
+                    and len(ign_failures) <= len(ign_mismatch_unmatched)
+                    and 1 <= len(ign_mismatch_unmatched) <= 5):
                 screenshot_url = ordered_pairs[0][1].url
                 await self._route_to_ign_confirmation(
-                    interaction, match, match_players, ign_failures, unmatched, screenshot_url
+                    interaction, match, match_players, ign_failures, ign_mismatch_unmatched,
+                    screenshot_url, leavers=leavers,
                 )
                 return
 
@@ -1104,6 +1174,36 @@ class Match(commands.Cog):
         return None, f"ambiguous — could be {display}"
 
     @staticmethod
+    def _looks_like_streamer_mask(ign: str) -> bool:
+        """Cheap heuristic for a CODM streamer-mode scrambled name.
+
+        Deliberately conservative — false negatives (missing a real mask)
+        just fall through to the normal 4-step resolution and end up as
+        an ordinary "unknown IGN", no worse than today. False positives
+        (flagging a real short custom IGN as a mask) are the risk to
+        avoid, so every check here is a hard requirement, not a scored
+        heuristic: any real player IGN that happens to trip all three
+        conditions at once was always going to be unresolvable anyway.
+
+        Requires ALL of:
+          - length 12-16 (bare, brackets already stripped by caller's
+            .strip() — this checks the raw ign as received, brackets
+            and all, so a bracket-wrapped 14-char mask like "[fd9sk2jh4lg5fd]"
+            still lands in range)
+          - alphanumeric only, once "[", "]", "(", ")" are ignored
+          - contains at least one letter AND at least one digit (rules
+            out plausible real IGNs that are pure letters or pure digits)
+        """
+        core = ign.translate(str.maketrans("", "", "[]()"))
+        if not (12 <= len(core) <= 16):
+            return False
+        if not core.isalnum():
+            return False
+        has_letter = any(c.isalpha() for c in core)
+        has_digit = any(c.isdigit() for c in core)
+        return has_letter and has_digit
+
+    @staticmethod
     def _resolve_ign(raw_ign: str, roster: dict) -> tuple[dict | None, str | None]:
         """Look up an OCR-read IGN against this match's 10-player roster.
 
@@ -1114,15 +1214,19 @@ class Match(commands.Cog):
            overwhelming common case, zero risk.
         2. Fuzzy match on the raw string (see _fuzzy_lookup) — catches
            ordinary OCR misreads (e.g. "Ézio." vs "Ezío.").
-        3. Strip a "(...)" suffix, if present, and retry as an EXACT match
-           on the remainder. CQ Mobile appends a parenthetical after some
-           players' names on the scoreboard — a short/lowercase echo of
-           their own IGN shown when the full name gets truncated (e.g.
-           "RVL.Eiji(eiji)", "CÖNÑÖR(Con...)"). This is UI chrome, not part
-           of the IGN, and OCR reads it verbatim per its prompt ("string,
-           exactly as shown"). Never reads what was inside the parens —
-           only ever discards it and matches on the part before "(".
-        4. Strip the same "(...)" suffix and retry with a full fuzzy pass
+        3. Strip a "(...)" (or, rarely, "[...]") suffix, if present, and
+           retry as an EXACT match on the remainder. CQ Mobile appends a
+           parenthetical after some players' names on the scoreboard — a
+           short/lowercase echo of their own IGN shown when the full name
+           gets truncated (e.g. "RVL.Eiji(eiji)", "CÖNÑÖR(Con...)"). This
+           is UI chrome, not part of the IGN, and OCR reads it verbatim
+           per its prompt ("string, exactly as shown") — except OCR has
+           been observed occasionally misreading that same "(" as "["
+           (confirmed reproducible in test env, match CQ-5346: "EXG.cHaoS(Chaos)"
+           on screen came back as "EXG.cHaos[Chaos]" from OCR). Never reads
+           what was inside the bracket — only ever discards it and matches
+           on the part before "(" or "[", whichever is present.
+        4. Strip the same suffix and retry with a full fuzzy pass
            (_fuzzy_lookup again) on the remainder — catches the combined
            case where a player's name has BOTH the parenthetical AND an
            ordinary OCR character slip in the base name (e.g. OCR misreads
@@ -1133,7 +1237,7 @@ class Match(commands.Cog):
         Steps 3 and 4 are a genuine last resort — they only run once
         BOTH step 1 and step 2 already missed against the raw string —
         so nothing about today's exact/fuzzy behavior changes for the
-        overwhelming majority of IGNs that don't contain "(" at all.
+        overwhelming majority of IGNs that don't contain "(" or "[" at all.
 
         Returns (match_player_or_None, ambiguity_note_or_None). The note
         is set whenever a step deliberately declined an ambiguous fuzzy
@@ -1141,6 +1245,23 @@ class Match(commands.Cog):
         mean X or Y?" message instead of a bare "unknown IGN".
         """
         ign = raw_ign.strip().lower()
+
+        # Step 0: likely CODM streamer-mode scramble — the game replaces
+        # a player's ENTIRE displayed name with a randomized alphanumeric
+        # string (observed length ~12-16 chars, mixed letters+digits, no
+        # separators) when that player has streamer mode on. Unlike the
+        # "(...)" echo handled in steps 3/4, there is no real IGN left to
+        # recover here by stripping — the whole string IS the mask, not
+        # a suffix on top of a real name. Nothing to fuzzy-match against,
+        # so we skip straight past steps 1-4 to an ambiguity note that
+        # tells the caller/admin what's likely going on, instead of
+        # burning fuzzy-match cycles or returning a bare "unknown IGN".
+        # NOT yet confirmed against a real ChampQueue match (as of
+        # 2026-09-18) — speculative guard based on documented CODM
+        # streamer-mode behavior, kept deliberately narrow so it only
+        # fires on strings that look nothing like a normal IGN.
+        if Match._looks_like_streamer_mask(ign):
+            return None, "possible streamer-mode masked name — resolve manually"
 
         # Step 1: exact match on the raw string.
         exact = roster.get(ign)
@@ -1154,10 +1275,22 @@ class Match(commands.Cog):
 
         # Both steps 1 and 2 came back a clean miss (no match, no
         # ambiguity note) — only now do we consider stripping a
-        # parenthetical, and only if one is actually present.
-        if "(" not in ign:
+        # parenthetical, and only if one is actually present. Check
+        # "(" first, then "[" — OCR normally reads the game's own
+        # "(" nickname-echo chrome verbatim (e.g. "Eiji09(Eiji)",
+        # "Xo.Crisis(Cris..."), but occasionally misreads that same
+        # "(" as "[" on some renders (confirmed reproducible in test
+        # env, match CQ-5346) — same UI element, same strip-and-match
+        # intent, just a different character coming out of OCR. Only
+        # ever discards what's after the opening bracket; never reads
+        # or requires a matching closer, since OCR's echo is often
+        # truncated with "..." before any "]"/")" would appear.
+        if "(" in ign:
+            stripped = ign.split("(", 1)[0].strip()
+        elif "[" in ign:
+            stripped = ign.split("[", 1)[0].strip()
+        else:
             return None, None
-        stripped = ign.split("(", 1)[0].strip()
         if not stripped:
             return None, None
 
@@ -1208,6 +1341,7 @@ class Match(commands.Cog):
         ign_failures: list[dict],
         unmatched: list[dict],
         screenshot_url: str,
+        leavers: list[dict] | None = None,
     ) -> None:
         """Lightweight alternative to _route_to_review for IGN-only
         failures. Flips match status to awaiting_review (same as full
@@ -1215,7 +1349,16 @@ class Match(commands.Cog):
         row. Posts a rich embed with the roster, unresolved OCR reads,
         and the screenshot image to the intake channel, with Confirm/Map
         + Reject buttons. Also posts a reassuring message in the match
-        text channel so the 10 players know what's happening."""
+        text channel so the 10 players know what's happening.
+
+        leavers (2026-09, CQ-6867 fix): roster players identified as
+        genuine no-shows (no OCR row at all) co-occurring with the IGN
+        mismatch(es) this flow is actually for. Shown to the admin for
+        visibility only — confirming the IGN mapping via
+        _complete_ign_confirmed auto-resolves them with the same AFK
+        treatment the clean-path 9/10 case already gets; the admin is
+        never asked to map an OCR name onto a leaver."""
+        leavers = leavers or []
         await adb.update_match(match["id"], {"status": "awaiting_review"})
 
         # --- Player-facing: reassuring message in the match text channel ---
@@ -1241,11 +1384,20 @@ class Match(commands.Cog):
         if intake_channel:
             n = len(ign_failures)
             embed = ign_confirmation_embed(
-                match, match_players, ign_failures, unmatched, screenshot_url
+                match, match_players, ign_failures, unmatched, screenshot_url, leavers=leavers,
             )
+            # Fast-path single-click button only when the mapping is
+            # truly unambiguous: exactly one OCR name failed AND exactly
+            # one roster player is a candidate for it. Any other shape —
+            # including n=1 with 2+ ambiguous candidates (2026-09,
+            # CQ-6867 follow-up: ign_failures count no longer implies
+            # candidate count once unresolved auto-split falls back to
+            # "show everyone") — needs the modal so the admin actually
+            # picks who's who, rather than assuming candidate zero.
+            unambiguous_single = n == 1 and len(unmatched) == 1
             view = IGNConfirmView(
                 match["id"], n,
-                unmatched_player_id=unmatched[0]["player_id"] if n == 1 else None,
+                unmatched_player_id=unmatched[0]["player_id"] if unambiguous_single else None,
             )
             admin_roles = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS) if hasattr(config, "ADMIN_ROLE_IDS") and config.ADMIN_ROLE_IDS else ""
             try:
@@ -1315,9 +1467,41 @@ class Match(commands.Cog):
         resolved_ids = {r["player_id"] for r in temp_round["results"]}
         unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
 
-        # Sanity: every confirmed player_id must be an unmatched player
-        unmatched_pids = {mp["player_id"] for mp in unmatched}
-        if not set(confirmed_pids).issubset(unmatched_pids):
+        # Same leaver/mismatch split as the gate in _submit_body (see
+        # its comment for the full reasoning) — re-derived here rather
+        # than passed through, since this runs on a fresh button click
+        # against current DB state, same pattern this function already
+        # follows for everything else. confirmed_pids must only ever
+        # target the mismatch group; a leaver is never something the
+        # admin maps an OCR name onto, it's auto-resolved as AFK below.
+        total_ocr_rows = len(extraction.get("players", []))
+        true_leaver_count = max(0, len(match_players) - total_ocr_rows)
+        ocr_fail_strings = [str(f.get("ocr_ign") or "").strip().lower() for f in ign_failures]
+        def _resembles_any_failure(mp: dict) -> bool:
+            candidate = mp["players"]["ign"].strip().lower()
+            return any(
+                difflib.SequenceMatcher(None, candidate, ocr).ratio() >= 0.5
+                for ocr in ocr_fail_strings if ocr
+            )
+        mismatch_candidates = [mp for mp in unmatched if _resembles_any_failure(mp)]
+        no_signal = [mp for mp in unmatched if mp not in mismatch_candidates]
+        if len(no_signal) == true_leaver_count:
+            leavers = no_signal
+            mismatch_unmatched = mismatch_candidates
+        else:
+            # Ambiguous split (see _submit_body's gate for full
+            # reasoning) — every unmatched player was offered as a
+            # candidate, and the admin's actual picks (confirmed_pids)
+            # are the real signal now. Whoever's unmatched but NOT
+            # picked is the leaver — determined here, after the human
+            # decision, rather than guessed beforehand.
+            leavers = [mp for mp in unmatched if mp["player_id"] not in confirmed_pids]
+            mismatch_unmatched = unmatched
+
+        # Sanity: every confirmed player_id must be an unmatched-for-IGN
+        # player (never a leaver — leavers are handled below, not here).
+        mismatch_pids = {mp["player_id"] for mp in mismatch_unmatched}
+        if not set(confirmed_pids).issubset(mismatch_pids):
             await interaction.followup.send(
                 "Mapping references a player who isn't unmatched — state may have changed. Use manual review.",
                 ephemeral=True,
@@ -1342,6 +1526,48 @@ class Match(commands.Cog):
         round_data_dict, reasons, _, _ = Match._prepare_round(
             match_players, maps[0], extraction, force_map=force_map
         )
+        # If leavers were identified alongside the IGN mismatch (see
+        # split above), _prepare_round's OWN built-in AFK synthesis
+        # only ever handles exactly one missing player at a time, so
+        # with 1+ leavers still outstanding here it will have declined
+        # to synthesize anything and left its "not one valid row" (and
+        # possibly MVP-count) reasons in place — expected, not a new
+        # problem. Synthesize each leaver's row the same way, same
+        # formula, here instead. Any OTHER reason (bad digits, map
+        # mismatch, etc.) still aborts to manual review same as before.
+        expected_reasons = {"scoreboard does not contain one valid row for every match player"}
+        expected_reasons |= {f"Team {t} must have exactly one game-provided MVP" for t in ("A", "B")}
+        unexpected_reasons = [r for r in reasons if r not in expected_reasons]
+        if leavers and not unexpected_reasons:
+            results = round_data_dict["results"]
+            score_match = _SCORE_RE.fullmatch(str(round_data_dict["final_score"] or ""))
+            winner = "A" if score_match and int(score_match.group(1)) > int(score_match.group(2)) else "B"
+            per_team = Counter(row["team"] for row in results)
+            for leaver in leavers:
+                # Leaver's own team: whichever screen-team is still
+                # short of 5 — same "count directly, never trust a
+                # static letter" approach _prepare_round itself uses.
+                short_teams = [t for t in ("A", "B") if per_team.get(t, 0) == 4]
+                if len(short_teams) != 1:
+                    unexpected_reasons.append(f"could not determine team for leaver {leaver['players']['ign']}")
+                    break
+                leaver_team = short_teams[0]
+                taken_positions = {row["position"] for row in results if row["team"] == leaver_team}
+                leaver_position = next((p for p in range(1, 6) if p not in taken_positions), None)
+                if leaver_position is None:
+                    unexpected_reasons.append(f"no open position for leaver {leaver['players']['ign']}")
+                    break
+                results.append({
+                    "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
+                    "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, leaver_team == winner, False),
+                    "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
+                    "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
+                    "afk": True,
+                })
+                per_team[leaver_team] += 1
+            if not unexpected_reasons and len(results) == 10 and per_team == Counter({"A": 5, "B": 5}):
+                reasons = []
+                round_data_dict["clean"] = True
         if reasons:
             # Something else went wrong (bad digits on the force-mapped
             # row, MVP count off, etc.) — can't auto-complete, fall back.
@@ -1390,6 +1616,14 @@ class Match(commands.Cog):
                     exc=result,
                     match=match,
                 )
+
+        # AFK notice for any leavers auto-resolved alongside this
+        # confirmed IGN mapping — informational only, same as the
+        # existing clean-path notice, does not block anything above.
+        for leaver in leavers:
+            leaver_row = next((r for r in round_data_dict["results"] if r["player_id"] == leaver["player_id"]), None)
+            if leaver_row and leaver_row.get("afk"):
+                await self._notify_afk_leaver(match, leaver_row, leaver["players"]["ign"])
 
         # Flip to pending_verification and post verification card
         deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()

@@ -768,48 +768,56 @@ class Queue(commands.Cog):
             overwrites=overwrites_text
         )
 
-        # Private VC A overwrites (Defender Team)
-        overwrites_vc_a = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
-        }
-        for admin_role in admin_roles:
-            overwrites_vc_a[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
-        for p in team_a:
-            member = guild.get_member(int(p["discord_id"]))
-            if member:
-                overwrites_vc_a[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+        # Per-match VCs (2026-09): gated behind config.CREATE_MATCH_VOICE_CHANNELS
+        # — default off, since these went largely unused in practice.
+        # vc_a/vc_b stay None when off, and the DB update below already
+        # only writes their ids conditionally, so every downstream reader
+        # of voice_channel_a_id/voice_channel_b_id sees the same "no VC
+        # for this match" shape it already knows how to skip past.
+        vc_a = vc_b = None
+        if config.CREATE_MATCH_VOICE_CHANNELS:
+            # Private VC A overwrites (Defender Team)
+            overwrites_vc_a = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
+            }
+            for admin_role in admin_roles:
+                overwrites_vc_a[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            for p in team_a:
+                member = guild.get_member(int(p["discord_id"]))
+                if member:
+                    overwrites_vc_a[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
-        vc_a = await guild.create_voice_channel(
-            name=f"🛡️ {match['match_id']} ",
-            category=category,
-            overwrites=overwrites_vc_a
-        )        
+            vc_a = await guild.create_voice_channel(
+                name=f"🛡️ {match['match_id']} ",
+                category=category,
+                overwrites=overwrites_vc_a
+            )
 
-        # Private VC B overwrites (Attacker Team)
-        overwrites_vc_b = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
-        }
-        for admin_role in admin_roles:
-            overwrites_vc_b[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
-        for p in team_b:
-            member = guild.get_member(int(p["discord_id"]))
-            if member:
-                overwrites_vc_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            # Private VC B overwrites (Attacker Team)
+            overwrites_vc_b = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
+            }
+            for admin_role in admin_roles:
+                overwrites_vc_b[admin_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            for p in team_b:
+                member = guild.get_member(int(p["discord_id"]))
+                if member:
+                    overwrites_vc_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
-        vc_b = await guild.create_voice_channel(
-            name=f"⚔️ {match['match_id']}",
-            category=category,
-            overwrites=overwrites_vc_b
-        )
+            vc_b = await guild.create_voice_channel(
+                name=f"⚔️ {match['match_id']}",
+                category=category,
+                overwrites=overwrites_vc_b
+            )
 
-        await adb.update_match(match["id"], {
-            "text_channel_id": str(text_channel.id),
-            "voice_channel_a_id": str(vc_a.id),
-            "voice_channel_b_id": str(vc_b.id),
-            "status": "forming"
-        })
+        match_update = {"text_channel_id": str(text_channel.id), "status": "forming"}
+        if vc_a is not None:
+            match_update["voice_channel_a_id"] = str(vc_a.id)
+        if vc_b is not None:
+            match_update["voice_channel_b_id"] = str(vc_b.id)
+        await adb.update_match(match["id"], match_update)
 
         host_player = next(p for p in players if p["id"] == host_player_id)
         host_member = guild.get_member(int(host_player["discord_id"]))
@@ -883,9 +891,13 @@ class Queue(commands.Cog):
         # in case we want to reintroduce a single combined ping or change
         # the notification format later.
         # mentions = " ".join(f"<@{p['discord_id']}>" for p in players)
+        voice_line = (
+            f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
+            if vc_a is not None and vc_b is not None else ""
+        )
         await text_channel.send(
             # f"{mentions}\n\n"
-            f"Voice: {vc_a.mention} (Defender) / {vc_b.mention} (Attacker)\n\n"
+            f"{voice_line}"
             f"Host {host_mention}: share the room code here with `+rc<code>` "
             f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n\n"
             f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."

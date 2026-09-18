@@ -101,6 +101,18 @@ REGIONS = ["East", "West", "EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
 RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
 
+# 2026-09: per-match voice channels (Defender/Attacker VCs, created
+# alongside the text channel in _create_match_channels / cogs/queue.py)
+# went largely unused in practice — most players stick to their own
+# voice call outside Discord. Rather than rip the creation code out,
+# gate it behind this switch: default OFF (no VCs created for the next
+# queue), flip back to True to restore the old behavior with zero code
+# changes needed. Every downstream read of voice_channel_a_id/
+# voice_channel_b_id (cleanup, /admin-scrap-match, /admin-swap-player)
+# already treats a missing/None VC id as a normal no-op, so turning
+# creation off here doesn't require touching anything else.
+CREATE_MATCH_VOICE_CHANNELS = os.getenv("CREATE_MATCH_VOICE_CHANNELS", "false").strip().lower() == "true"
+
 # --- Priority fixes: admin IGN-change channel ---
 # 2026-08-08: players frequently change their in-game name after queueing
 # (sometimes mid-match), and OCR/roster mismatches were traced back to this

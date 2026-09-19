@@ -17,7 +17,7 @@ import logging
 from database.db import adb, with_retry
 from services import localization, mmr_engine, validation, vision_extraction
 from utils.embeds import ign_confirmation_embed, verification_card
-from utils.permissions import admin_only, is_admin
+from utils.permissions import admin_only, is_admin, is_mod_or_admin
 from utils import incident_log
 
 logger = logging.getLogger(__name__)
@@ -130,8 +130,8 @@ class IGNConfirmButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls(int(match["match_db_id"]), int(match["player_id"]))
 
     async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Only admins can confirm IGN mappings.", ephemeral=True)
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can confirm IGN mappings.", ephemeral=True)
             return
         cog = interaction.client.get_cog("Match")
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -157,8 +157,8 @@ class IGNMapButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls(int(match["match_db_id"]))
 
     async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Only admins can confirm IGN mappings.", ephemeral=True)
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can confirm IGN mappings.", ephemeral=True)
             return
         # Build the modal from the embed that's already on this message —
         # no DB queries before the initial response, since Discord's 3s
@@ -231,8 +231,8 @@ class IGNRejectButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls(int(match["match_db_id"]))
 
     async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Only admins can review matches.", ephemeral=True)
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can review matches.", ephemeral=True)
             return
         cog = interaction.client.get_cog("Match")
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -430,8 +430,8 @@ class IssueResolveButton(discord.ui.DynamicItem[discord.ui.Button], template=r"i
         return cls(int(match["issue_id"]))
 
     async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Only admins can resolve reports.", ephemeral=True)
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can resolve reports.", ephemeral=True)
             return
         cog = interaction.client.get_cog("Match")
         await interaction.response.send_modal(IssueResolveModal(cog, self.issue_id, interaction.message))
@@ -1399,7 +1399,7 @@ class Match(commands.Cog):
                 match["id"], n,
                 unmatched_player_id=unmatched[0]["player_id"] if unambiguous_single else None,
             )
-            admin_roles = " ".join(f"<@&{rid}>" for rid in config.ADMIN_ROLE_IDS) if hasattr(config, "ADMIN_ROLE_IDS") and config.ADMIN_ROLE_IDS else ""
+            admin_roles = " ".join(f"<@&{rid}>" for rid in sorted(config.ADMIN_ROLE_IDS | config.MODERATOR_ROLE_IDS)) if hasattr(config, "ADMIN_ROLE_IDS") and config.ADMIN_ROLE_IDS else ""
             try:
                 await intake_channel.send(
                     content=admin_roles or None,

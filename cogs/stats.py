@@ -10,7 +10,7 @@ from utils.embeds import (
     player_stats_card, comparison_embed, rank_progress_card, rank_ladder_embed,
     achievements_card, achievements_browse_embed, cs_stats_card,
 )
-from utils.permissions import admin_only
+from utils.permissions import admin_only, mod_or_admin_only
 
 _PAGE_SIZE = 50  # players per leaderboard page — Discord embed description
                  # limit is 4096 chars; a real ign+rank+mmr line runs
@@ -285,7 +285,7 @@ class Stats(commands.Cog):
         await interaction.response.send_message(embed=cs_stats_card(player, season, season_stats), ephemeral=True)
 
     @app_commands.command(name="leaderboard-post", description="Post the persistent unified leaderboard panel")
-    @admin_only()
+    @mod_or_admin_only()
     async def leaderboard_post(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         players = await adb.region_leaderboard()
@@ -295,7 +295,7 @@ class Stats(commands.Cog):
         await interaction.followup.send("Posted the persistent leaderboard panel.", ephemeral=True)
 
     @app_commands.command(name="leaderboard-refresh", description="Admin: force-refresh the leaderboard from the latest DB state")
-    @admin_only()
+    @mod_or_admin_only()
     async def leaderboard_refresh(self, interaction: discord.Interaction):
         # Same rare-stuck-entry safety valve as queue's admin tooling —
         # re-posts a fresh panel rather than trying to locate and edit a

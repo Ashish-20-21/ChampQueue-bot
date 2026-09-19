@@ -48,13 +48,22 @@ GUILD_ID = int(_require("GUILD_ID"))
 # for the required .env rename from ADMIN_ROLE_ID to ADMIN_ROLE_IDS.
 ADMIN_ROLE_IDS = {int(x.strip()) for x in _require("ADMIN_ROLE_IDS").split(",") if x.strip()}
 
-# --- P4: AFK reporting + match-log channel ---
+# --- P4: player reports + match-log channel ---
 # Both channels are created manually in Discord (bot doesn't create them) —
 # grab each channel's ID and set it here or in .env. Optional at import time
 # (default None) so the bot doesn't crash on boot if these haven't been
 # created yet; the features that need them just no-op with a log warning
 # until they're set.
-AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID")) if os.getenv("AFK_CHANNEL_ID") else None
+#
+# REPORT_CHANNEL_ID (renamed from AFK_CHANNEL_ID): the one channel where
+# BOTH /afk and /report post — same audience (admins/moderators), same
+# purpose (something happened in a match, please review). The old env var
+# name is still read as a fallback so an existing host .env that hasn't
+# been updated yet keeps working instead of silently dropping every report.
+# Prefer REPORT_CHANNEL_ID going forward; AFK_CHANNEL_ID can be deleted
+# from .env once the host has been switched over.
+_report_channel_raw = os.getenv("REPORT_CHANNEL_ID") or os.getenv("AFK_CHANNEL_ID")
+REPORT_CHANNEL_ID = int(_report_channel_raw) if _report_channel_raw else None
 MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATCH_LOG_CHANNEL_ID") else None
 
 # --- Incident logging (2026-08-24) ---
@@ -142,6 +151,16 @@ APPROVAL_SWEEP_INTERVAL_SECONDS = 30  # how often the sweep checks for overdue m
 # match — prevents spam/duplicate filing if multiple players in the same
 # match try to flag something around the same time.
 CORRECTION_COMMAND_COOLDOWN_SECONDS = 8
+
+# /report + /afk share ONE per-reporter budget (see cogs/queue.py) so a
+# player can't dodge the limit by alternating between the two commands.
+# discord.py's cooldown is "N uses per window", so this reads literally:
+# at most REPORT_COOLDOWN_USES reports per REPORT_COOLDOWN_WINDOW_SECONDS,
+# per reporting player. Keyed on the reporter (NOT the channel, unlike the
+# host-roll-map/correction cooldowns above) — otherwise one player using
+# up the budget would lock every teammate out of reporting in that match.
+REPORT_COOLDOWN_USES = 5
+REPORT_COOLDOWN_WINDOW_SECONDS = 3600
 
 # Per-channel cooldown on /host-roll-map — cheap guard against a host
 # reroll-spamming to try to land a specific map, not a hard limit on
@@ -361,6 +380,19 @@ HOD_APPROVAL_CHANNEL_ID = int(os.getenv("HOD_APPROVAL_CHANNEL_ID")) if os.getenv
 # person with an HOD role confirms. If unset, cash-path shield grants
 # are disabled (points path still works).
 HOD_ROLE_IDS = {int(x.strip()) for x in os.getenv("HOD_ROLE_IDS", "").split(",") if x.strip()}
+
+# Moderator role IDs — separate from ADMIN_ROLE_IDS on purpose (see
+# utils/permissions.py is_moderator). Comma-separated in .env, optional:
+# unset/empty means no moderators exist and every gate behaves exactly as
+# it did before this feature.
+MODERATOR_ROLE_IDS = {int(x.strip()) for x in os.getenv("MODERATOR_ROLE_IDS", "").split(",") if x.strip()}
+
+# Largest single /admin-adjust-mmr change a Moderator (not an admin) may
+# make, in either direction. One normal match moves MMR by roughly +25 /
+# -20 (+10 for MVP, see MMR_WIN_BASE etc.), so 50 is about one match's worth
+# of correction. Admins are uncapped. Every adjustment is logged with who
+# ran it regardless (mmr_adjustment_log.adjusted_by).
+MODERATOR_MMR_ADJUST_LIMIT = 50
 
 # Points leaderboard display
 POINTS_LEADERBOARD_PAGE_SIZE = 50

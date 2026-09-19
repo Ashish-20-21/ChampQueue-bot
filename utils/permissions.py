@@ -40,3 +40,36 @@ def hod_or_admin_only():
     def predicate(interaction: discord.Interaction) -> bool:
         return is_admin(interaction) or is_hod(interaction)
     return app_commands.check(predicate)
+
+
+def is_moderator(interaction: discord.Interaction) -> bool:
+    """True if the user holds any configured Moderator role.
+
+    Deliberately a SEPARATE set from ADMIN_ROLE_IDS: is_admin() is used in
+    places moderators must NOT inherit (unlimited /ign-change, the
+    scoreboard-upload-on-host's-behalf bypass, /host-roll-map override, and
+    every admin-only command not explicitly opened to moderators). Putting a
+    Moderator role into ADMIN_ROLE_IDS would silently hand all of that over.
+
+    Fails closed: if MODERATOR_ROLE_IDS is unset/empty this is always False,
+    so deploying the code before creating the role changes nothing."""
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    if not config.MODERATOR_ROLE_IDS:
+        return False
+    return any(role.id in config.MODERATOR_ROLE_IDS for role in interaction.user.roles)
+
+
+def is_mod_or_admin(interaction: discord.Interaction) -> bool:
+    return is_admin(interaction) or is_moderator(interaction)
+
+
+def mod_or_admin_only():
+    """Permission gate that allows EITHER admin OR Moderator role holders.
+    Used only on the operational commands moderators share the load on
+    (queue clean/replace, match review/scrap/map-change, panels, ...).
+    Anything destructive to rankings beyond a capped MMR correction stays
+    on admin_only()."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        return is_mod_or_admin(interaction)
+    return app_commands.check(predicate)

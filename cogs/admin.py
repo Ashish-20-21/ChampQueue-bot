@@ -11,7 +11,7 @@ import config
 from database.db import db, adb, with_retry
 from services import reputation, mmr_engine
 from utils.embeds import verification_card, hall_of_fame_embed, season_recap_embed
-from utils.permissions import admin_only, is_admin, hod_or_admin_only
+from utils.permissions import admin_only, is_admin, hod_or_admin_only, mod_or_admin_only
 from utils import incident_log
 from utils.timeutil import iso_to_ts
 from cogs.queue import RegionQueueView, make_queue_embed
@@ -69,7 +69,7 @@ class Admin(commands.Cog):
     #     await interaction.response.send_message(f"Rejected registration for **{player['ign']}**.", ephemeral=True)
 
     @app_commands.command(name="admin-review-queue", description="[Admin] List matches awaiting review")
-    @admin_only()
+    @mod_or_admin_only()
     async def review_queue(self, interaction: discord.Interaction):
         res = await asyncio.to_thread(
             lambda: db.client.table("matches").select("*").eq("status", "awaiting_review").execute()
@@ -159,7 +159,7 @@ class Admin(commands.Cog):
 
     @app_commands.command(name="admin-force-approve", description="[Admin] Approve a match once all 10 round-result rows exist")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)")
-    @admin_only()
+    @mod_or_admin_only()
     async def force_approve(self, interaction: discord.Interaction, match_id: str):
         match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
@@ -196,8 +196,19 @@ class Admin(commands.Cog):
         )
 
     @app_commands.command(name="admin-adjust-mmr", description="[Admin] Manually adjust a player's MMR (disciplinary — e.g. after repeated AFK warnings)")
-    @admin_only()
+    @mod_or_admin_only()
     async def adjust_mmr(self, interaction: discord.Interaction, user: discord.Member, delta: int, reason: str):
+        # Moderators may use this command, but only for small corrections.
+        # Anyone who reaches here without being an admin is a moderator
+        # (the gate above is mod_or_admin_only). Admins are uncapped.
+        limit = config.MODERATOR_MMR_ADJUST_LIMIT
+        if not is_admin(interaction) and abs(delta) > limit:
+            await interaction.response.send_message(
+                f"Moderators can change MMR by at most ±{limit} per action — you entered {delta:+d}. "
+                "Ask an admin for a larger adjustment.",
+                ephemeral=True,
+            )
+            return
         player = await adb.get_player_by_discord_id(user.id)
         if not player:
             await interaction.response.send_message("Player not found.", ephemeral=True)
@@ -434,7 +445,7 @@ class Admin(commands.Cog):
 
 
     @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after 1hr")
-    @admin_only()
+    @mod_or_admin_only()
     async def scrap_match(self, interaction: discord.Interaction, match_id: str, reason: str):
         # Normalize case — match_id is always stored uppercase (CQ-XXXX) but
         # admins will naturally type whatever case they saw it in (channel
@@ -802,7 +813,7 @@ class Admin(commands.Cog):
         app_commands.Choice(name="India / ME", value="INDIA_ME"),
         app_commands.Choice(name="Japan", value="JAPAN"),
     ])
-    @admin_only()
+    @mod_or_admin_only()
     async def queue_clean(self, interaction: discord.Interaction, queue: app_commands.Choice[str],
                            user1: discord.Member | None = None, user2: discord.Member | None = None,
                            user3: discord.Member | None = None):
@@ -864,7 +875,7 @@ class Admin(commands.Cog):
         old_player="The AFK/unavailable player currently in the match",
         new_player="The new player to bring in, same team as old_player",
     )
-    @admin_only()
+    @mod_or_admin_only()
     async def queue_replace(self, interaction: discord.Interaction, match_id: str,
                              old_player: discord.Member, new_player: discord.Member):
         match = await adb.get_match_by_code(match_id.strip().upper())
@@ -985,7 +996,7 @@ class Admin(commands.Cog):
                           description="[Admin] Correct a match's map (e.g. after an illegal in-game map switch)")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", new_map="The corrected map")
     @app_commands.choices(new_map=[app_commands.Choice(name=m, value=m) for m in config.HARDPOINT_MAPS])
-    @admin_only()
+    @mod_or_admin_only()
     async def map_change(self, interaction: discord.Interaction, match_id: str, new_map: app_commands.Choice[str]):
         match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
@@ -1137,7 +1148,7 @@ class Admin(commands.Cog):
     # sweep (piggybacked on the leaderboard reload button), so it can
     # read 'active' well past a shield's actual expiry between
     # sweeps. See db.py's get_all_active_shields docstring.
-    @admin_only()
+    @mod_or_admin_only()
     @app_commands.command(
         name="admin-active-shield",
         description="List every player with a currently active shield, and which tier",

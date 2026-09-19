@@ -5,6 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import config
@@ -42,11 +43,44 @@ COGS = [
 ]
 
 
+def _install_tree_error_handler(tree: app_commands.CommandTree) -> None:
+    """Tell people WHY a slash command refused them, instead of leaving the
+    interaction unanswered.
+
+    Before this, only the /admin-* commands had an error handler. A failed
+    permission check or a cooldown on any other command (queue-post,
+    leaderboard-post, host-roll-map, correction-result, ...) was logged as a
+    traceback and the player just saw "The application did not respond".
+
+    discord.py (2.7.1 checked) calls tree.on_error from a `finally`, i.e.
+    AFTER a command's own @cmd.error handler has already replied. So this
+    must skip anything already answered, or admin.py's commands would
+    double-respond. Anything that isn't a permission/cooldown refusal is
+    handed to discord.py's original handler, so real errors are still
+    logged exactly as before."""
+    default_on_error = tree.on_error
+
+    async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        if isinstance(error, app_commands.CommandOnCooldown):
+            message = str(error)
+        elif isinstance(error, app_commands.CheckFailure) and not isinstance(error, app_commands.BotMissingPermissions):
+            message = "You don't have permission to use this command."
+        else:
+            await default_on_error(interaction, error)
+            return
+        if interaction.response.is_done():
+            return  # the command's own handler already replied
+        await interaction.response.send_message(message, ephemeral=True)
+
+    tree.error(on_tree_error)
+
+
 class ChampionsQueueBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!cq-", intents=INTENTS)
 
     async def setup_hook(self):
+        _install_tree_error_handler(self.tree)
         for cog in COGS:
             await self.load_extension(cog)
             log.info(f"Loaded {cog}")

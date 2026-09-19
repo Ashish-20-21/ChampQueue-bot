@@ -11,7 +11,7 @@ from discord.ext import commands, tasks
 import config
 from database.db import db, adb, with_retry
 from services import matchmaking, mmr_engine, reputation
-from utils.permissions import admin_only
+from utils.permissions import admin_only, mod_or_admin_only
 from utils import incident_log
 
 logger = logging.getLogger("champions_queue")
@@ -322,7 +322,7 @@ class Queue(commands.Cog):
         app_commands.Choice(name="India / ME", value="INDIA_ME"),
         app_commands.Choice(name="Japan", value="JAPAN"),
     ])
-    @admin_only()
+    @mod_or_admin_only()
     async def queue_post(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
         queue_key = queue.value
         await interaction.response.defer(thinking=True)
@@ -748,7 +748,9 @@ class Queue(commands.Cog):
         # elsewhere. Missing/invalid role IDs are silently skipped
         # (guild.get_role returns None) rather than raising, consistent
         # with the old single-role "if admin_role:" fail-open pattern.
-        admin_roles = [r for r in (guild.get_role(rid) for rid in config.ADMIN_ROLE_IDS) if r]
+        # Moderators get the same private-channel visibility as admins — they
+        # act on reports/scraps/map-changes inside these channels.
+        admin_roles = [r for r in (guild.get_role(rid) for rid in (config.ADMIN_ROLE_IDS | config.MODERATOR_ROLE_IDS)) if r]
 
         # Private text channel overwrites
         overwrites_text = {
@@ -1107,11 +1109,50 @@ class Queue(commands.Cog):
         await self._handle_room_code_share(message, message.channel, message.author.id, code, respond, allow_overwrite=is_update)
 
 
-    @app_commands.command(name="afk", description="Report a player (including the host) who isn't following through on this match")
-    @app_commands.describe(target="The player who's gone AFK/unresponsive", reason="Optional — what happened")
-    async def afk(self, interaction: discord.Interaction, target: discord.Member, reason: str = "No reason given"):
+    # ── /afk and /report — one shared pipeline ───────────────────
+    # Both commands do the same job (a player flags someone in their own
+    # match; admins/moderators review it in REPORT_CHANNEL_ID) and only
+    # differ in the embed title/colour and the footer hint, so the whole
+    # flow lives in _submit_match_report() rather than being copy-pasted.
+    # Two copies would inevitably drift: a fix to one (say, blocking
+    # self-reports) would silently miss the other.
+    #
+    # Nothing is written to the database — the Discord post IS the record.
+    # (Deliberate, see the 2026-09-19 decision: complaint volume is low
+    # enough for admins to manage from the channel; add a reports table
+    # only if that stops being true.)
+
+    # Per-reporter budget shared by BOTH commands — see the comment on
+    # REPORT_COOLDOWN_USES in config.py. Module-level mapping (not a
+    # decorator on each command) because two separate @cooldown
+    # decorators would give /afk and /report independent budgets.
+    _report_cooldown = commands.CooldownMapping.from_cooldown(
+        config.REPORT_COOLDOWN_USES,
+        config.REPORT_COOLDOWN_WINDOW_SECONDS,
+        commands.BucketType.user,
+    )
+
+    async def _submit_match_report(
+        self,
+        interaction: discord.Interaction,
+        target: discord.Member,
+        details: str,
+        *,
+        kind: str,  # "afk" or "report" — only affects wording/colour
+    ) -> None:
+        # Cheap, no-DB rejections first.
         if not isinstance(interaction.channel, discord.TextChannel) or not interaction.channel.name.startswith("cq-"):
             await interaction.response.send_message("This only works inside a match channel.", ephemeral=True)
+            return
+
+        # New in /report (2026-09-19). /afk never blocked this; a player
+        # reporting themselves is always a mistake or a joke, and either
+        # way it would page the admin/moderator roles for nothing.
+        if target.id == interaction.user.id:
+            await interaction.response.send_message("You can't report yourself.", ephemeral=True)
+            return
+        if target.bot:
+            await interaction.response.send_message("You can't report a bot.", ephemeral=True)
             return
 
         reporter = await adb.get_player_by_discord_id(interaction.user.id)
@@ -1132,36 +1173,95 @@ class Queue(commands.Cog):
             await interaction.response.send_message("Both players need to be part of this match.", ephemeral=True)
             return
 
+        # Rate limit LAST among the rejections, so a request that was
+        # going to be refused anyway (wrong channel, not in the match,
+        # typo'd target) never burns one of the player's 5 hourly slots.
+        # CooldownMapping expects something message-shaped (reads
+        # .author.id for BucketType.user); a raw Interaction has .user.
+        # Same tiny shim points.py's leaderboard reload already uses.
+        class _Ctx:
+            author = interaction.user
+        retry_after = self._report_cooldown.get_bucket(_Ctx()).update_rate_limit()
+        if retry_after:
+            minutes = max(1, int(retry_after // 60) + 1)
+            await interaction.response.send_message(
+                f"You've hit the report limit ({config.REPORT_COOLDOWN_USES} per hour). "
+                f"Try again in about {minutes} minute{'s' if minutes != 1 else ''}. "
+                "If something is urgent, ping an admin directly.",
+                ephemeral=True,
+            )
+            return
+
         is_host = reported["id"] == match.get("room_code_shared_by")
         await interaction.response.send_message(
-            f"Report sent to admins for review — no action has been taken automatically.", ephemeral=True
+            "Report sent to admins for review — no action has been taken automatically.", ephemeral=True
         )
 
-        if not config.AFK_CHANNEL_ID:
-            logger.warning("AFK_CHANNEL_ID not configured — /AFK report for match_id=%s was not posted anywhere", match["id"])
+        # Fail-open, same as before: the player has already been told
+        # "sent", and a missing/renamed channel must not crash the command.
+        if not config.REPORT_CHANNEL_ID:
+            logger.warning("REPORT_CHANNEL_ID not configured — /%s report for match_id=%s was not posted anywhere",
+                           kind, match["id"])
             return
-        afk_channel = self.bot.get_channel(config.AFK_CHANNEL_ID)
-        if not afk_channel:
-            logger.warning("AFK_CHANNEL_ID=%s not found/accessible", config.AFK_CHANNEL_ID)
+        report_channel = self.bot.get_channel(config.REPORT_CHANNEL_ID)
+        if not report_channel:
+            logger.warning("REPORT_CHANNEL_ID=%s not found/accessible", config.REPORT_CHANNEL_ID)
             return
 
+        if kind == "afk":
+            title = f"⚠️ AFK Report — Match {match['match_id']}"
+            color = discord.Color.orange()
+            footer = "No automatic action taken. Requires admin review — see /admin-scrap-match."
+        else:
+            title = f"🚩 Player Report — Match {match['match_id']}"
+            color = discord.Color.red()
+            footer = "No automatic action taken. Requires admin review."
+
         embed = discord.Embed(
-            title=f"⚠️ AFK Report — Match {match['match_id']}",
+            title=title,
             description=(
                 f"**Reported:** {target.mention} ({reported['ign']}){' — this is the match Host' if is_host else ''}\n"
                 f"**Reported by:** {interaction.user.mention} ({reporter['ign']})\n"
-                f"**Reason:** {reason}"
+                f"**Details:** {details}"
             ),
-            color=discord.Color.orange(),
+            color=color,
         )
-        embed.set_footer(text="No automatic action taken. Requires admin review — see /admin-scrap-match.")
-        # Unified 2026-07-29: was a single admin_role mention. Now pings
-        # every role in ADMIN_ROLE_IDS so any admin (or HOD) gets
-        # notified, not just whoever held the old single role.
-        admin_roles = [interaction.guild.get_role(rid) for rid in config.ADMIN_ROLE_IDS] if interaction.guild else []
+        embed.set_footer(text=footer)
+        # Unified 2026-07-29: pings every role in ADMIN_ROLE_IDS so any
+        # admin (or HOD) gets notified. Moderator roles are included too
+        # (2026-09-19) — otherwise moderators could act on reports but
+        # never get told about them.
+        admin_roles = [interaction.guild.get_role(rid) for rid in (config.ADMIN_ROLE_IDS | config.MODERATOR_ROLE_IDS)] if interaction.guild else []
         admin_roles = [r for r in admin_roles if r]
         content = " ".join(r.mention for r in admin_roles) if admin_roles else None
-        await afk_channel.send(content=content, embed=embed)
+        try:
+            await report_channel.send(content=content, embed=embed)
+        except discord.HTTPException as exc:
+            # The player was already told "sent". Without this the report
+            # would vanish with only a traceback; route it to the incident
+            # log so an admin at least learns a report was lost.
+            logger.exception("report post failed for match_id=%s", match["id"])
+            await incident_log.post(
+                self.bot,
+                category="REPORT_POST_FAIL",
+                summary=f"/{kind} report for match {match['match_id']} could not be posted to REPORT_CHANNEL_ID={config.REPORT_CHANNEL_ID}",
+                exc=exc,
+                match=match,
+            )
+
+    @app_commands.command(name="afk", description="Report a player (including the host) who isn't following through on this match")
+    @app_commands.describe(target="The player who's gone AFK/unresponsive", reason="Optional — what happened")
+    async def afk(self, interaction: discord.Interaction, target: discord.Member, reason: str = "No reason given"):
+        await self._submit_match_report(interaction, target, reason, kind="afk")
+
+    @app_commands.command(name="report", description="Report a player in this match (wrong operator, cheating, toxicity, etc.)")
+    @app_commands.describe(
+        target="The player you're reporting",
+        details="What happened — write it in your own words, the more specific the better",
+    )
+    async def report(self, interaction: discord.Interaction, target: discord.Member,
+                     details: app_commands.Range[str, 5, 900]):
+        await self._submit_match_report(interaction, target, details, kind="report")
 
     @tasks.loop(minutes=config.CLEANUP_SWEEP_INTERVAL_MINUTES)
     async def cleanup_sweep(self):

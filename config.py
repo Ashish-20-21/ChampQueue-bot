@@ -179,7 +179,15 @@ HOST_ROLL_MAP_COOLDOWN_SECONDS = 15
 # Independent of the 1hr cleanup delay itself — this just controls how
 # often the bot checks "is anything due yet".
 CLEANUP_SWEEP_INTERVAL_MINUTES = 5
-MATCH_CHANNEL_CLEANUP_DELAY_SECONDS = 3600   # 1hr grace window before deletion
+MATCH_CHANNEL_CLEANUP_DELAY_SECONDS = 900    # 15-min grace window before deletion
+
+# Optional channel for one-line match status updates (result submitted, etc.).
+# Unset = feature off (same pattern as MATCH_LOG_CHANNEL_ID).
+MATCH_STATUS_CHANNEL_ID = int(os.getenv("MATCH_STATUS_CHANNEL_ID")) if os.getenv("MATCH_STATUS_CHANNEL_ID") else None
+
+# /host-replace-player: max replacements a host can make per match.
+# 0 = feature disabled. Read at startup (needs restart to change).
+HOST_REPLACE_LIMIT = int(os.getenv("HOST_REPLACE_LIMIT", "2"))
 
 # --- Supabase / Postgres ---
 SUPABASE_URL = _require("SUPABASE_URL")

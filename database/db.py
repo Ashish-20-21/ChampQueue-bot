@@ -1498,3 +1498,43 @@ def _current_season_stats(self: Database, player_id: int, season_id: int) -> Opt
     return res.data[0]
 
 Database.current_season_stats = _current_season_stats
+
+
+# ── /host-replace-player support (2026-09-21) ─────────────────────────
+def _claim_host_replacement(self: Database, match_pk: int, expected_used: int) -> bool:
+    """Compare-and-swap on matches.host_replacements_used: bumps the counter
+    to expected_used + 1 ONLY if it still equals expected_used. Returns True
+    if this call won the slot, False if someone else changed it first, so two
+    fast uses can never both pass the limit. Needs migration_037."""
+    res = (
+        self.client.table("matches")
+        .update({"host_replacements_used": expected_used + 1})
+        .eq("id", match_pk)
+        .eq("host_replacements_used", expected_used)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def _get_active_match_for_player(self: Database, player_id: int, exclude_match_pk: int | None = None) -> dict | None:
+    """Returns {"match_id": "CQ-1234", "status": ...} if the player is on a
+    match that is still live (not completed/cancelled/abandoned), else None.
+    Used to stop one player being seated in two matches at once."""
+    res = (
+        self.client.table("match_players")
+        .select("match_id, matches!inner(match_id, status)")
+        .eq("player_id", player_id)
+        .in_("matches.status", ["forming", "map_vote", "awaiting_room", "in_progress",
+                                "awaiting_result", "pending_verification", "awaiting_review"])
+        .execute()
+    )
+    for row in res.data or []:
+        if exclude_match_pk is not None and row.get("match_id") == exclude_match_pk:
+            continue
+        m = row.get("matches") or {}
+        return {"match_id": m.get("match_id"), "status": m.get("status")}
+    return None
+
+
+Database.claim_host_replacement = _claim_host_replacement
+Database.get_active_match_for_player = _get_active_match_for_player

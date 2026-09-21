@@ -87,7 +87,8 @@ async def test_taken_skill_is_one_message(db):
     assert "teammate" in inter.messages[0]
 
 
-async def test_full_team_is_five_calls_and_no_db_reads(db):
+async def test_full_team_is_five_calls_and_no_db_reads(db, monkeypatch):
+    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
     view = make_view()
     total = 0
     for i in range(5):
@@ -109,7 +110,8 @@ async def test_failed_reply_still_counts_vote_and_adds_no_extra_call(db, caplog)
     assert len([r for r in caplog.records if "ack dropped" in r.getMessage()]) == 1   # ONE warning line
 
 
-async def test_failed_reply_vote_is_still_saved_at_five(db):
+async def test_failed_reply_vote_is_still_saved_at_five(db, monkeypatch):
+    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
     view = make_view()
     await click(view, 0, 101, fail_on={"edit_message"})    # this player's repaint fails
     for i in range(1, 5):
@@ -155,7 +157,8 @@ async def test_vote_path_never_uses_defer_or_edit_original_response(db):
     assert "defer" not in seen and "edit_original_response" not in seen and "followup" not in seen
 
 
-async def test_fifth_vote_flushes_once_with_five_votes(db):
+async def test_fifth_vote_flushes_once_with_five_votes(db, monkeypatch):
+    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
     view = make_view()
     for i in range(5):
         await click(view, i, 101 + i)
@@ -164,7 +167,8 @@ async def test_fifth_vote_flushes_once_with_five_votes(db):
     assert all(v["match_id"] == 1 and v["team"] == "A" for v in db.bulk_writes[0])
 
 
-async def test_timeout_flushes_partial_votes(db):
+async def test_timeout_flushes_partial_votes(db, monkeypatch):
+    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
     view = make_view()
     await click(view, 0, 101)
     await click(view, 1, 102)

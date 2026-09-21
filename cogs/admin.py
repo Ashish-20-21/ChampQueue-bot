@@ -444,7 +444,7 @@ class Admin(commands.Cog):
         return f"✅ Hall of Fame posted to {channel.mention} and recorded for {season.get('code') or season.get('name')}."
 
 
-    @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after 1hr")
+    @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after ~15 min")
     @mod_or_admin_only()
     async def scrap_match(self, interaction: discord.Interaction, match_id: str, reason: str):
         # Normalize case — match_id is always stored uppercase (CQ-XXXX) but
@@ -484,14 +484,14 @@ class Admin(commands.Cog):
             try:
                 await text_channel.send(
                     f"⚠️ This match has been scrapped by an admin (`{reason}`). "
-                    f"This channel will be deleted automatically in ~1 hour. "
+                    f"This channel will be deleted automatically in ~15 minutes. "
                     f"Please return to the queue to start a new match."
                 )
             except discord.HTTPException:
                 pass
 
         await interaction.followup.send(
-            f"Match `{match_id}` marked abandoned. VCs deleted, text channel will auto-delete in ~1hr.",
+            f"Match `{match_id}` marked abandoned. VCs deleted, text channel will auto-delete in ~15 min.",
             ephemeral=True,
         )
 
@@ -1295,10 +1295,97 @@ class Admin(commands.Cog):
         else:
             raise error
 
+    # ── /admin-update-host ────────────────────────────────────────
+    @app_commands.command(name="admin-update-host",
+                          description="[Admin] Change the host of a match to another player in the match")
+    @app_commands.describe(
+        match_id="The match ID (e.g. CQ-0001)",
+        new_host="The player who should become the new host (must be in this match)",
+        reason="Why the host is being changed (logged, optional)",
+    )
+    @mod_or_admin_only()
+    async def update_host(self, interaction: discord.Interaction, match_id: str,
+                          new_host: discord.Member, reason: str = ""):
+        match = await adb.get_match_by_code(match_id.strip().upper())
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+
+        blocked = ("completed", "cancelled", "abandoned")
+        if match["status"] in blocked:
+            await interaction.response.send_message(
+                f"Match is `{match['status']}` — host can no longer be changed.", ephemeral=True
+            )
+            return
+
+        new_player = await adb.get_player_by_discord_id(new_host.id)
+        if not new_player:
+            await interaction.response.send_message(
+                f"{new_host.mention} isn't registered.", ephemeral=True
+            )
+            return
+
+        current_host_id = match.get("room_code_shared_by")
+        if new_player["id"] == current_host_id:
+            await interaction.response.send_message(
+                f"**{new_player['ign']}** is already the host of this match.", ephemeral=True
+            )
+            return
+
+        roster = await adb.get_match_players(match["id"])
+        if not any(r["player_id"] == new_player["id"] for r in roster):
+            await interaction.response.send_message(
+                f"**{new_player['ign']}** isn't part of match `{match_id}`.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # One UPDATE — room_code_shared_by IS the host column.
+        await adb.update_match(match["id"], {"room_code_shared_by": new_player["id"]})
+
+        old_host_row = next((r for r in roster if r["player_id"] == current_host_id), None)
+        old_ign = old_host_row["players"]["ign"] if old_host_row else f"(id {current_host_id})"
+        reason_part = f" — reason: {reason}" if reason else ""
+
+        # Post in the match channel so everyone knows.
+        text_channel_id = match.get("text_channel_id")
+        guild = interaction.guild
+        text_channel = guild.get_channel(int(text_channel_id)) if guild and text_channel_id else None
+        if text_channel:
+            try:
+                await text_channel.send(
+                    f"🔄 **Host changed:** {old_ign} → **{new_player['ign']}** "
+                    f"(by {interaction.user.display_name}){reason_part}"
+                )
+            except discord.HTTPException:
+                pass
+
+        # Log to the match-log channel if configured.
+        if config.MATCH_LOG_CHANNEL_ID:
+            log_channel = guild.get_channel(config.MATCH_LOG_CHANNEL_ID) if guild else None
+            if log_channel:
+                try:
+                    await log_channel.send(
+                        f"\U0001f4dd `{match['match_id']}` host changed: "
+                        f"**{old_ign}** → **{new_player['ign']}** "
+                        f"(admin: {interaction.user.display_name}){reason_part}"
+                    )
+                except discord.HTTPException:
+                    pass
+
+        await interaction.followup.send(
+            f"✅ Host of `{match['match_id']}` changed: **{old_ign}** → **{new_player['ign']}**."
+            + (f" Reason: {reason}" if reason else ""),
+            ephemeral=True,
+        )
+
 
 # ── Manual Entry Views/Modals (Approach A: 3-step) ───────────────
 # These live outside the Admin class since Discord.py modal classes
 # are standalone — they can't be nested inside a Cog class.
+
+
 
 _SCORE_RE = re.compile(r"^(\d+)\s*[-:]\s*(\d+)$")
 

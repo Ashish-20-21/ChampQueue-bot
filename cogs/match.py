@@ -628,18 +628,23 @@ class Match(commands.Cog):
         but: host-gated, capped per match (config.HOST_REPLACE_LIMIT, 0 = off),
         and the incoming player is validated (approved, eligible, not already
         in another live match). Admins bypass the cap and don't consume it."""
+        # Defer FIRST: the checks below make several DB round trips, which can blow
+        # Discord's 3-second window (found live 2026-09-21: 404 10062 on a refusal,
+        # the player saw 'did not respond' and never learned why).
+        await interaction.response.defer(ephemeral=True)
+
         if config.HOST_REPLACE_LIMIT <= 0:
-            await interaction.response.send_message("Host replacements are currently disabled.", ephemeral=True)
+            await interaction.followup.send("Host replacements are currently disabled.", ephemeral=True)
             return
 
         match = await adb.get_match_by_code(normalize_match_code(match_id))
         if not match:
-            await interaction.response.send_message("Match not found.", ephemeral=True)
+            await interaction.followup.send("Match not found.", ephemeral=True)
             return
 
         allowed_statuses = ("forming", "awaiting_room", "awaiting_result")
         if match["status"] not in allowed_statuses:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Match is `{match['status']}` — replacements only work while it's still "
                 f"pre-review ({', '.join(f'`{st}`' for st in allowed_statuses)}).",
                 ephemeral=True,
@@ -650,23 +655,23 @@ class Match(commands.Cog):
         caller_is_host = bool(caller) and match.get("room_code_shared_by") == caller["id"]
         caller_is_admin = is_admin(interaction)
         if not caller_is_host and not caller_is_admin:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Only the Match Host (or an admin) can replace a player.", ephemeral=True
             )
             return
 
         if old_player.id == new_player.id:
-            await interaction.response.send_message("Pick two different players.", ephemeral=True)
+            await interaction.followup.send("Pick two different players.", ephemeral=True)
             return
         if caller_is_host and old_player.id == interaction.user.id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "You can't replace yourself — ask an admin to use /admin-update-host.", ephemeral=True
             )
             return
 
         used = int(match.get("host_replacements_used") or 0)
         if not caller_is_admin and used >= config.HOST_REPLACE_LIMIT:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"This match has already used {used}/{config.HOST_REPLACE_LIMIT} host replacements. "
                 f"Ask an admin to use /admin-queue-replace.",
                 ephemeral=True,
@@ -676,39 +681,37 @@ class Match(commands.Cog):
         old = await adb.get_player_by_discord_id(old_player.id)
         new = await adb.get_player_by_discord_id(new_player.id)
         if not old:
-            await interaction.response.send_message(f"{old_player.mention} isn't registered.", ephemeral=True)
+            await interaction.followup.send(f"{old_player.mention} isn't registered.", ephemeral=True)
             return
         if not new:
-            await interaction.response.send_message(f"{new_player.mention} isn't registered.", ephemeral=True)
+            await interaction.followup.send(f"{new_player.mention} isn't registered.", ephemeral=True)
             return
         if new.get("status") != "approved":
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{new['ign']}** is `{new.get('status')}`, not approved.", ephemeral=True
             )
             return
         eligible, why = reputation.is_queue_eligible(new)
         if not eligible:
-            await interaction.response.send_message(f"**{new['ign']}** can't play right now: {why}", ephemeral=True)
+            await interaction.followup.send(f"**{new['ign']}** can't play right now: {why}", ephemeral=True)
             return
 
         roster = await adb.get_match_players(match["id"])
         old_row = next((r for r in roster if r["player_id"] == old["id"]), None)
         if not old_row:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{old['ign']}** isn't part of match `{match['match_id']}`.", ephemeral=True
             )
             return
         if any(r["player_id"] == new["id"] for r in roster):
-            await interaction.response.send_message(f"**{new['ign']}** is already in this match.", ephemeral=True)
+            await interaction.followup.send(f"**{new['ign']}** is already in this match.", ephemeral=True)
             return
         elsewhere = await adb.get_active_match_for_player(new["id"], match["id"])
         if elsewhere:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{new['ign']}** is already in another live match (`{elsewhere['match_id']}`).", ephemeral=True
             )
             return
-
-        await interaction.response.defer(ephemeral=True)
 
         # Claim the slot FIRST (compare-and-swap) so two quick uses can't both
         # pass the limit. Admins don't consume the host cap.
@@ -748,17 +751,6 @@ class Match(commands.Cog):
                 )
             except discord.HTTPException:
                 pass
-
-        if config.MATCH_LOG_CHANNEL_ID:
-            log_ch = self.bot.get_channel(config.MATCH_LOG_CHANNEL_ID)
-            if log_ch:
-                try:
-                    await log_ch.send(
-                        f"🔄 `{match['match_id']}` player replaced: **{old['ign']}** → **{new['ign']}** "
-                        f"(by {interaction.user.display_name})"
-                    )
-                except discord.HTTPException:
-                    pass
 
         await interaction.followup.send(
             f"✅ **{old['ign']}** → **{new['ign']}** on `{match['match_id']}` (Team {team}).", ephemeral=True

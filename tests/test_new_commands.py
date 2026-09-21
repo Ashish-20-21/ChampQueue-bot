@@ -39,8 +39,10 @@ class Chan:
 class Guild:
     def __init__(self, chan):
         self.chan = chan
+        self.asked = []
 
     def get_channel(self, cid):
+        self.asked.append(cid)
         return self.chan
 
     def get_member(self, uid):
@@ -49,9 +51,10 @@ class Guild:
 
 
 class Inter:
-    def __init__(self, uid, guild=None):
+    def __init__(self, uid, guild=None, order=None):
         self.user = Member(uid)
         self.guild = guild
+        self.order = order if order is not None else []
         self.replies, self.followups = [], []
         self.response = type("R", (), {
             "send_message": self._send, "defer": self._defer})()
@@ -63,6 +66,7 @@ class Inter:
 
     async def _defer(self, **kw):
         self.deferred = True
+        self.order.append("defer")
 
     async def _follow(self, content=None, **kw):
         self.followups.append(content)
@@ -80,8 +84,11 @@ class FakeAdb:
         self.p, self.roster, self.m = players_by_discord, roster, match_row
         self.claim_ok, self.elsewhere, self.queue = claim_ok, elsewhere, list(queue)
         self.calls = []
+        self.order = []
 
-    async def get_match_by_code(self, code): return self.m
+    async def get_match_by_code(self, code):
+        self.order.append("db")
+        return self.m
     async def get_player_by_discord_id(self, did): return self.p.get(int(did))
     async def get_match_players(self, pk): return self.roster
     async def get_active_match_for_player(self, pid, excl=None): return self.elsewhere
@@ -121,7 +128,7 @@ def cog(monkeypatch):
 async def run(cog, monkeypatch, fake, caller=101, old=102, new=120):
     monkeypatch.setattr(match, "adb", fake)
     chan = Chan()
-    inter = Inter(caller, Guild(chan))
+    inter = Inter(caller, Guild(chan), fake.order)
     await match.Match.host_replace_player.callback(cog, inter, "1", Member(old), Member(new))
     return inter, chan
 
@@ -141,14 +148,14 @@ async def test_happy_path_swaps_player_and_uses_one_slot(cog, monkeypatch):
 async def test_non_host_is_refused_and_nothing_changes(cog, monkeypatch):
     fake = world()
     inter, _ = await run(cog, monkeypatch, fake, caller=103)                   # a teammate, not the host
-    assert "Only the Match Host" in inter.replies[0]
+    assert "Only the Match Host" in inter.followups[0]
     assert fake.calls == []
 
 
 async def test_limit_reached_is_refused(cog, monkeypatch):
     fake = world(match={"host_replacements_used": 2})
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "2/2" in inter.replies[0]
+    assert "2/2" in inter.followups[0]
     assert fake.calls == []
 
 
@@ -156,46 +163,46 @@ async def test_switch_off_with_limit_zero(cog, monkeypatch):
     monkeypatch.setattr(config, "HOST_REPLACE_LIMIT", 0)
     fake = world()
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "disabled" in inter.replies[0] and fake.calls == []
+    assert "disabled" in inter.followups[0] and fake.calls == []
 
 
 async def test_host_cannot_replace_self(cog, monkeypatch):
     fake = world()
     inter, _ = await run(cog, monkeypatch, fake, old=101)
-    assert "replace yourself" in inter.replies[0] and fake.calls == []
+    assert "replace yourself" in inter.followups[0] and fake.calls == []
 
 
 async def test_new_player_not_approved_is_refused(cog, monkeypatch):
     fake = world()
     fake.p[120]["status"] = "banned"
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "not approved" in inter.replies[0] and fake.calls == []
+    assert "not approved" in inter.followups[0] and fake.calls == []
 
 
 async def test_new_player_low_reputation_is_refused(cog, monkeypatch):
     fake = world()
     fake.p[120]["reputation"] = -9999
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "can't play right now" in inter.replies[0] and fake.calls == []
+    assert "can't play right now" in inter.followups[0] and fake.calls == []
 
 
 async def test_new_player_already_in_another_live_match_is_refused(cog, monkeypatch):
     fake = world(elsewhere={"match_id": "CQ-9", "status": "awaiting_result"})
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "CQ-9" in inter.replies[0] and fake.calls == []
+    assert "CQ-9" in inter.followups[0] and fake.calls == []
 
 
 async def test_old_player_not_in_match_is_refused(cog, monkeypatch):
     fake = world()
     fake.p[130] = P(30, 130, "Stranger")
     inter, _ = await run(cog, monkeypatch, fake, old=130)
-    assert "isn't part of match" in inter.replies[0] and fake.calls == []
+    assert "isn't part of match" in inter.followups[0] and fake.calls == []
 
 
 async def test_finished_match_is_refused(cog, monkeypatch):
     fake = world(match={"status": "completed"})
     inter, _ = await run(cog, monkeypatch, fake)
-    assert "pre-review" in inter.replies[0] and fake.calls == []
+    assert "pre-review" in inter.followups[0] and fake.calls == []
 
 
 async def test_lost_race_on_the_counter_changes_nothing(cog, monkeypatch):
@@ -232,7 +239,7 @@ def admin_cog(monkeypatch):
 async def run_uh(admin_cog, monkeypatch, fake, new=102, reason=""):
     monkeypatch.setattr(admin, "adb", fake)
     chan = Chan()
-    inter = Inter(900, Guild(chan))
+    inter = Inter(900, Guild(chan), fake.order)
     await admin.Admin.update_host.callback(admin_cog, inter, "CQ-1", Member(new), reason)
     return inter, chan
 
@@ -248,16 +255,54 @@ async def test_update_host_new_host_must_be_in_match(admin_cog, monkeypatch):
     fake = world()
     fake.p[120] = P(20, 120, "New")
     inter, _ = await run_uh(admin_cog, monkeypatch, fake, new=120)
-    assert "isn't part of match" in inter.replies[0] and fake.calls == []
+    assert "isn't part of match" in inter.followups[0] and fake.calls == []
 
 
 async def test_update_host_same_host_is_refused(admin_cog, monkeypatch):
     fake = world()
     inter, _ = await run_uh(admin_cog, monkeypatch, fake, new=101)
-    assert "already the host" in inter.replies[0] and fake.calls == []
+    assert "already the host" in inter.followups[0] and fake.calls == []
 
 
 async def test_update_host_finished_match_is_refused(admin_cog, monkeypatch):
     fake = world(match={"status": "abandoned"})
     inter, _ = await run_uh(admin_cog, monkeypatch, fake)
-    assert "no longer be changed" in inter.replies[0] and fake.calls == []
+    assert "no longer be changed" in inter.followups[0] and fake.calls == []
+
+
+# ---------------- defer first + match-channel-only (2026-09-21 live fixes) ----------------
+
+async def test_host_replace_defers_before_any_db_read(cog, monkeypatch):
+    fake = world()
+    inter, _ = await run(cog, monkeypatch, fake)
+    assert fake.order[0] == "defer" and inter.replies == []       # nothing sent the old way
+
+
+async def test_host_replace_refusals_also_defer_first(cog, monkeypatch):
+    fake = world()
+    inter, _ = await run(cog, monkeypatch, fake, caller=103)      # non-host -> refusal
+    assert fake.order[0] == "defer" and inter.replies == [] and inter.followups
+
+
+async def test_host_replace_never_posts_to_match_log(cog, monkeypatch):
+    monkeypatch.setattr(config, "MATCH_LOG_CHANNEL_ID", 999)
+    asked = []
+    cog.bot = type("B", (), {"get_channel": lambda self, cid: asked.append(cid)})()
+    fake = world()
+    inter, chan = await run(cog, monkeypatch, fake)
+    assert 999 not in asked and any("replaced by" in (x or "") for x in chan.sent)   # match channel only
+
+
+async def test_update_host_defers_before_any_db_read(admin_cog, monkeypatch):
+    fake = world()
+    inter, _ = await run_uh(admin_cog, monkeypatch, fake)
+    assert fake.order[0] == "defer" and inter.replies == []
+
+
+async def test_update_host_never_posts_to_match_log(admin_cog, monkeypatch):
+    monkeypatch.setattr(config, "MATCH_LOG_CHANNEL_ID", 999)
+    fake = world()
+    monkeypatch.setattr(admin, "adb", fake)
+    chan = Chan(); guild = Guild(chan); inter = Inter(900, guild, fake.order)
+    await admin.Admin.update_host.callback(admin_cog, inter, "CQ-1", Member(102), "")
+    assert 999 not in guild.asked and any("Host changed" in (x or "") for x in chan.sent)

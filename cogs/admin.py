@@ -1306,40 +1306,41 @@ class Admin(commands.Cog):
     @mod_or_admin_only()
     async def update_host(self, interaction: discord.Interaction, match_id: str,
                           new_host: discord.Member, reason: str = ""):
+        # Defer FIRST (several DB reads follow; see /host-replace-player for the live incident).
+        await interaction.response.defer(ephemeral=True)
+
         match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
-            await interaction.response.send_message("Match not found.", ephemeral=True)
+            await interaction.followup.send("Match not found.", ephemeral=True)
             return
 
         blocked = ("completed", "cancelled", "abandoned")
         if match["status"] in blocked:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Match is `{match['status']}` — host can no longer be changed.", ephemeral=True
             )
             return
 
         new_player = await adb.get_player_by_discord_id(new_host.id)
         if not new_player:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"{new_host.mention} isn't registered.", ephemeral=True
             )
             return
 
         current_host_id = match.get("room_code_shared_by")
         if new_player["id"] == current_host_id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{new_player['ign']}** is already the host of this match.", ephemeral=True
             )
             return
 
         roster = await adb.get_match_players(match["id"])
         if not any(r["player_id"] == new_player["id"] for r in roster):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{new_player['ign']}** isn't part of match `{match_id}`.", ephemeral=True
             )
             return
-
-        await interaction.response.defer(ephemeral=True)
 
         # One UPDATE — room_code_shared_by IS the host column.
         await adb.update_match(match["id"], {"room_code_shared_by": new_player["id"]})
@@ -1360,19 +1361,6 @@ class Admin(commands.Cog):
                 )
             except discord.HTTPException:
                 pass
-
-        # Log to the match-log channel if configured.
-        if config.MATCH_LOG_CHANNEL_ID:
-            log_channel = guild.get_channel(config.MATCH_LOG_CHANNEL_ID) if guild else None
-            if log_channel:
-                try:
-                    await log_channel.send(
-                        f"\U0001f4dd `{match['match_id']}` host changed: "
-                        f"**{old_ign}** → **{new_player['ign']}** "
-                        f"(admin: {interaction.user.display_name}){reason_part}"
-                    )
-                except discord.HTTPException:
-                    pass
 
         await interaction.followup.send(
             f"✅ Host of `{match['match_id']}` changed: **{old_ign}** → **{new_player['ign']}**."

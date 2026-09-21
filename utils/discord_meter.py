@@ -17,6 +17,15 @@ so one-call replies can be told apart from defer + follow-up. A 10-second timer
 prints each finished minute on time (without it a line only appeared when the
 NEXT Discord call happened, sometimes many minutes late). Minutes are UTC.
 
+Bursts and rate limits (added 2026-09-22): every minute line also carries the busiest
+single second and busiest 5 seconds per category (peak1s_reply / peak5s_reply for
+interaction replies, peak1s_chan / peak5s_chan for normal channel calls), because a
+per-minute total hides the short bursts Discord limits actually act on. Every 429
+also gets one DISCORD_429 warning line (max 5 per minute) with the response headers
+(X-RateLimit-*, Via, Retry-After) and how many calls we had just made in the last
+1 s / 5 s, so the real rule can be read off instead of guessed. Only the route
+TEMPLATE is logged, never a URL, so interaction tokens can't leak into the log.
+
 Safety: the counter dict and the log line can never raise into the caller.
 The original function is ALWAYS called, even if counting fails.
 """
@@ -41,9 +50,28 @@ _orig_http_request = None
 _orig_webhook_request = None
 _installed = False
 
+# Per-second hit counters, by category: "reply" = interaction replies (webhook
+# adapter), "chan" = normal channel/guild calls. Key: (category, epoch_second).
+_sec_hits: dict[tuple[str, int], int] = defaultdict(int)
+# DISCORD_429 detail lines already written, per minute (cap so a storm can't flood the log)
+_429_lines: dict[str, int] = defaultdict(int)
+_MAX_429_LINES_PER_MINUTE = 5
+_FORENSIC_HEADERS = (
+    "Retry-After", "X-RateLimit-Scope", "X-RateLimit-Limit", "X-RateLimit-Remaining",
+    "X-RateLimit-Reset-After", "X-RateLimit-Bucket", "X-RateLimit-Global", "Via",
+)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _minute_of(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M", time.gmtime(ts))
+
 
 def _minute_key() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M", time.gmtime())
+    return _minute_of(_now())
 
 
 def _simplify_path(path: str) -> str:
@@ -83,12 +111,91 @@ def _callback_kind(path: str, kwargs: dict) -> str:
         return ""
 
 
-def _record(method: str, path: str, outcome: str, kind: str = "") -> None:
-    """Add one tick. Must never raise."""
+def _record(method: str, path: str, outcome: str, kind: str = "", cat: str = "",
+            ts: float | None = None) -> None:
+    """Add one tick (ts = when the request STARTED). Must never raise."""
     try:
-        minute = _minute_key()
+        now = _now() if ts is None else ts
+        minute = _minute_of(now)
         simple = _simplify_path(path) + (f" [{kind}]" if kind else "")
         _counts[(minute, method, simple, outcome)] += 1
+        if cat:
+            _sec_hits[(cat, int(now))] += 1
+    except Exception:
+        pass
+
+
+def _recent(cat: str, seconds: int, now: float) -> int:
+    """Calls of this category started in the last `seconds` seconds (incl. the current one)."""
+    return sum(_sec_hits.get((cat, int(now) - k), 0) for k in range(seconds))
+
+
+def _take_peaks(minute: str) -> dict[str, tuple[int, int]]:
+    """{category: (busiest 1 s, busiest 5 s)} for one finished minute; drops those entries.
+    (A 5 s window is cut at the minute edge — a small undercount, fine for spotting bursts.)"""
+    by_cat: dict[str, dict[int, int]] = {}
+    for (cat, sec), n in list(_sec_hits.items()):
+        if _minute_of(sec) == minute:
+            by_cat.setdefault(cat, {})[sec] = n
+            del _sec_hits[(cat, sec)]
+    out = {}
+    for cat, secs in by_cat.items():
+        p1 = max(secs.values())
+        p5 = max(sum(secs.get(sec + k, 0) for k in range(5)) for sec in secs)
+        out[cat] = (p1, p5)
+    return out
+
+
+def _log_429(method: str, path: str, kind: str, cat: str, exc: Exception, ts: float) -> None:
+    """One warning with everything Discord told us about a 429. Never raises."""
+    try:
+        minute = _minute_of(ts)
+        if _429_lines[minute] >= _MAX_429_LINES_PER_MINUTE:
+            return
+        _429_lines[minute] += 1
+        for old_minute in [m for m in _429_lines if m < minute]:
+            del _429_lines[old_minute]
+        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+        seen = {}
+        for h in _FORENSIC_HEADERS:
+            try:
+                v = headers.get(h)
+            except Exception:
+                v = None
+            if v is not None:
+                seen[h] = str(v)
+        logger.warning(
+            "DISCORD_429 route=%s %s%s cat=%s code=%s text=%r headers=%s "
+            "recent_1s=%d recent_5s=%d all_1s=%d",
+            method, _simplify_path(path), f" [{kind}]" if kind else "", cat,
+            getattr(exc, "code", None), str(getattr(exc, "text", "") or "")[:120],
+            seen or "none", _recent(cat, 1, ts), _recent(cat, 5, ts),
+            sum(_recent(c, 1, ts) for c in ("reply", "chan")),
+        )
+    except Exception:
+        pass
+
+
+def _after_call(method: str, path: str, kind: str, cat: str, t0: float,
+                exc: Exception | None) -> None:
+    """All metering for one finished call, fully guarded: the meter must never
+    change the outcome of the Discord call it is watching."""
+    try:
+        if exc is None:
+            outcome = "ok"
+        else:
+            code = getattr(getattr(exc, "response", None), "status", 0)
+            outcome = str(code) if code else "err"
+        _record(method, path, outcome, kind, cat, t0)
+        if outcome == "429":
+            _log_429(method, path, kind, cat, exc, t0)
+    except Exception:
+        pass
+
+
+async def _safe_flush() -> None:
+    try:
+        await _flush_if_new_minute()
     except Exception:
         pass
 
@@ -116,10 +223,15 @@ async def _flush_if_new_minute() -> None:
                     total_429 += count
                 else:
                     total_err += count
+            peaks = _take_peaks(prev)
+            peak_txt = "".join(
+                f" peak1s_{c}={p1} peak5s_{c}={p5}" for c, (p1, p5) in sorted(peaks.items()))
             logger.info(
-                "DISCORD_METER minute=%s ok=%d 429=%d err=%d | %s",
-                prev, total_ok, total_429, total_err, " | ".join(lines),
+                "DISCORD_METER minute=%s ok=%d 429=%d err=%d%s | %s",
+                prev, total_ok, total_429, total_err, peak_txt, " | ".join(lines),
             )
+        for key in [k for k in _sec_hits if _minute_of(k[1]) < minute]:   # safety net
+            del _sec_hits[key]
 
 
 _ticker_task: "asyncio.Task | None" = None
@@ -155,37 +267,33 @@ def _stop_ticker() -> None:
 def _wrap_http_request(original):
     """Wrap HTTPClient.request (channel sends, edits, creates, deletes)."""
     async def wrapper(self, route, **kwargs):
-        method = route.method
-        path = route.path
+        method, path, t0 = route.method, route.path, _now()
         try:
             result = await original(self, route, **kwargs)
-            _record(method, path, "ok")
-            await _flush_if_new_minute()
-            return result
         except Exception as exc:
-            code = getattr(getattr(exc, "response", None), "status", 0)
-            _record(method, path, str(code) if code else "err")
-            await _flush_if_new_minute()
+            _after_call(method, path, "", "chan", t0, exc)
+            await _safe_flush()
             raise
+        _after_call(method, path, "", "chan", t0, None)
+        await _safe_flush()
+        return result
     return wrapper
 
 
 def _wrap_webhook_request(original):
     """Wrap AsyncWebhookAdapter.request (interaction replies)."""
     async def wrapper(self, route, session, **kwargs):
-        method = route.method
-        path = route.path
+        method, path, t0 = route.method, route.path, _now()
         kind = _callback_kind(path, kwargs)
         try:
             result = await original(self, route, session, **kwargs)
-            _record(method, path, "ok", kind)
-            await _flush_if_new_minute()
-            return result
         except Exception as exc:
-            code = getattr(getattr(exc, "response", None), "status", 0)
-            _record(method, path, str(code) if code else "err", kind)
-            await _flush_if_new_minute()
+            _after_call(method, path, kind, "reply", t0, exc)
+            await _safe_flush()
             raise
+        _after_call(method, path, kind, "reply", t0, None)
+        await _safe_flush()
+        return result
     return wrapper
 
 
@@ -234,4 +342,6 @@ def reset() -> None:
     """Clear all counters (for tests)."""
     global _last_flush_minute
     _counts.clear()
+    _sec_hits.clear()
+    _429_lines.clear()
     _last_flush_minute = ""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 
 import discord
 from discord import app_commands
@@ -15,6 +16,67 @@ from utils.permissions import admin_only, mod_or_admin_only
 from utils import incident_log
 
 logger = logging.getLogger("champions_queue")
+
+
+# ---------------------------------------------------------------------------
+# Webhook-429 isolation + click debounce (2026-09-19, live-load fix)
+#
+# Incident: under a hyper-active queue, Discord's per-webhook rate limit (429)
+# began dropping button acks. Players saw nothing happen and re-clicked
+# 20-50x each, which (a) burned the same webhook budget faster, and (b) fed
+# the rollback race in db.queue_mark_waiting. Two independent defences:
+#
+#  1. _safe_ack(): EVERY player-facing Discord message in join/leave goes
+#     through one helper that can never raise and never retries. The DB write
+#     is the source of truth and has already succeeded (or failed and been
+#     reported) by the time this runs, so a lost ack costs nothing but a
+#     stale button. A 429 here is logged at DEBUG-ish volume, not escalated.
+#
+#  2. _click_gate(): a tiny per-(player, action) in-memory cooldown that drops
+#     rapid repeat clicks BEFORE they touch the DB or Discord. It is
+#     deliberately in-memory and best-effort: a bot restart just clears it,
+#     and it can only ever suppress a click (never create state), so it fails
+#     safe. It is intentionally NOT applied to Start Match.
+# ---------------------------------------------------------------------------
+_CLICK_COOLDOWN_SECONDS = 2.0
+_click_last: dict[tuple[int, str], float] = {}
+_CLICK_MAP_MAX = 5000  # hard cap so this can never grow unbounded
+
+
+def _click_gate(discord_user_id: int, action: str) -> bool:
+    """True = let this click through. False = drop it as a repeat click.
+    Never raises."""
+    try:
+        now = time.monotonic()
+        key = (discord_user_id, action)
+        last = _click_last.get(key)
+        if last is not None and (now - last) < _CLICK_COOLDOWN_SECONDS:
+            return False
+        if len(_click_last) >= _CLICK_MAP_MAX:
+            cutoff = now - _CLICK_COOLDOWN_SECONDS
+            for k in [k for k, v in _click_last.items() if v < cutoff]:
+                _click_last.pop(k, None)
+            if len(_click_last) >= _CLICK_MAP_MAX:
+                _click_last.clear()
+        _click_last[key] = now
+        return True
+    except Exception:
+        return True  # fail open: never block a real player on a gate bug
+
+
+async def _safe_ack(send_coro_factory, *, what: str, player_id=None) -> bool:
+    """Run a Discord-message coroutine; swallow every failure. Returns True
+    if it was delivered. send_coro_factory is a zero-arg callable returning
+    the awaitable (so it is only created if we actually run it)."""
+    try:
+        await send_coro_factory()
+        return True
+    except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+        logger.warning("ack dropped (%s) player_id=%s: %s", what, player_id, getattr(e, "status", e))
+        return False
+    except Exception:
+        logger.exception("ack unexpectedly failed (%s) player_id=%s", what, player_id)
+        return False
 
 
 class SkillVoteView(discord.ui.View):
@@ -93,21 +155,27 @@ class SkillVoteView(discord.ui.View):
             await interaction.response.defer(ephemeral=True)
 
             player = await adb.get_player_by_discord_id(interaction.user.id)
+            # 2026-09-20: these replies were bare. Live log showed a 429
+            # "Rate limit reached for webhook" on the "already picked"
+            # reply escaping as an ERROR traceback (button spam by a player
+            # whose first click DID save). The vote state is already decided
+            # above — the message is cosmetic — so a lost reply must never
+            # raise. _safe_ack logs one WARNING line and moves on.
             if not player or player["id"] not in self.team_player_ids:
-                await interaction.followup.send("This isn't your team's vote.", ephemeral=True)
+                await _safe_ack(lambda: interaction.followup.send("This isn't your team's vote.", ephemeral=True), what="vote-not-your-team")
                 return
             if player["id"] in self.voted_player_ids:
-                await interaction.followup.send(
+                await _safe_ack(lambda: interaction.followup.send(
                     "You've already picked an operator skill for this match — it's locked in, "
                     "you can't change it. Check the button showing your name for what you picked.",
                     ephemeral=True,
-                )
+                ), what="vote-already-picked", player_id=player["id"])
                 return
             if skill in self.taken_skills:
-                await interaction.followup.send(
+                await _safe_ack(lambda: interaction.followup.send(
                     f"**{skill}** was already picked by a teammate — operator skills must be unique per team.",
                     ephemeral=True,
-                )
+                ), what="vote-skill-taken", player_id=player["id"])
                 return
 
             # In-memory lock-in — instant, same as before, no DB round
@@ -160,18 +228,11 @@ class SkillVoteView(discord.ui.View):
             # their pick locked in even though the button display didn't
             # refresh on their end.
             if edit_failed:
-                try:
-                    await interaction.followup.send(
-                        f"Your pick (**{skill}**) is locked in — your vote was saved successfully "
-                        f"even though the button display didn't update.",
-                        ephemeral=True,
-                    )
-                except discord.errors.HTTPException as e2:
-                    logger.warning(
-                        "SkillVoteView: fallback followup also failed for player_id=%s, skill=%s "
-                        "(vote already recorded, player will see it as failed on their end): %s",
-                        player["id"], skill, e2,
-                    )
+                await _safe_ack(lambda: interaction.followup.send(
+                    f"Your pick (**{skill}**) is locked in — your vote was saved successfully "
+                    f"even though the button display didn't update.",
+                    ephemeral=True,
+                ), what="vote-fallback-confirm", player_id=player["id"])
 
         button.callback = callback
         return button
@@ -395,6 +456,15 @@ class Queue(commands.Cog):
         #    real panel has to go through the captured `panel_message`
         #    directly instead of interaction.edit_original_response().
         is_retry = panel_message is not None
+
+        # Repeat-click debounce (2026-09-19). A dropped click MUST still be
+        # acknowledged or Discord shows the player "interaction failed" —
+        # so we defer (one cheap call, no DB, no followup message) and stop.
+        # Retry-button clicks are exempt: that's a deliberate second attempt.
+        if not is_retry and not _click_gate(interaction.user.id, "join"):
+            await _safe_ack(lambda: interaction.response.defer(), what="join-debounce")
+            return
+
         if is_retry:
             view = RegionQueueView(queue_key, self)
 
@@ -416,10 +486,10 @@ class Queue(commands.Cog):
             return
 
         if not player:
-            await interaction.followup.send("You need to `/register` and be approved first.", ephemeral=True)
+            await _safe_ack(lambda: interaction.followup.send("You need to `/register` and be approved first.", ephemeral=True), what="join-unregistered")
             return
         if player["status"] != "approved":
-            await interaction.followup.send(f"Your registration is `{player['status']}`, not approved yet.", ephemeral=True)
+            await _safe_ack(lambda: interaction.followup.send(f"Your registration is `{player['status']}`, not approved yet.", ephemeral=True), what="join-unapproved", player_id=player["id"])
             return
 
         # Unified 2026-07-29: the players.region == queue_key gate is
@@ -434,7 +504,7 @@ class Queue(commands.Cog):
 
         eligible, reason = reputation.is_queue_eligible(player)
         if not eligible:
-            await interaction.followup.send(reason, ephemeral=True)
+            await _safe_ack(lambda: interaction.followup.send(reason, ephemeral=True), what="join-ineligible", player_id=player["id"])
             return
 
         async with self._locks[queue_key]:
@@ -461,13 +531,10 @@ class Queue(commands.Cog):
             # calls are try/excepted now; a 429 on our own message-send is
             # just logged and returned, never escalated into more sends.
             if len(current_queue) >= 10:
-                try:
-                    await interaction.followup.send(
-                        "Queue is full (10/10) — a match is about to start. Try again in a moment.",
-                        ephemeral=True,
-                    )
-                except discord.errors.HTTPException as e:
-                    logger.warning("handle_join: 'queue full' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                await _safe_ack(lambda: interaction.followup.send(
+                    "Queue is full (10/10) — a match is about to start. Try again in a moment.",
+                    ephemeral=True,
+                ), what="join-queue-full", player_id=player["id"])
                 return
 
             try:
@@ -477,10 +544,7 @@ class Queue(commands.Cog):
                 return
 
             if entry is None:
-                try:
-                    await interaction.followup.send("You're already in the queue.", ephemeral=True)
-                except discord.errors.HTTPException as e:
-                    logger.warning("handle_join: 'already in queue' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                await _safe_ack(lambda: interaction.followup.send("You're already in the queue.", ephemeral=True), what="join-already-in", player_id=player["id"])
                 return
 
             try:
@@ -493,11 +557,8 @@ class Queue(commands.Cog):
             embed = make_queue_embed(queue_key, current_queue)
 
             if is_retry:
-                try:
-                    await panel_message.edit(embed=embed, view=view)
-                except (discord.errors.NotFound, discord.errors.HTTPException) as e:
-                    logger.warning("handle_join(retry): panel_message.edit failed for player_id=%s (join already saved): %s", player["id"], e)
-                await interaction.edit_original_response(content="✅ You're in the queue.", view=None)
+                await _safe_ack(lambda: panel_message.edit(embed=embed, view=view), what="join-retry-panel", player_id=player["id"])
+                await _safe_ack(lambda: interaction.edit_original_response(content="✅ You're in the queue.", view=None), what="join-retry-ack", player_id=player["id"])
                 return
 
             # DB write above already succeeded — that's the source of
@@ -505,10 +566,7 @@ class Queue(commands.Cog):
             # instead of an unhandled exception if the interaction token
             # went stale (e.g. network jitter), so the player's join is
             # never lost even if the button UI doesn't refresh for them.
-            try:
-                await interaction.edit_original_response(embed=embed, view=view)
-            except (discord.errors.NotFound, discord.errors.HTTPException) as e:
-                logger.warning("handle_join: edit_original_response failed for player_id=%s (join already saved): %s", player["id"], e)
+            await _safe_ack(lambda: interaction.edit_original_response(embed=embed, view=view), what="join-ack", player_id=player["id"])
 
     async def handle_leave(
         self, interaction: discord.Interaction, queue_key: str,
@@ -516,6 +574,11 @@ class Queue(commands.Cog):
     ):
         # See handle_join above for the two-entry-path explanation.
         is_retry = panel_message is not None
+
+        if not is_retry and not _click_gate(interaction.user.id, "leave"):
+            await _safe_ack(lambda: interaction.response.defer(), what="leave-debounce")
+            return
+
         if is_retry:
             view = RegionQueueView(queue_key, self)
 
@@ -528,7 +591,7 @@ class Queue(commands.Cog):
             return
 
         if not player:
-            await interaction.followup.send("You're not registered.", ephemeral=True)
+            await _safe_ack(lambda: interaction.followup.send("You're not registered.", ephemeral=True), what="leave-unregistered")
             return
 
         async with self._locks[queue_key]:
@@ -543,10 +606,7 @@ class Queue(commands.Cog):
             # why this is deliberately outside the try/except.
             in_queue = any(p["player_id"] == player["id"] for p in current_queue)
             if not in_queue:
-                try:
-                    await interaction.followup.send("You're not in the queue.", ephemeral=True)
-                except discord.errors.HTTPException as e:
-                    logger.warning("handle_leave: 'not in queue' followup failed for player_id=%s (Discord-side, not a DB issue): %s", player["id"], e)
+                await _safe_ack(lambda: interaction.followup.send("You're not in the queue.", ephemeral=True), what="leave-not-in", player_id=player["id"])
                 return
 
             try:
@@ -560,42 +620,58 @@ class Queue(commands.Cog):
             embed = make_queue_embed(queue_key, current_queue)
 
             if is_retry:
-                try:
-                    await panel_message.edit(embed=embed, view=view)
-                except (discord.errors.NotFound, discord.errors.HTTPException) as e:
-                    logger.warning("handle_leave(retry): panel_message.edit failed for player_id=%s (leave already saved): %s", player["id"], e)
-                await interaction.edit_original_response(content="✅ You've left the queue.", view=None)
+                await _safe_ack(lambda: panel_message.edit(embed=embed, view=view), what="leave-retry-panel", player_id=player["id"])
+                await _safe_ack(lambda: interaction.edit_original_response(content="✅ You've left the queue.", view=None), what="leave-retry-ack", player_id=player["id"])
                 return
 
-            try:
-                await interaction.edit_original_response(embed=embed, view=view)
-            except (discord.errors.NotFound, discord.errors.HTTPException) as e:
-                logger.warning("handle_leave: edit_original_response failed for player_id=%s (leave already saved): %s", player["id"], e)
+            await _safe_ack(lambda: interaction.edit_original_response(embed=embed, view=view), what="leave-ack", player_id=player["id"])
 
     async def handle_start_match(self, interaction: discord.Interaction, queue_key: str, view: RegionQueueView):
         # Defer first, before the get_player_by_discord_id / queue_current /
         # lock-wait chain below — same fix as handle_join/handle_leave.
         await interaction.response.defer(ephemeral=True)
 
-        player = await adb.get_player_by_discord_id(interaction.user.id)
+        # 2026-09-19: these reads were bare adb calls — one transient
+        # network blip left the host on an endless "thinking..." spinner
+        # with no message and no incident. with_retry + a reported failure
+        # matches what handle_join/handle_leave already do.
+        try:
+            player = await with_retry(adb.get_player_by_discord_id, interaction.user.id)
+        except Exception as exc:
+            logger.exception("handle_start_match: get_player failed for queue_key=%s", queue_key)
+            await incident_log.post(self.bot, category="QUEUE_START_DB_FAIL",
+                summary=f"handle_start_match: get_player failed for queue_key={queue_key} — {exc!r}", exc=exc)
+            await _safe_ack(lambda: interaction.followup.send(
+                "Couldn't start the match right now (temporary connection issue). Nothing was changed — try Start Match again.",
+                ephemeral=True), what="start-getplayer-fail")
+            return
         if not player:
-            await interaction.followup.send("You're not registered.", ephemeral=True)
+            await _safe_ack(lambda: interaction.followup.send("You're not registered.", ephemeral=True), what="start-unregistered")
             return
 
         async with self._locks[queue_key]:
-            current_queue = await adb.queue_current(queue_key=queue_key)
+            try:
+                current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+            except Exception as exc:
+                logger.exception("handle_start_match: queue_current failed for queue_key=%s", queue_key)
+                await incident_log.post(self.bot, category="QUEUE_START_DB_FAIL",
+                    summary=f"handle_start_match: queue_current failed for queue_key={queue_key} — {exc!r}", exc=exc)
+                await _safe_ack(lambda: interaction.followup.send(
+                    "Couldn't start the match right now (temporary connection issue). Nothing was changed — try Start Match again.",
+                    ephemeral=True), what="start-queuecurrent-fail")
+                return
             if len(current_queue) < 10:
-                await interaction.followup.send("The queue no longer has 10 players.", ephemeral=True)
+                await _safe_ack(lambda: interaction.followup.send("The queue no longer has 10 players.", ephemeral=True), what="start-not-10")
                 await view.update_view_state(current_queue)
                 embed = make_queue_embed(queue_key, current_queue)
-                await interaction.message.edit(embed=embed, view=view)
+                await _safe_ack(lambda: interaction.message.edit(embed=embed, view=view), what="start-not-10-panel")
                 return
 
             queued_player_ids = {p["player_id"] for p in current_queue}
             if player["id"] not in queued_player_ids:
-                await interaction.followup.send(
+                await _safe_ack(lambda: interaction.followup.send(
                     "Only players currently in the queue can start the match.", ephemeral=True
-                )
+                ), what="start-not-in-queue", player_id=player["id"])
                 return
 
             # Validate every player has a real, resolvable Discord ID BEFORE
@@ -607,23 +683,42 @@ class Queue(commands.Cog):
             players_list = [p["players"] for p in pop]
             bad_ids = [p["ign"] for p in players_list if not str(p.get("discord_id", "")).isdigit()]
             if bad_ids:
-                await interaction.followup.send(
+                await _safe_ack(lambda: interaction.followup.send(
                     f"Can't start this match — these players have invalid Discord IDs and can't be "
                     f"added to a real channel: {', '.join(bad_ids)}. (This usually means test/fake "
                     f"data is still in the queue — clear it before testing Start Match.)",
                     ephemeral=True,
-                )
+                ), what="start-bad-ids")
                 return
 
             player_ids = [p["player_id"] for p in pop]
-            await adb.queue_mark_matched(player_ids)
+            try:
+                await with_retry(adb.queue_mark_matched, player_ids)
+            except Exception as exc:
+                # Nothing was flipped (or we can't tell) — abort BEFORE any
+                # channel is created; players are still 'waiting'.
+                logger.exception("handle_start_match: queue_mark_matched failed for queue_key=%s", queue_key)
+                await incident_log.post(self.bot, category="QUEUE_START_DB_FAIL",
+                    summary=f"handle_start_match: queue_mark_matched failed for queue_key={queue_key} — {exc!r}",
+                    exc=exc, players=[(p["ign"], p["discord_id"]) for p in players_list])
+                await _safe_ack(lambda: interaction.followup.send(
+                    "Couldn't start the match right now (temporary connection issue). Nobody was removed from the queue — try Start Match again.",
+                    ephemeral=True), what="start-markmatched-fail")
+                return
 
-            # Reset the persistent queue panel message back to current queue state (minus the matched 10)
-            remaining_queue = await adb.queue_current(queue_key=queue_key)
-            new_view = RegionQueueView(queue_key, self)
-            await new_view.update_view_state(remaining_queue)
-            new_embed = make_queue_embed(queue_key, remaining_queue)
-            await interaction.message.edit(embed=new_embed, view=new_view)
+            # Reset the persistent queue panel message back to current queue state (minus the matched 10).
+            # 2026-09-19: the DB flip above already succeeded, so a failure to
+            # REFRESH THE PANEL (429 / stale message) must never abort the
+            # match — previously an exception here skipped _start_match_flow
+            # entirely and left all 10 players 'matched' with no channel.
+            try:
+                remaining_queue = await with_retry(adb.queue_current, queue_key=queue_key)
+                new_view = RegionQueueView(queue_key, self)
+                await new_view.update_view_state(remaining_queue)
+                new_embed = make_queue_embed(queue_key, remaining_queue)
+                await _safe_ack(lambda: interaction.message.edit(embed=new_embed, view=new_view), what="start-panel-reset")
+            except Exception:
+                logger.exception("handle_start_match: panel refresh failed for queue_key=%s (match proceeds regardless)", queue_key)
             # Lock released here — everything below (channel creation, the
             # skill-vote views) is slow, and the 10 players are already
             # marked matched + off the queue panel, so there's nothing left
@@ -640,7 +735,6 @@ class Queue(commands.Cog):
         # back into the queue.
         try:
             await self._start_match_flow(interaction, players_list, player["id"], queue_key)
-            await interaction.followup.send("Match started successfully!", ephemeral=True)
         except Exception as exc:
             logger.exception(
                 f"_start_match_flow failed for queue_key={queue_key}, host_player_id={player['id']}. "
@@ -685,17 +779,77 @@ class Queue(commands.Cog):
             # catching a Discord-side hiccup (channel/VC creation,
             # permissions, rate limits — see comment above this try
             # block) or a rare internal ID conflict, not a bot failure.
-            await interaction.followup.send(
+            await _safe_ack(lambda: interaction.followup.send(
                 "This match couldn't be started due to a brief sync issue with Discord — "
                 "as a precaution, you've been placed back in queue automatically. "
                 "No action needed on your end, just try Start Match again.",
                 ephemeral=True,
-            )
+            ), what="start-rollback-msg", player_id=player["id"])
+
+    async def _create_match_safely(self, bootstrap: bool, queue_key: str, season_id) -> dict:
+        """Create the matches row, surviving a transient DB drop WITHOUT
+        ever creating a duplicate match. See the note at the call site."""
+        # Step 1: reserve an id. Pure reads — with_retry is always safe here.
+        match_code = await with_retry(adb.generate_match_id)
+
+        payload = {
+            "match_id": match_code,
+            "status": "forming",
+            "is_bootstrap": bootstrap,
+            "region": queue_key,      # still NOT NULL in the schema — see db.create_match
+            "queue_key": queue_key,
+            "season_id": season_id,
+        }
+
+        def _insert():
+            return db.client.table("matches").insert(payload).execute()
+
+        def _fetch_existing():
+            res = db.client.table("matches").select("*").eq("match_id", match_code).execute()
+            return res.data[0] if res.data else None
+
+        last_exc = None
+        for attempt in range(3):
+            try:
+                res = await asyncio.to_thread(_insert)
+                return res.data[0]
+            except Exception as exc:
+                last_exc = exc
+                # The insert may have LANDED before the connection dropped.
+                # Look for our own pinned id before doing anything else.
+                try:
+                    existing = await with_retry(asyncio.to_thread, _fetch_existing)
+                except Exception:
+                    existing = None
+                if existing is not None:
+                    logger.warning(
+                        "_create_match_safely: insert raised %r but match %s already exists — using it (no duplicate created)",
+                        exc, match_code,
+                    )
+                    return existing
+                # Not there. Only retry on a genuine transient network error;
+                # anything else (a real DB/constraint error) must surface.
+                from database.db import _RETRYABLE_EXCEPTIONS
+                if not isinstance(exc, _RETRYABLE_EXCEPTIONS):
+                    raise
+                if attempt < 2:
+                    logger.warning(
+                        "_create_match_safely: transient error on attempt %d/3 for %s: %r — retrying",
+                        attempt + 1, match_code, exc,
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        raise last_exc
 
     async def _start_match_flow(self, interaction: discord.Interaction, players: list[dict], host_player_id: int, queue_key: str):
         channel = interaction.channel
         player_ids = [p["id"] for p in players]
-        bootstrap = await matchmaking.is_bootstrap_match(player_ids)
+        # 2026-09-20: this call (11 sequential DB reads inside) was the #1
+        # cause of "queue can't start" — 3 of 5 live failures on Sep 19-20
+        # died here on a transient RemoteProtocolError('Server disconnected'),
+        # and rolled back a perfectly good pop of 10 players. It's pure
+        # reads, so retrying is always safe. with_retry already fixed 41/41
+        # of the same drops elsewhere in the log on the first retry.
+        bootstrap = await with_retry(matchmaking.is_bootstrap_match, player_ids)
 
         # Team split (2026-08): wired up to balance_teams()'s actual
         # output. Previously discarded (`_ = ...`) and replaced with
@@ -721,7 +875,7 @@ class Queue(commands.Cog):
         # and migration_025_season_2_transition.sql (the latter also adds
         # a DB-level unique-active-season index, so this read can never
         # come back with more than one candidate row).
-        active_season = await adb.get_active_season()
+        active_season = await with_retry(adb.get_active_season)
         season_id = active_season["id"] if active_season else None
         if season_id is None:
             logger.warning(
@@ -729,15 +883,28 @@ class Queue(commands.Cog):
                 "Run migration_023_season_activation.sql / migration_025_season_2_transition.sql if this is unexpected.",
                 queue_key,
             )
-        match = await adb.create_match(is_bootstrap=bootstrap, queue_key=queue_key, season_id=season_id)
-        await adb.update_match(match["id"], {
+        # 2026-09-20: create_match was 2 of the 5 live "queue can't start"
+        # failures (a DB connection drop, one at the match_id availability
+        # check, one at the INSERT itself). It can't just be wrapped in
+        # with_retry: create_match() generates a FRESH random match_id on
+        # every call, so if the INSERT reached the server but its reply was
+        # lost, a blind retry would insert a SECOND match row for the same
+        # pop and orphan the first. Fix: reserve the match_id ONCE (a pure
+        # read, safe to retry), then retry the INSERT using that same
+        # pinned id. matches.match_id is UNIQUE, so a retry after an
+        # already-landed insert is rejected instead of duplicating — and we
+        # then just fetch the row that is already there.
+        match = await self._create_match_safely(bootstrap, queue_key, season_id)
+        await with_retry(adb.update_match, match["id"], {
             "room_code_shared_by": host_player_id
         })
 
+        # add_match_player is idempotent (UNIQUE (match_id, player_id)), so
+        # retrying it can never double-add anyone.
         for p in team_a:
-            await adb.add_match_player(match["id"], p["id"], "A", is_captain=False)
+            await with_retry(adb.add_match_player, match["id"], p["id"], "A", is_captain=False)
         for p in team_b:
-            await adb.add_match_player(match["id"], p["id"], "B", is_captain=False)
+            await with_retry(adb.add_match_player, match["id"], p["id"], "B", is_captain=False)
 
         guild = channel.guild
         category = channel.category
@@ -819,7 +986,7 @@ class Queue(commands.Cog):
             match_update["voice_channel_a_id"] = str(vc_a.id)
         if vc_b is not None:
             match_update["voice_channel_b_id"] = str(vc_b.id)
-        await adb.update_match(match["id"], match_update)
+        await with_retry(adb.update_match, match["id"], match_update)  # idempotent UPDATE by id
 
         host_player = next(p for p in players if p["id"] == host_player_id)
         host_member = guild.get_member(int(host_player["discord_id"]))
@@ -873,8 +1040,8 @@ class Queue(commands.Cog):
         # match now, not three. map_pool stays a 1-element array
         # (["Summit"]), not a string - indexed [0] below rather than
         # changing the column type, per the RO1 migration plan.
-        maps = await matchmaking.pick_map_candidates(list(team_a_ids), list(team_b_ids), bootstrap, n=1, queue_key=queue_key)
-        await adb.update_match(match["id"], {
+        maps = await with_retry(matchmaking.pick_map_candidates, list(team_a_ids), list(team_b_ids), bootstrap, n=1, queue_key=queue_key)
+        await with_retry(adb.update_match, match["id"], {
             "map_pool": maps,
             "status": "awaiting_room"
         })

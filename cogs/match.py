@@ -2124,7 +2124,26 @@ class Match(commands.Cog):
             # Re-check has_open_issue right here (inside _do_approve), not
             # just at query time — a correction filed between the query
             # above and this call still correctly blocks approval.
-            success, _ = await self._do_approve(guild, match["id"], match.get("room_code_shared_by"))
+            #
+            # 2026-09-19: this was bare — a single RemoteProtocolError
+            # inside _do_approve (specifically adb.has_open_issue) killed
+            # the ENTIRE tasks.loop for 32 min until a process restart.
+            # Now each match is independently guarded: one failure skips
+            # that match (next sweep retries it), never the rest.
+            try:
+                success, _ = await self._do_approve(guild, match["id"], match.get("room_code_shared_by"))
+            except Exception as per_match_exc:
+                logger.exception(
+                    "approval_sweep: _do_approve failed for match id=%s (%s) — skipping, will retry next sweep",
+                    match.get("id"), match.get("match_id"),
+                )
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_APPROVAL_SWEEP_FAIL",
+                    summary=f"approval_sweep: _do_approve failed for match {match.get('match_id')} — skipping this match only",
+                    exc=per_match_exc,
+                )
+                continue
             if not success:
                 continue  # blocked by an open issue, or the RPC itself rejected it — try again next sweep
 

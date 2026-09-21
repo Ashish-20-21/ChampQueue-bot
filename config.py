@@ -122,6 +122,13 @@ RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.
 # creation off here doesn't require touching anything else.
 CREATE_MATCH_VOICE_CHANNELS = os.getenv("CREATE_MATCH_VOICE_CHANNELS", "false").strip().lower() == "true"
 
+# Operator-skill votes: whether picks are written to operator_skill_votes.
+# Default ON (today's behaviour). Nothing in the bot reads that table yet, so
+# turning it OFF is safe: buttons still lock and show picks, the DB just gets
+# no vote writes (saves ~2 writes per match). Read at startup, so changing it
+# needs a bot restart. Accepts true/false.
+STORE_SKILL_VOTES = os.getenv("STORE_SKILL_VOTES", "true").strip().lower() == "true"
+
 # --- Priority fixes: admin IGN-change channel ---
 # 2026-08-08: players frequently change their in-game name after queueing
 # (sometimes mid-match), and OCR/roster mismatches were traced back to this

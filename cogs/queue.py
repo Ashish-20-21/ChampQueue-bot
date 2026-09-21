@@ -95,13 +95,19 @@ class SkillVoteView(discord.ui.View):
     lock-in (button disabled/relabeled) is still instant on every click,
     same as before; only the DB write timing changed."""
 
-    def __init__(self, match_id: int, team: str, team_player_ids: set[int]):
+    def __init__(self, match_id: int, team: str, team_player_ids: set[int],
+                 roster: dict[int, dict]):
         super().__init__(timeout=config.VOTE_TIMEOUT_SECONDS)
         self.match_id = match_id
         self.team = team
         self.team_player_ids = team_player_ids
+        # roster: {discord_user_id (int): {"id": players.id, "ign": str}} for
+        # THIS team, built once at match start. A click resolves the player
+        # from here — no DB read, so nothing slow sits before the reply.
+        self.roster = roster
         self.taken_skills: set[str] = set()
         self.voted_player_ids: set[int] = set()
+        self.player_picks: dict[int, str] = {}   # players.id -> skill, for "you already picked X"
         self.pending_votes: list[dict] = []
         self._flushed = False
         for skill in config.OPERATOR_SKILLS:
@@ -137,102 +143,67 @@ class SkillVoteView(discord.ui.View):
         button = discord.ui.Button(label=skill, style=discord.ButtonStyle.secondary)
 
         async def callback(interaction: discord.Interaction):
-            # Stop Discord's 3-second clock FIRST, before any DB calls.
-            # Under concurrent votes (8-10 players clicking within the same
-            # window), get_player_by_discord_id + the vote write compete
-            # for the same connection pool — by the later clicks, those two
-            # round trips alone can exceed 3s even though nothing is
-            # actually broken. defer() is a single fast Discord-side call
-            # with no DB dependency, so it wins that race every time.
+            # ONE Discord call per click, and no DB read.
             #
-            # ephemeral=True: if the later edit_original_response ever fails
-            # (stale token under load — see the 5th-voter race note below),
-            # a non-ephemeral defer makes Discord render a public red
-            # "interaction failed" to the player even though their vote was
-            # saved. Ephemeral keeps any failure quiet and consistent with
-            # the followup fallback. Fix 2026-07-30 after a live report of
-            # exactly this on the team-completing (5th) vote.
-            await interaction.response.defer(ephemeral=True)
-
-            player = await adb.get_player_by_discord_id(interaction.user.id)
-            # 2026-09-20: these replies were bare. Live log showed a 429
-            # "Rate limit reached for webhook" on the "already picked"
-            # reply escaping as an ERROR traceback (button spam by a player
-            # whose first click DID save). The vote state is already decided
-            # above — the message is cosmetic — so a lost reply must never
-            # raise. _safe_ack logs one WARNING line and moves on.
-            if not player or player["id"] not in self.team_player_ids:
-                await _safe_ack(lambda: interaction.followup.send("This isn't your team's vote.", ephemeral=True), what="vote-not-your-team")
+            # History: this callback used to defer() first (to beat the 3s
+            # clock) because a get_player_by_discord_id round trip sat before
+            # the reply. That read is gone (roster is in memory), so every
+            # check below is instant and the reply goes out straight away:
+            #   accepted click -> response.edit_message(view=self)   (ack + repaint in one call)
+            #   rejected click -> response.send_message(..., ephemeral=True)
+            # The 5th-vote DB flush still runs AFTER the reply, as before.
+            #
+            # First-click-wins: there is no await between the checks and the
+            # lock-in below, and the event loop is single-threaded, so two
+            # players cannot both take the same skill.
+            player = self.roster.get(interaction.user.id)
+            if player is None or player["id"] not in self.team_player_ids:
+                await _safe_ack(lambda: interaction.response.send_message(
+                    "This isn't your team's vote.", ephemeral=True), what="vote-not-your-team")
                 return
-            if player["id"] in self.voted_player_ids:
-                await _safe_ack(lambda: interaction.followup.send(
-                    "You've already picked an operator skill for this match — it's locked in, "
-                    "you can't change it. Check the button showing your name for what you picked.",
-                    ephemeral=True,
-                ), what="vote-already-picked", player_id=player["id"])
+            pid = player["id"]
+            if pid in self.voted_player_ids:
+                picked = self.player_picks.get(pid, "an operator skill")
+                await _safe_ack(lambda: interaction.response.send_message(
+                    f"You've already picked **{picked}** for this match — it's locked in, "
+                    f"you can't change it.", ephemeral=True), what="vote-already-voted", player_id=pid)
                 return
             if skill in self.taken_skills:
-                await _safe_ack(lambda: interaction.followup.send(
+                await _safe_ack(lambda: interaction.response.send_message(
                     f"**{skill}** was already picked by a teammate — operator skills must be unique per team.",
-                    ephemeral=True,
-                ), what="vote-skill-taken", player_id=player["id"])
+                    ephemeral=True), what="vote-skill-taken", player_id=pid)
                 return
 
-            # In-memory lock-in — instant, same as before, no DB round
-            # trip in the critical path of the click itself.
+            # In-memory lock-in — instant, no DB round trip in the click path.
             self.taken_skills.add(skill)
-            self.voted_player_ids.add(player["id"])
-            self.pending_votes.append({
-                "match_id": self.match_id,
-                "player_id": player["id"],
-                "team": self.team,
-                "skill": skill,
-            })
+            self.voted_player_ids.add(pid)
+            self.player_picks[pid] = skill
+            if config.STORE_SKILL_VOTES:
+                self.pending_votes.append({
+                    "match_id": self.match_id,
+                    "player_id": pid,
+                    "team": self.team,
+                    "skill": skill,
+                })
             button.disabled = True
             button.label = f"{skill} ✓ ({player['ign']})"
 
-            # Update the player's UI FIRST, before any DB write. Fix
-            # 2026-07-30: previously, when this click was the 5th (team-
-            # completing) vote, _flush_votes() ran inline HERE — a real
-            # Supabase round-trip inserted between the defer and the
-            # response edit. Under concurrent load (pool contention while
-            # 8-10 players click at once) that extra latency could push
-            # edit_original_response past its valid token window, so it
-            # threw and the player saw "interaction failed" even though
-            # their vote was saved. The 5th voter did strictly more work
-            # in the critical path than voters 1-4, making them
-            # structurally the one who fails. Now the UI edit happens
-            # first (fast, no DB), and the flush moves after it.
-            edit_failed = False
-            try:
-                await interaction.edit_original_response(view=self)
-            except (discord.errors.NotFound, discord.errors.HTTPException) as e:
-                edit_failed = True
-                logger.warning(
-                    "SkillVoteView: edit_original_response failed for player_id=%s, skill=%s (vote will still be recorded): %s",
-                    player["id"], skill, e,
-                )
+            # The single reply: acknowledges the click AND repaints the panel.
+            # If it fails (429 / expired token) we log ONE warning and move on:
+            # no fallback message, no retry — extra Discord calls would only
+            # hit a limiter that has already tripped. The vote is already
+            # locked in memory and will still be saved; the panel repaints on
+            # the next accepted vote, and this player's next click is told
+            # which skill they picked (see the already-voted branch above).
+            await _safe_ack(lambda: interaction.response.edit_message(view=self),
+                            what="vote-edit", player_id=pid)
 
-            # Now flush to the DB, AFTER the player's UI has already been
-            # answered — the player is never waiting on this write, so its
-            # latency can no longer break their interaction response. Once
-            # the whole team (5/5) has picked, this is the single bulk
-            # write that collapses 5 individual writes into 1; otherwise
-            # the pending votes wait for the next completing click or the
-            # on_timeout fallback.
+            # Flush AFTER the reply, so the player never waits on the write.
+            # One bulk write once the whole team (5/5) has picked; otherwise
+            # pending votes wait for the on_timeout fallback. When
+            # STORE_SKILL_VOTES is off pending_votes stays empty and this is a no-op.
             if len(self.voted_player_ids) >= len(self.team_player_ids):
                 await self._flush_votes()
-
-            # Only if the visual update actually failed do we send the
-            # plain-text confirmation fallback, so the player still knows
-            # their pick locked in even though the button display didn't
-            # refresh on their end.
-            if edit_failed:
-                await _safe_ack(lambda: interaction.followup.send(
-                    f"Your pick (**{skill}**) is locked in — your vote was saved successfully "
-                    f"even though the button display didn't update.",
-                    ephemeral=True,
-                ), what="vote-fallback-confirm", player_id=player["id"])
 
         button.callback = callback
         return button
@@ -1078,8 +1049,11 @@ class Queue(commands.Cog):
         # SkillVoteView.on_timeout). Nothing downstream (room code,
         # match-log, MMR, approval) depends on skill votes being complete,
         # so there's nothing here to wait on before finishing the flow.
-        view_a = SkillVoteView(match["id"], "A", team_a_ids)
-        view_b = SkillVoteView(match["id"], "B", team_b_ids)
+        # Rosters (discord id -> db id + IGN) so a vote click needs no DB read.
+        roster_a = {int(p["discord_id"]): {"id": p["id"], "ign": p["ign"]} for p in team_a}
+        roster_b = {int(p["discord_id"]): {"id": p["id"], "ign": p["ign"]} for p in team_b}
+        view_a = SkillVoteView(match["id"], "A", team_a_ids, roster_a)
+        view_b = SkillVoteView(match["id"], "B", team_b_ids, roster_b)
         await text_channel.send(f"**Defender Team** — vote your operator skill (unique per team):", view=view_a)
         await text_channel.send(f"**Attacker Team** — vote your operator skill (unique per team):", view=view_b)
 

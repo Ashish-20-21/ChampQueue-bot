@@ -1,7 +1,8 @@
 """Stand-ins for Discord and the database.
 
 FakeInteraction records every Discord call the code makes, in order, in
-`.calls`. That list is what the tests count. It never talks to Discord.
+`.calls`, and the text of any message sent in `.messages`. That is what the
+tests count and read. It never talks to Discord.
 """
 from __future__ import annotations
 
@@ -17,23 +18,26 @@ class _FakeResponse:
 
     async def edit_message(self, **kw):
         self._o._hit("edit_message")
+        self._o.edit_view = kw.get("view")
 
-    async def send_message(self, *a, **kw):
+    async def send_message(self, content=None, **kw):
         self._o._hit("send_message")
+        self._o.messages.append(content)
 
 
 class _FakeFollowup:
     def __init__(self, owner: "FakeInteraction"):
         self._o = owner
 
-    async def send(self, *a, **kw):
+    async def send(self, content=None, **kw):
         self._o._hit("followup")
+        self._o.messages.append(content)
 
 
 class FakeInteraction:
     """Looks enough like discord.Interaction for the vote callback.
 
-    fail_on: names of calls that should raise a Discord 429, e.g. {"edit"}.
+    fail_on: names of calls that should raise a Discord 429, e.g. {"edit_message"}.
     """
 
     def __init__(self, user_id: int, fail_on: set[str] | None = None):
@@ -41,6 +45,8 @@ class FakeInteraction:
         self.response = _FakeResponse(self)
         self.followup = _FakeFollowup(self)
         self.calls: list[str] = []
+        self.messages: list[str] = []
+        self.edit_view = None
         self._fail_on = fail_on or set()
 
     def _hit(self, name: str):
@@ -49,7 +55,8 @@ class FakeInteraction:
             raise _make_429()
 
     async def edit_original_response(self, **kw):
-        self._hit("edit")
+        # The new vote code must NOT use this. Recorded so a test can catch it.
+        self._hit("edit_original_response")
 
 
 def _make_429() -> discord.errors.HTTPException:
@@ -61,20 +68,17 @@ def _make_429() -> discord.errors.HTTPException:
 
 
 class FakeDB:
-    """Replaces the parts of `adb` the vote callback uses.
+    """Replaces the parts of `adb` the vote code may touch.
 
-    players: {discord_id: {"id": db_id, "ign": name}}
-    Counts reads and bulk writes so tests can assert on them.
+    A click must NOT read the database any more, so any read raises. Only the
+    bulk write (the flush) is allowed, and it is recorded.
     """
 
-    def __init__(self, players: dict[int, dict]):
-        self.players = players
-        self.reads = 0
+    def __init__(self):
         self.bulk_writes: list[list[dict]] = []
 
     async def get_player_by_discord_id(self, discord_id):
-        self.reads += 1
-        return self.players.get(int(discord_id))
+        raise AssertionError("DB read inside the vote click path — the roster should be used instead")
 
     async def cast_skill_votes_bulk(self, votes):
         self.bulk_writes.append(list(votes))

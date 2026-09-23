@@ -515,7 +515,12 @@ class Queue(commands.Cog):
                 return
 
             if entry is None:
-                await _safe_ack(lambda: interaction.followup.send("You're already in the queue.", ephemeral=True), what="join-already-in", player_id=player["id"])
+                # No-op reply drop (2026-09-22): the player is already in the
+                # queue and the panel already shows them — the "you're already
+                # in the queue" followup was pure noise AND, per the 2026-08-30
+                # spam-cascade writeup above, these no-op followups were the
+                # single biggest slice of the webhook 429s. The defer already
+                # acknowledged the click, so nothing further is sent.
                 return
 
             try:
@@ -577,7 +582,9 @@ class Queue(commands.Cog):
             # why this is deliberately outside the try/except.
             in_queue = any(p["player_id"] == player["id"] for p in current_queue)
             if not in_queue:
-                await _safe_ack(lambda: interaction.followup.send("You're not in the queue.", ephemeral=True), what="leave-not-in", player_id=player["id"])
+                # No-op reply drop (2026-09-22): nothing to leave, panel already
+                # reflects that. Same rationale as join-already-in above — the
+                # defer acknowledged the click, no followup 429 risk added.
                 return
 
             try:
@@ -870,12 +877,15 @@ class Queue(commands.Cog):
             "room_code_shared_by": host_player_id
         })
 
-        # add_match_player is idempotent (UNIQUE (match_id, player_id)), so
-        # retrying it can never double-add anyone.
-        for p in team_a:
-            await with_retry(adb.add_match_player, match["id"], p["id"], "A", is_captain=False)
-        for p in team_b:
-            await with_retry(adb.add_match_player, match["id"], p["id"], "B", is_captain=False)
+        # Burst-2 fix (2026-09-22): all 10 match_players rows in ONE bulk
+        # upsert instead of 10 sequential add_match_player() calls. Still
+        # idempotent (UNIQUE (match_id, player_id) + ignore_duplicates), so
+        # a with_retry re-run can't double-add, and the existing
+        # _start_match_flow rollback (all 10 back to 'waiting' on failure)
+        # is unchanged.
+        rows = ([{"player_id": pl["id"], "team": "A", "is_captain": False} for pl in team_a]
+                + [{"player_id": pl["id"], "team": "B", "is_captain": False} for pl in team_b])
+        await with_retry(adb.add_match_players_bulk, match["id"], rows)
 
         guild = channel.guild
         category = channel.category

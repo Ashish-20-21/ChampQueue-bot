@@ -79,9 +79,13 @@ async def is_bootstrap_match(player_ids: list[int]) -> bool:
     """A match runs in random/bootstrap mode unless every player already
     has enough completed matches AND the overall graduated pool is large
     enough for analysis to be meaningful."""
+    # Burst-2 fix (2026-09-22): one bulk query for all 10 players instead
+    # of ten sequential player_completed_match_count() round trips. Same
+    # graduation rule, same result; just far fewer DB trips at match start.
+    counts = await adb.player_completed_counts(player_ids)
     graduated = [
         pid for pid in player_ids
-        if await adb.player_completed_match_count(pid) >= config.BOOTSTRAP_MATCH_THRESHOLD
+        if counts.get(pid, 0) >= config.BOOTSTRAP_MATCH_THRESHOLD
     ]
     if len(graduated) < len(player_ids):
         return True  # someone in this pop hasn't graduated yet

@@ -379,6 +379,29 @@ class Database:
         ).execute()
         return res.data[0]
 
+    def add_match_players_bulk(self, match_id: int, rows: list[dict]) -> list[dict]:
+        """Insert every player of a forming match in ONE request instead of
+        ten add_match_player() round trips (burst-2 fix, 2026-09-22).
+
+        rows: [{"player_id": int, "team": "A"|"B", "is_captain": bool}, ...]
+
+        Idempotent, exactly like the per-row add_match_player it replaces:
+        match_players has UNIQUE (match_id, player_id), so upsert with
+        ignore_duplicates leaves any already-inserted row untouched. That
+        preserves the caller's existing safety net — _start_match_flow is
+        wrapped so a failure rolls all 10 players back to 'waiting', and a
+        retry of this whole call can never double-add anyone.
+        """
+        payload = [
+            {"match_id": match_id, "player_id": r["player_id"],
+             "team": r["team"], "is_captain": r.get("is_captain", False)}
+            for r in rows
+        ]
+        res = self.client.table("match_players").upsert(
+            payload, on_conflict="match_id,player_id", ignore_duplicates=True
+        ).execute()
+        return res.data or []
+
     def remove_match_player(self, match_id: int, player_id: int) -> None:
         """Deletes one player's match_players row. Built for
         /admin-queue-replace (2026-08-20) — paired with add_match_player
@@ -429,6 +452,30 @@ class Database:
             .execute()
         )
         return res.count or 0
+
+    def player_completed_counts(self, player_ids: list[int]) -> dict[int, int]:
+        """Completed-match count for MANY players in ONE query instead of
+        one round trip per player (burst-2 fix, 2026-09-22). Returns
+        {player_id: count}, with 0 for any id that has no completed match.
+
+        Same source as player_completed_match_count (match_players joined
+        to matches.status = completed), just fetched in bulk and counted
+        client-side — queue pops are 10 players, so the row volume is
+        tiny. Any id absent from the result simply hasn't graduated yet."""
+        if not player_ids:
+            return {}
+        res = (
+            self.client.table("match_players")
+            .select("player_id, matches!inner(status)")
+            .in_("player_id", player_ids)
+            .eq("matches.status", "completed")
+            .execute()
+        )
+        counts = {pid: 0 for pid in player_ids}
+        for row in res.data or []:
+            pid = row["player_id"]
+            counts[pid] = counts.get(pid, 0) + 1
+        return counts
 
     # ------------------------------------------------------------------
     # VOTES

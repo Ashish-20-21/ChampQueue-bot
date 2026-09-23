@@ -972,7 +972,10 @@ class Queue(commands.Cog):
         host_player = next(p for p in players if p["id"] == host_player_id)
         host_member = guild.get_member(int(host_player["discord_id"]))
         host_mention = host_member.mention if host_member else f"<@{host_player['discord_id']}>"
-        await text_channel.send(f"{host_mention} is the Match Host.")
+        # 2026-09-23: the standalone "is the Match Host." message was removed —
+        # it duplicated host_mention with the room-code instruction message
+        # below, costing an extra Discord call per match for the same info.
+        # The host tag now only appears once, folded into that message.
 
         # Post team embed
         embed_teams = discord.Embed(
@@ -1048,7 +1051,7 @@ class Queue(commands.Cog):
         await text_channel.send(
             # f"{mentions}\n\n"
             f"{voice_line}"
-            f"Host {host_mention}: share the room code here with `+rc<code>` "
+            f"{host_mention} is the Match Host — share the room code here with `+rc<code>` "
             f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n\n"
             f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."
         )

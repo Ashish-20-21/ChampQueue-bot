@@ -182,3 +182,26 @@ def test_bulk_completed_counts_defaults_absent_players_to_zero(monkeypatch):
 def test_bulk_completed_counts_empty_input():
     from database.db import Database
     assert Database.player_completed_counts(Database.__new__(Database), []) == {}
+
+
+# ---------------- host tag merged into one message (2026-09-23) ----------------
+
+def test_host_tag_sent_only_once_in_match_start_source():
+    """Regression guard: 'is the Match Host' text must appear in exactly
+    ONE text_channel.send(...) call in _start_match_flow, not two — the
+    2026-09-22 log showed the host mention posted twice (a standalone
+    'is the Match Host.' message, then again in the room-code instructions),
+    costing an extra Discord call per match for duplicate information."""
+    import re
+    src = open("cogs/queue.py", encoding="utf-8").read()
+    start = src.index("async def _start_match_flow")
+    end = src.index("\n    async def ", start + 10)
+    body = src[start:end]
+    # Strip comment lines so the count reflects real code, not commentary
+    # that happens to mention the phrase (this test's own history bit us once).
+    code_only = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+    # Match each text_channel.send(...) call as a block (they can be multi-line).
+    calls = re.findall(r"text_channel\.send\([^)]*(?:\([^)]*\)[^)]*)*\)", code_only, re.S)
+    calls_with_tag = [c for c in calls if "is the Match Host" in c]
+    assert len(calls_with_tag) == 1, calls_with_tag
+    assert 'text_channel.send(f"{host_mention} is the Match Host.")' not in code_only

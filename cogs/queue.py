@@ -38,9 +38,46 @@ logger = logging.getLogger("champions_queue")
 #     and it can only ever suppress a click (never create state), so it fails
 #     safe. It is intentionally NOT applied to Start Match.
 # ---------------------------------------------------------------------------
-_CLICK_COOLDOWN_SECONDS = 2.0
+# 2026-09-25: raised from 2.0s after the Sep 23 429 storm — see the
+# join_button.disabled fix in RegionQueueView.update_view_state for the
+# primary defense (stops most repeat clicks at the source once the panel
+# shows 10/10). 3.0s here is the second layer, tuned to still feel
+# responsive for a genuine double-tap while cutting the tail of clicks
+# that land in the gap between "queue hit 10" and "panel/button repaint
+# lands" (a real player.py client render delay, not something we can
+# close to zero). 5s was considered and rejected as too laggy-feeling.
+_CLICK_COOLDOWN_SECONDS = 3.0
 _click_last: dict[tuple[int, str], float] = {}
 _CLICK_MAP_MAX = 5000  # hard cap so this can never grow unbounded
+
+# 2026-09-25: separate, longer-window cooldown for the "queue is full" reply
+# specifically. With the button now disabled at 10/10 this should rarely
+# fire at all — it only exists for the brief race window right as the 10th
+# player joins (see update_view_state above). Kept as a second safety net:
+# even in that narrow window, a player mashing the (now stale) button gets
+# told ONCE, then silence, instead of a followup per click.
+_QUEUE_FULL_REPLY_COOLDOWN_SECONDS = 30.0
+_queue_full_last: dict[int, float] = {}
+
+
+def _queue_full_gate(discord_user_id: int) -> bool:
+    """True = tell this player the queue is full (first time recently).
+    False = they were already told, stay silent. Never raises."""
+    try:
+        now = time.monotonic()
+        last = _queue_full_last.get(discord_user_id)
+        if last is not None and (now - last) < _QUEUE_FULL_REPLY_COOLDOWN_SECONDS:
+            return False
+        if len(_queue_full_last) >= _CLICK_MAP_MAX:
+            cutoff = now - _QUEUE_FULL_REPLY_COOLDOWN_SECONDS
+            for k in [k for k, v in _queue_full_last.items() if v < cutoff]:
+                _queue_full_last.pop(k, None)
+            if len(_queue_full_last) >= _CLICK_MAP_MAX:
+                _queue_full_last.clear()
+        _queue_full_last[discord_user_id] = now
+        return True
+    except Exception:
+        return True  # fail open: never suppress a real player's first notice
 
 
 def _click_gate(discord_user_id: int, action: str) -> bool:
@@ -274,7 +311,18 @@ class RegionQueueView(discord.ui.View):
         self.start_match_button.callback = self.start_match_callback
 
     async def update_view_state(self, current_queue: list[dict]):
-        if len(current_queue) >= 10:
+        # 2026-09-25 fix: disable Join once the panel shows 10/10. Root cause
+        # of the Sep 23 429 storm (verified from DISCORD_METER/DISCORD_429
+        # forensics: 100% of 193 rate-limit hits over 13h+ traced to ONE
+        # 4-minute burst of repeat Join clicks on an already-full queue,
+        # ~180 "queue is full" followups in 4 minutes, tripping Discord's
+        # 60s webhook cooldown). A disabled button stops the click at the
+        # source instead of relying on debounce/silent-reply downstream —
+        # this is the primary fix; _CLICK_COOLDOWN_SECONDS above is the
+        # second layer for the brief render-lag window right at 10/10.
+        full = len(current_queue) >= 10
+        self.join_button.disabled = full
+        if full:
             if self.start_match_button not in self.children:
                 self.add_item(self.start_match_button)
         else:
@@ -502,10 +550,14 @@ class Queue(commands.Cog):
             # calls are try/excepted now; a 429 on our own message-send is
             # just logged and returned, never escalated into more sends.
             if len(current_queue) >= 10:
-                await _safe_ack(lambda: interaction.followup.send(
-                    "Queue is full (10/10) — a match is about to start. Try again in a moment.",
-                    ephemeral=True,
-                ), what="join-queue-full", player_id=player["id"])
+                if _queue_full_gate(interaction.user.id):
+                    await _safe_ack(lambda: interaction.followup.send(
+                        "Queue is full (10/10) — a match is about to start. Try again in a moment.",
+                        ephemeral=True,
+                    ), what="join-queue-full", player_id=player["id"])
+                # else: already told this player recently — stay silent
+                # rather than repeat the same followup (this is exactly the
+                # pattern that produced the Sep 23 429 storm).
                 return
 
             try:

@@ -205,3 +205,69 @@ def test_host_tag_sent_only_once_in_match_start_source():
     calls_with_tag = [c for c in calls if "is the Match Host" in c]
     assert len(calls_with_tag) == 1, calls_with_tag
     assert 'text_channel.send(f"{host_mention} is the Match Host.")' not in code_only
+
+
+# ---------------- Sep 23 429-storm fix: disable Join at 10/10 + cooldown (2026-09-25) ----------------
+# Root cause (from live DISCORD_METER/DISCORD_429 forensics): 100% of 193
+# rate-limit hits over 13+ hours traced to one 4-minute burst of repeat
+# Join clicks on an already-full queue. Two independent defenses tested here.
+
+async def test_join_button_disabled_when_queue_hits_ten(cog):
+    view = qmod.RegionQueueView("INDIA_ME", cog)
+    full = [{"player_id": i} for i in range(10)]
+    await view.update_view_state(full)
+    assert view.join_button.disabled is True
+    assert view.start_match_button in view.children
+
+
+async def test_join_button_re_enabled_when_queue_drops_below_ten(cog):
+    view = qmod.RegionQueueView("INDIA_ME", cog)
+    await view.update_view_state([{"player_id": i} for i in range(10)])
+    assert view.join_button.disabled is True
+    await view.update_view_state([{"player_id": i} for i in range(9)])   # someone left
+    assert view.join_button.disabled is False
+    assert view.start_match_button not in view.children
+
+
+async def test_leave_button_never_disabled_by_queue_state(cog):
+    view = qmod.RegionQueueView("INDIA_ME", cog)
+    await view.update_view_state([{"player_id": i} for i in range(10)])
+    assert view.leave_button.disabled is False    # only Join is gated
+
+
+async def test_queue_full_reply_sent_once_then_silent_on_repeat(cog, monkeypatch):
+    qmod._queue_full_last.clear()   # isolate from other tests / real clock
+    full = [{"player_id": i, "players": {}} for i in range(10)]
+    adb = JoinAdb(already_in=False, queue=full)
+
+    inter1 = await make_cog_call(cog, monkeypatch, adb, qmod.Queue.handle_join, uid=1)
+    assert any("full" in (c or "").lower() for c in followups(inter1))   # 1st click: told
+
+    inter2 = await make_cog_call(cog, monkeypatch, adb, qmod.Queue.handle_join, uid=1)
+    assert followups(inter2) == []                                       # 2nd click: silent
+
+
+async def test_queue_full_reply_still_reaches_a_different_player(cog, monkeypatch):
+    """The cooldown is per-player — it must never silence a genuinely new
+    player just because someone else was recently told."""
+    qmod._queue_full_last.clear()
+    full = [{"player_id": i, "players": {}} for i in range(10)]
+    adb = JoinAdb(already_in=False, queue=full)
+
+    await make_cog_call(cog, monkeypatch, adb, qmod.Queue.handle_join, uid=1)
+    inter_other = await make_cog_call(cog, monkeypatch, adb, qmod.Queue.handle_join, uid=2)
+    assert any("full" in (c or "").lower() for c in followups(inter_other))
+
+
+def test_queue_full_gate_fails_open_on_internal_error(monkeypatch):
+    """Same fail-open contract as _click_gate: a bug in the gate itself
+    must never block a real player's first notice."""
+    monkeypatch.setattr(qmod, "_queue_full_last", None)   # force an exception inside the gate
+    assert qmod._queue_full_gate(999) is True
+
+
+def test_click_debounce_is_three_seconds_not_two_or_five():
+    """Pins the exact tuning decision (2026-09-25): 2s was too short (didn't
+    stop the Sep 23 storm), 5s was rejected as too laggy-feeling for a
+    genuine double-tap. Guards against either direction drifting back."""
+    assert qmod._CLICK_COOLDOWN_SECONDS == 3.0

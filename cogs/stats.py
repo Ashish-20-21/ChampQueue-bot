@@ -152,6 +152,16 @@ class LeaderboardView(discord.ui.View):
         # /admin-update-host — see cogs/match.py / cogs/admin.py history).
         await interaction.response.defer()
         players = await adb.region_leaderboard()
+
+        # 2026-09-26 fix: clamp self.page HERE, using the data we already
+        # fetched — not just the rendered text. Previously only the
+        # DISPLAYED text was clamped inside _leaderboard_page_text; the
+        # actual self.page (and therefore the footer's page number) kept
+        # climbing forever on repeated Next clicks, producing the live
+        # "page 3/1" report on a 1-page, 42-player board.
+        total_pages = max(1, -(-len(players) // _PAGE_SIZE))  # same ceil-div as _leaderboard_page_text
+        self.page = max(0, min(self.page, total_pages - 1))
+
         embed = _leaderboard_embed(players, self.page)
         await interaction.edit_original_response(embed=embed, view=self)
 

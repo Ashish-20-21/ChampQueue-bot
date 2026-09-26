@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -146,68 +144,24 @@ class LeaderboardView(discord.ui.View):
         self.add_item(self.next_button)
 
     async def _render(self, interaction: discord.Interaction):
-        # 2026-09-26 fix: ACK FIRST, then read the DB. Was DB-call-then-
-        # respond — live traceback (Sep 26 00:11) confirmed this hit
-        # discord.errors.NotFound 10062 "Unknown interaction" whenever
-        # region_leaderboard() was slow (the same 3-second-window trap
-        # already fixed once for /host-replace-player and
-        # /admin-update-host — see cogs/match.py / cogs/admin.py history).
-        # edit_message() IS the ack (there's no separate defer() needed
-        # for a component click that only edits its own message), so
-        # simply moving it first closes the gap.
-        await interaction.response.defer()
         players = await adb.region_leaderboard()
         embed = _leaderboard_embed(players, self.page)
-        await interaction.edit_original_response(embed=embed, view=self)
-
-        # Shared 60s lock (2026-09-26): this ONE view instance is attached
-        # to ONE posted message — self.page, and now this lock, are state
-        # shared by every viewer, not per-user. Disabling here therefore
-        # locks Prev/Next/Reload for EVERYONE for 60s after any single
-        # click, cutting redundant renders when several people click close
-        # together (same DB call, same result, moments apart) — the same
-        # "disable once full/used" concept as RegionQueueView's Join
-        # button (cogs/queue.py, the Sep 23 429-storm fix), applied here
-        # to reduce load rather than to stop a rate-limit storm.
-        self.prev_button.disabled = True
-        self.next_button.disabled = True
-        self.reload_button.disabled = True
-        await interaction.edit_original_response(view=self)
-        await asyncio.sleep(60)
-        self.prev_button.disabled = False
-        self.next_button.disabled = False
-        self.reload_button.disabled = False
-        try:
-            await interaction.message.edit(view=self)
-        except discord.HTTPException:
-            pass  # message may have been deleted/reposted meanwhile — nothing to unlock
+        await interaction.response.edit_message(embed=embed, view=self)
 
     async def prev_callback(self, interaction: discord.Interaction):
-        if self.prev_button.disabled:
-            await interaction.response.defer()  # locked — silent, no extra DB/Discord call
-            return
         self.page = max(0, self.page - 1)
         await self._render(interaction)
 
     async def next_callback(self, interaction: discord.Interaction):
-        if self.next_button.disabled:
-            await interaction.response.defer()
-            return
         self.page += 1  # _render/_leaderboard_page_text clamps to the real last page
         await self._render(interaction)
 
     async def reload_callback(self, interaction: discord.Interaction):
-        if self.reload_button.disabled:
-            await interaction.response.defer()
-            return
         # commands.CooldownMapping expects something message-shaped
         # (reads .author.id for BucketType.user) — a raw Interaction has
         # .user, not .author, so it can't be passed directly. This tiny
         # shim is cheaper and less error-prone than hand-rolling a
-        # separate rate limiter. Kept alongside the new shared lock above:
-        # this still stops ONE user re-triggering it solo; the shared lock
-        # additionally stops a SECOND, DIFFERENT user from doing the same
-        # within that same 60s window.
+        # separate rate limiter.
         class _Ctx:
             author = interaction.user
         bucket = LeaderboardView._cooldown.get_bucket(_Ctx())

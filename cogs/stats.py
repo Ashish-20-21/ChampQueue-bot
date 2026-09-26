@@ -144,9 +144,16 @@ class LeaderboardView(discord.ui.View):
         self.add_item(self.next_button)
 
     async def _render(self, interaction: discord.Interaction):
+        # 2026-09-26 fix: ACK FIRST, then read the DB. Was DB-call-then-
+        # respond — live traceback (Sep 26 00:11) confirmed this hit
+        # discord.errors.NotFound 10062 "Unknown interaction" whenever
+        # region_leaderboard() was slow (the same 3-second-window trap
+        # already fixed once for /host-replace-player and
+        # /admin-update-host — see cogs/match.py / cogs/admin.py history).
+        await interaction.response.defer()
         players = await adb.region_leaderboard()
         embed = _leaderboard_embed(players, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.edit_original_response(embed=embed, view=self)
 
     async def prev_callback(self, interaction: discord.Interaction):
         self.page = max(0, self.page - 1)

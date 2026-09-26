@@ -751,7 +751,6 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
     _cooldown = commands.CooldownMapping.from_cooldown(
         1, config.POINTS_LEADERBOARD_COOLDOWN_SECONDS, commands.BucketType.user
     )
-    _locked_until: float = 0.0  # monotonic-clock deadline; shared across every render (class-level)
 
     def __init__(self) -> None:
         super().__init__(discord.ui.Button(
@@ -767,25 +766,10 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls()
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        # 2026-09-26: shared 60s lock, same concept as the region
-        # leaderboard fix (cogs/stats.py) and RegionQueueView's Join
-        # button (cogs/queue.py, the Sep 23 429-storm fix). This button
-        # already deferred first (no 10062 bug here — it was built after
-        # that lesson was learned), so this is purely a call-reduction
-        # layer: reused_button is a fresh discord.ui.View instance each
-        # render (see the bottom of this method), so the lock has to live
-        # on the CLASS, not self, to survive across renders/instances.
-        if PointsLeaderboardReloadButton._locked_until and                 asyncio.get_event_loop().time() < PointsLeaderboardReloadButton._locked_until:
-            await interaction.response.defer()  # locked — silent
-            return
-
         # commands.CooldownMapping expects something message-shaped
         # (reads .author.id for BucketType.user) — a raw Interaction
         # has .user, not .author. Same shim LeaderboardView.reload_callback
-        # already uses in cogs/stats.py. Kept alongside the new shared
-        # lock above: this still stops ONE user re-triggering it solo;
-        # the shared lock additionally stops a SECOND, DIFFERENT user
-        # from doing the same within that same 60s window.
+        # already uses in cogs/stats.py.
         class _Ctx:
             author = interaction.user
         bucket = PointsLeaderboardReloadButton._cooldown.get_bucket(_Ctx())
@@ -797,7 +781,6 @@ class PointsLeaderboardReloadButton(discord.ui.DynamicItem[discord.ui.Button],
             )
             return
 
-        PointsLeaderboardReloadButton._locked_until = asyncio.get_event_loop().time() + 60
         await interaction.response.defer()
 
         # Lazy status sweep: point_shields.status only ever gets set

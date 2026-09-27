@@ -113,7 +113,7 @@ QUEUES = {
     "EU_AF":         {"display": "EU/AF",         "active": True},
     "NA_LATAM":      {"display": "NA/Latam",      "active": True},
     "INDIA_ME":      {"display": "India/ME",      "active": True},
-    "JAPAN":         {"display": "Japan",         "active": False},
+    "JAPAN":         {"display": "Japan",         "active": False},  # inactive, but keep the key valid for historical rows
     "INDIA_ME_ONLY": {"display": "India/ME-only", "active": True},
 }
 QUEUE_KEYS = list(QUEUES)                                          # every queue_key that ever existed (DB constraint, locks)

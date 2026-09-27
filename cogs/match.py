@@ -1720,7 +1720,7 @@ class Match(commands.Cog):
                     break
                 results.append({
                     "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
-                    "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, leaver_team == winner, False),
+                    "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, False, False),
                     "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
                     "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
                     "afk": True,
@@ -2065,7 +2065,7 @@ class Match(commands.Cog):
             # in this function uses two lines up.
             results.append({
                 "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
-                "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, leaver_team == winner, False),
+                "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, False, False),
                 "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
                 "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
                 "afk": True,

@@ -802,16 +802,13 @@ class Admin(commands.Cog):
     @app_commands.command(name="admin-queue-clean",
                           description="[Admin] Clear AFK/unresponsive players from a queue — whole queue or up to 3 named players")
     @app_commands.describe(
-        queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)",
+        queue="Which queue to clean",
         user1="Player to remove (leave all 3 blank to clear the ENTIRE queue)",
         user2="Second player to remove (optional)",
         user3="Third player to remove (optional)",
     )
     @app_commands.choices(queue=[
-        app_commands.Choice(name="EU / AF", value="EU_AF"),
-        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
-        app_commands.Choice(name="India / ME", value="INDIA_ME"),
-        app_commands.Choice(name="Japan", value="JAPAN"),
+        app_commands.Choice(name=display, value=key) for display, key in config.queue_choice_items()
     ])
     @mod_or_admin_only()
     async def queue_clean(self, interaction: discord.Interaction, queue: app_commands.Choice[str],

@@ -76,19 +76,67 @@ MATCH_LOG_CHANNEL_ID = int(os.getenv("MATCH_LOG_CHANNEL_ID")) if os.getenv("MATC
 BOTLOG_CHANNEL_ID = int(os.getenv("BOTLOG_CHANNEL_ID")) if os.getenv("BOTLOG_CHANNEL_ID") else None
 HALL_OF_FAME_CHANNEL_ID = int(os.getenv("HALL_OF_FAME_CHANNEL_ID")) if os.getenv("HALL_OF_FAME_CHANNEL_ID") else None
 
-# --- Unified global region + 4-queue matchmaking (2026-07-29) ---
-# Server moved to one unified show with four ticket-counter queues, kept
+# --- Unified global region + queue matchmaking (2026-07-29, extended 2026-09-27) ---
+# Server moved to one unified show with several ticket-counter queues, kept
 # separate for matchmaking throughput / ping reasons only. Everything
 # downstream of "a match happened" collapses into ONE pool: one upload
 # channel, one approval channel, one match-log (already was), one
-# leaderboard. QUEUE_KEYS is the source of truth for which 4 queues
-# exist — used for queue-post buttons, per-queue locks, and validating
-# /queue-post's region argument. This is DELIBERATELY separate from
-# players.region (see REGIONS below) — queue_key is "which physical
-# queue is this match/entry in", region is "informational label the
-# player picked at registration", and the whole point of this change is
-# that the two no longer have to match.
-QUEUE_KEYS = ["EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
+# leaderboard. QUEUES is the source of truth for every queue_key that
+# exists or has ever existed — used for queue-post/queue-status/
+# admin-queue-clean's choice lists, per-queue locks, panel/embed display
+# names, and validating queue_key against the DB. This is DELIBERATELY
+# separate from players.region (see REGIONS below) — queue_key is
+# "which physical queue is this match/entry in", region is
+# "informational label the player picked at registration", and the
+# whole point of the 07-29 change is that the two no longer have to match.
+#
+# Each entry:
+#   display: human-readable label shown in panels/embeds/commands —
+#            NOT derived by munging the queue_key string, since that
+#            breaks the moment a key has more than one underscore
+#            (INDIA_ME_ONLY -> "INDIA/ME/ONLY" would be wrong).
+#   active:  False = hidden from every slash-command choice list; the
+#            queue's key stays valid in the DB (history intact), it's
+#            just not offered to join/post/clean. Flip back to True to
+#            bring a queue back with zero other code changes.
+#
+# 2026-09-27: JAPAN had no active players, while some India/ME players
+# wanted a queue restricted to India/ME-tagged players only. Rather than
+# repurpose JAPAN's queue_key (would silently relabel its historical
+# queue_entries/matches rows), JAPAN is kept as its own entry — now
+# inactive — and INDIA_ME_ONLY is added as a genuinely new queue_key.
+# If Japan ever becomes active again, flip its `active` back to True;
+# no rename needed. NOTE: the actual India/ME-only join restriction
+# (gating who can join this queue) is not implemented yet — this change
+# is the rename/labeling step only, confirmed as a separate follow-up.
+QUEUES = {
+    "EU_AF":         {"display": "EU/AF",         "active": True},
+    "NA_LATAM":      {"display": "NA/Latam",      "active": True},
+    "INDIA_ME":      {"display": "India/ME",      "active": True},
+    "JAPAN":         {"display": "Japan",         "active": False},
+    "INDIA_ME_ONLY": {"display": "India/ME-only", "active": True},
+}
+QUEUE_KEYS = list(QUEUES)                                          # every queue_key that ever existed (DB constraint, locks)
+ACTIVE_QUEUE_KEYS = [k for k, v in QUEUES.items() if v["active"]]  # only these appear in slash-command choice lists
+
+
+def queue_choice_items() -> list[tuple[str, str]]:
+    """(display, queue_key) pairs for active queues only, in QUEUES'
+    definition order. Used by cogs/queue.py and cogs/admin.py to build
+    their app_commands.Choice lists without hand-duplicating the queue
+    list in three separate places (the original bug this replaces).
+    Deliberately returns plain tuples, not discord.Choice objects — this
+    module has no discord.py dependency and shouldn't gain one."""
+    return [(v["display"], k) for k, v in QUEUES.items() if v["active"]]
+
+
+def queue_display_name(queue_key: str) -> str:
+    """Human-readable label for a queue_key, for panels/embeds/logs.
+    Falls back to the old underscore->slash munge for any queue_key not
+    (yet) in QUEUES, so this never hard-crashes on unexpected or
+    historical data."""
+    entry = QUEUES.get(queue_key)
+    return entry["display"] if entry else queue_key.replace("_", "/")
 
 # Registration-time region label. Informational only as of this change —
 # never read by queue/match/channel logic. Old East/West values are left
@@ -110,24 +158,11 @@ REGIONS = ["East", "West", "EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
 RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
 
-# 2026-09: per-match voice channels (Defender/Attacker VCs, created
-# alongside the text channel in _create_match_channels / cogs/queue.py)
-# went largely unused in practice — most players stick to their own
-# voice call outside Discord. Rather than rip the creation code out,
-# gate it behind this switch: default OFF (no VCs created for the next
-# queue), flip back to True to restore the old behavior with zero code
-# changes needed. Every downstream read of voice_channel_a_id/
-# voice_channel_b_id (cleanup, /admin-scrap-match, /admin-swap-player)
-# already treats a missing/None VC id as a normal no-op, so turning
-# creation off here doesn't require touching anything else.
-CREATE_MATCH_VOICE_CHANNELS = os.getenv("CREATE_MATCH_VOICE_CHANNELS", "false").strip().lower() == "true"
-
-# Operator-skill votes: whether picks are written to operator_skill_votes.
-# Default ON (today's behaviour). Nothing in the bot reads that table yet, so
-# turning it OFF is safe: buttons still lock and show picks, the DB just gets
-# no vote writes (saves ~2 writes per match). Read at startup, so changing it
-# needs a bot restart. Accepts true/false.
-STORE_SKILL_VOTES = os.getenv("STORE_SKILL_VOTES", "true").strip().lower() == "true"
+# CREATE_MATCH_VOICE_CHANNELS and STORE_SKILL_VOTES moved to switches.py
+# on 2026-09-27 — both are flat, standalone on/off flags, not config
+# data, so they now live in the dedicated switches file. Import
+# `switches` and read `switches.CREATE_MATCH_VOICE_CHANNELS` /
+# `switches.STORE_SKILL_VOTES` directly; do not re-add them here.
 
 # --- Priority fixes: admin IGN-change channel ---
 # 2026-08-08: players frequently change their in-game name after queueing
@@ -275,6 +310,13 @@ QUEUE_JOIN_COOLDOWN_SECONDS = 10                 # per-user cooldown on /queue-j
 
 # --- Suspicious-submission thresholds (route to admin review instead of auto-accept) ---
 STAT_OUTLIER_STD_DEVS = 2.5       # flag any player stat more than N std devs from their own rolling average
+# 2026-09-27: confirmed superseded, not wired to anything. This was written
+# for a planned player-submitted winner-vote step that got replaced by the
+# OCR/scoreboard auto-check before it was ever built — there is no
+# winner-vote anywhere in this codebase for a mismatch to compare against.
+# Not read by any code today (grep confirms zero call sites outside this
+# file). Left in place rather than deleted pending an explicit decision to
+# remove it; do not wire new code to it without re-opening that decision.
 VOTE_MISMATCH_BLOCKS_AUTO_ACCEPT = True  # if player winner-vote disagrees with scoreboard winner, force review
 
 # --- Ranks ---

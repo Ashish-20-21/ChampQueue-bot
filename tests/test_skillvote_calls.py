@@ -11,6 +11,7 @@ import logging
 import pytest
 
 import config
+import switches
 from cogs import queue
 from tests.fakes import FakeDB, FakeInteraction
 
@@ -88,7 +89,7 @@ async def test_taken_skill_is_one_message(db):
 
 
 async def test_full_team_is_five_calls_and_no_db_reads(db, monkeypatch):
-    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
+    monkeypatch.setattr(switches, "STORE_SKILL_VOTES", True)
     view = make_view()
     total = 0
     for i in range(5):
@@ -111,7 +112,7 @@ async def test_failed_reply_still_counts_vote_and_adds_no_extra_call(db, caplog)
 
 
 async def test_failed_reply_vote_is_still_saved_at_five(db, monkeypatch):
-    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
+    monkeypatch.setattr(switches, "STORE_SKILL_VOTES", True)
     view = make_view()
     await click(view, 0, 101, fail_on={"edit_message"})    # this player's repaint fails
     for i in range(1, 5):
@@ -158,7 +159,7 @@ async def test_vote_path_never_uses_defer_or_edit_original_response(db):
 
 
 async def test_fifth_vote_flushes_once_with_five_votes(db, monkeypatch):
-    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
+    monkeypatch.setattr(switches, "STORE_SKILL_VOTES", True)
     view = make_view()
     for i in range(5):
         await click(view, i, 101 + i)
@@ -168,7 +169,7 @@ async def test_fifth_vote_flushes_once_with_five_votes(db, monkeypatch):
 
 
 async def test_timeout_flushes_partial_votes(db, monkeypatch):
-    monkeypatch.setattr(config, "STORE_SKILL_VOTES", True)
+    monkeypatch.setattr(switches, "STORE_SKILL_VOTES", True)
     view = make_view()
     await click(view, 0, 101)
     await click(view, 1, 102)
@@ -180,7 +181,7 @@ async def test_timeout_flushes_partial_votes(db, monkeypatch):
 # ---------------- STORE_SKILL_VOTES switch ----------------
 
 async def test_switch_off_locks_buttons_but_writes_nothing(db, monkeypatch):
-    monkeypatch.setattr(config, "STORE_SKILL_VOTES", False)
+    monkeypatch.setattr(switches, "STORE_SKILL_VOTES", False)
     view = make_view()
     for i in range(5):
         inter = await click(view, i, 101 + i)

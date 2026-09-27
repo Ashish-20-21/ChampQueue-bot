@@ -35,6 +35,10 @@ async def _post_match_status(bot, match_id_str: str, queue_key: str, event: str)
         channel = bot.get_channel(config.MATCH_STATUS_CHANNEL_ID)
         if not channel:
             return
+        # Deliberately the raw munge, not config.queue_display_name() — kept
+        # byte-for-byte identical to pre-2026-09-27 output for every existing
+        # queue (INDIA/ME, NA/LATAM stay all-caps here); only the queue
+        # panel/embed sites in cogs/queue.py use the nicer display names.
         region = queue_key.replace("_", "/") if queue_key else "—"
         await channel.send(f"`{match_id_str}` | {region} | {event}")
     except Exception:

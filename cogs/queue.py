@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+import switches
 from database.db import db, adb, with_retry
 from services import matchmaking, mmr_engine, reputation
 from utils.permissions import admin_only, mod_or_admin_only
@@ -215,7 +216,7 @@ class SkillVoteView(discord.ui.View):
             self.taken_skills.add(skill)
             self.voted_player_ids.add(pid)
             self.player_picks[pid] = skill
-            if config.STORE_SKILL_VOTES:
+            if switches.STORE_SKILL_VOTES:
                 self.pending_votes.append({
                     "match_id": self.match_id,
                     "player_id": pid,
@@ -267,9 +268,10 @@ def make_queue_embed(queue_key: str, current_queue: list[dict]) -> discord.Embed
 
     names = "\n".join(player_lines) if player_lines else "*No players in queue. Be the first to join!*"
 
+    display_name = config.queue_display_name(queue_key)
     embed = discord.Embed(
-        title=f"🛡️ Champion's Queue — {queue_key.replace('_', '/')}",
-        description=f"Join the competitive matchmaking lobby for the **{queue_key.replace('_', '/')}** queue.",
+        title=f"🛡️ Champion's Queue — {display_name}",
+        description=f"Join the competitive matchmaking lobby for the **{display_name}** queue.",
         color=discord.Color.from_rgb(88, 101, 242)
     )
     embed.add_field(name=f"👥 Active Queue ({len(current_queue)}/10)", value=names, inline=False)
@@ -395,12 +397,9 @@ class Queue(commands.Cog):
         self.cleanup_sweep.cancel()
 
     @app_commands.command(name="queue-post", description="Post the persistent queue panel for a specific queue")
-    @app_commands.describe(queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)")
+    @app_commands.describe(queue="Which queue to post the panel for")
     @app_commands.choices(queue=[
-        app_commands.Choice(name="EU / AF", value="EU_AF"),
-        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
-        app_commands.Choice(name="India / ME", value="INDIA_ME"),
-        app_commands.Choice(name="Japan", value="JAPAN"),
+        app_commands.Choice(name=display, value=key) for display, key in config.queue_choice_items()
     ])
     @mod_or_admin_only()
     async def queue_post(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
@@ -415,12 +414,9 @@ class Queue(commands.Cog):
         await interaction.followup.send(f"Successfully posted the persistent queue panel for **{queue.name}**.", ephemeral=True)
 
     @app_commands.command(name="queue-status", description="See who's currently in queue")
-    @app_commands.describe(queue="Which of the 4 queues (EU/AF, NA/Latam, India/ME, Japan)")
+    @app_commands.describe(queue="Which queue to check")
     @app_commands.choices(queue=[
-        app_commands.Choice(name="EU / AF", value="EU_AF"),
-        app_commands.Choice(name="NA / Latam", value="NA_LATAM"),
-        app_commands.Choice(name="India / ME", value="INDIA_ME"),
-        app_commands.Choice(name="Japan", value="JAPAN"),
+        app_commands.Choice(name=display, value=key) for display, key in config.queue_choice_items()
     ])
     async def queue_status(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
         current = await adb.queue_current(queue_key=queue.value)
@@ -520,6 +516,20 @@ class Queue(commands.Cog):
         # role-sync bot) is what determines which queue channels a
         # player can even see in the first place — this handler doesn't
         # need to re-enforce that at the DB layer.
+        #
+        # 2026-09-27: ONE deliberate, scoped exception to the above —
+        # INDIA_ME_ONLY re-adds the region gate, but only for this one
+        # queue_key. Reason: India's queue is busy enough that some
+        # India players wanted a queue where everyone present actually
+        # registered India/ME, not "any approved player, informational
+        # region be damned". No extra DB/API call — `player` is already
+        # loaded above with its `region` field.
+        if queue_key == "INDIA_ME_ONLY" and player["region"] != "INDIA_ME":
+            await _safe_ack(lambda: interaction.followup.send(
+                "This queue is restricted to players who selected **India/ME** at registration.",
+                ephemeral=True
+            ), what="join-region-restricted", player_id=player["id"])
+            return
 
         eligible, reason = reputation.is_queue_eligible(player)
         if not eligible:
@@ -970,14 +980,14 @@ class Queue(commands.Cog):
             overwrites=overwrites_text
         )
 
-        # Per-match VCs (2026-09): gated behind config.CREATE_MATCH_VOICE_CHANNELS
+        # Per-match VCs (2026-09): gated behind switches.CREATE_MATCH_VOICE_CHANNELS
         # — default off, since these went largely unused in practice.
         # vc_a/vc_b stay None when off, and the DB update below already
         # only writes their ids conditionally, so every downstream reader
         # of voice_channel_a_id/voice_channel_b_id sees the same "no VC
         # for this match" shape it already knows how to skip past.
         vc_a = vc_b = None
-        if config.CREATE_MATCH_VOICE_CHANNELS:
+        if switches.CREATE_MATCH_VOICE_CHANNELS:
             # Private VC A overwrites (Defender Team)
             overwrites_vc_a = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
@@ -1031,7 +1041,7 @@ class Queue(commands.Cog):
 
         # Post team embed
         embed_teams = discord.Embed(
-            title=f"Match {match['match_id']} — Teams Formed ({queue_key.replace('_', '/')})",
+            title=f"Match {match['match_id']} — Teams Formed ({config.queue_display_name(queue_key)})",
             color=discord.Color.blue()
         )
         # Roster-display fix (2026-08-08): players couldn't tell who's who

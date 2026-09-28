@@ -157,6 +157,11 @@ REGIONS = ["East", "West", "EU_AF", "NA_LATAM", "INDIA_ME", "JAPAN"]
 # crashing the bot on boot.
 RESULT_UPLOAD_CHANNEL_ID = int(os.getenv("RESULT_UPLOAD_CHANNEL_ID")) if os.getenv("RESULT_UPLOAD_CHANNEL_ID") else None
 RESULT_APPROVAL_CHANNEL_ID = int(os.getenv("RESULT_APPROVAL_CHANNEL_ID")) if os.getenv("RESULT_APPROVAL_CHANNEL_ID") else None
+# RESULT_SS_CHANNEL_ID (2026-09-28): every submitted scoreboard is re-posted
+# here as a real image file (not a link), captioned with its match code, so
+# admins can open it on a phone. One Discord call, zero DB calls, runs in
+# the background and can never block or fail a submission. Unset = off.
+RESULT_SS_CHANNEL_ID = int(os.getenv("RESULT_SS_CHANNEL_ID")) if os.getenv("RESULT_SS_CHANNEL_ID") else None
 
 # CREATE_MATCH_VOICE_CHANNELS and STORE_SKILL_VOTES moved to switches.py
 # on 2026-09-27 — both are flat, standalone on/off flags, not config
@@ -303,6 +308,13 @@ REPUTATION_BAN_THRESHOLD = 25             # temporary queue ban, admin must revi
 
 # --- Abuse / cost-control guards ---
 MAX_SCOREBOARD_UPLOAD_BYTES = 8 * 1024 * 1024   # 8MB cap before sending to Vision AI (cost + DoS guard)
+# "+result" in-flight guard (2026-09-28): while one submission for a match is
+# being processed, any repeat "+result" or /match-submit for it is ignored.
+# The guard lives in memory, so a bot restart clears it; after this many
+# seconds it is also treated as stale, so a hung run can never lock a host
+# out forever. Matches the "send +result again after 5 minutes" line the
+# host is shown in the processing message.
+RESULT_INFLIGHT_STALE_SECONDS = 300
 # NOTE: registration cooldown was removed entirely (DECISIONS.md — final,
 # 2026-07-13). REGISTER_COOLDOWN_SECONDS deliberately deleted here since it
 # was dead/unused in registration.py; don't re-add without re-opening that decision.

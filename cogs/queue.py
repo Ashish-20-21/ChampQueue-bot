@@ -1113,9 +1113,10 @@ class Queue(commands.Cog):
         await text_channel.send(
             # f"{mentions}\n\n"
             f"{voice_line}"
-            f"{host_mention} is the Match Host — share the room code here with `+rc<code>` "
-            f"(or `/rc <code>`). Made a typo? Use `+urc<code>` to correct it.\n\n"
-            f"Make sure to select your operator skill above ⬆️ — no rush, select whenever you're ready."
+            f"{host_mention} is the Match Host — share the room code here with `+rc<code>`. "
+            f"Made a typo? Use `+urc<code>` to correct it. "
+            f"Use `+result` with the scoreboard image to upload the result in this chat.\n\n"
+            f"Make sure to select your operator ⬇️"
         )
 
         # Skill votes — no blocking wait here anymore. Views are sent and

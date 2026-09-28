@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import io
 import random
 import re
+import time
 from collections import Counter
 from datetime import timedelta
 
@@ -14,10 +16,11 @@ from discord.ext import commands, tasks
 
 import config
 import logging
+import switches
 from database.db import adb, with_retry
 from services import localization, mmr_engine, reputation, validation, vision_extraction
 from utils.embeds import ign_confirmation_embed, verification_card
-from utils.permissions import admin_only, is_admin, is_mod_or_admin
+from utils.permissions import admin_only, is_admin, is_admin_user, is_mod_or_admin
 from utils import incident_log
 
 logger = logging.getLogger(__name__)
@@ -530,6 +533,73 @@ class CorrectionDetailModal(discord.ui.Modal, title="Correction Details"):
         )
 
 
+class _InteractionReply:
+    """Result-pipeline reply channel for /match-submit: an ephemeral
+    followup, exactly what _submit_body always sent before 2026-09-28.
+    Failures are NOT swallowed here, so the slash path behaves byte-for-byte
+    as it did (its safety net in _run_submission still catches them)."""
+    in_match_channel = False
+
+    def __init__(self, interaction: discord.Interaction):
+        self._interaction = interaction
+
+    async def send(self, text: str) -> None:
+        await self._interaction.followup.send(text, ephemeral=True)
+
+
+class _MessageReply:
+    """Result-pipeline reply channel for "+result" (2026-09-28).
+
+    Every outcome EDITS the one "processing" message the bot already posted
+    in the match channel — so the whole submission costs the channel one
+    message, not a new one per step. Never raises: a 429 or a deleted
+    message logs one warning and moves on (no retry, no fallback — the
+    limiter has already tripped, see the queue.py 429-storm notes). If the
+    processing message itself never got posted, the first outcome makes ONE
+    plain send attempt instead, so the host still hears back.
+
+    in_match_channel=True tells _route_to_ign_confirmation that this reply
+    already lands in the match channel, so it must not ALSO post its own
+    "battling special characters" line there (that would be a duplicate)."""
+    in_match_channel = True
+
+    def __init__(self, channel, status_message=None):
+        self._channel = channel
+        self._status = status_message
+
+    async def send(self, text: str) -> None:
+        try:
+            if self._status is not None:
+                await self._status.edit(content=text)
+            else:
+                self._status = await self._channel.send(text)
+        except (discord.NotFound, discord.HTTPException) as exc:
+            logger.warning("+result reply dropped: %s", getattr(exc, "status", exc))
+        except Exception:
+            logger.exception("+result reply unexpectedly failed")
+
+
+_RESULT_PROCESSING_TEXT = (
+    "📥 Result received! ChampQueue is processing your scoreboard — sit tight.\n"
+    "-# No reply within 5 minutes? Send `+result` with the screenshot again."
+)
+_RESULT_BATTLING_TEXT = (
+    "⚔️ ChampQueue is battling special characters! "
+    "An admin is sending reinforcements — result will "
+    "be confirmed shortly. Hang tight!"
+)
+# One-line notices for the host/admin's real mistakes. Each is sent at most
+# ONCE per match (see Match._notice_once) — a host who keeps retyping the
+# same wrong thing gets silence after the first explanation.
+_RESULT_NOTICES = {
+    "no_image": "Attach your scoreboard screenshot to the **same** message as `+result`.",
+    "bad_file": ("That file isn't a usable image — send `+result` again with a screenshot "
+                 f"(PNG/JPG, under {config.MAX_SCOREBOARD_UPLOAD_BYTES // (1024 * 1024)}MB)."),
+    "no_room_code": "The room code hasn't been shared yet — the host shares it with `+rc<code>` first, then `+result` after the match.",
+    "text_off": "`+result` is switched off right now — please use `/match-submit` in the result-upload channel.",
+}
+
+
 class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -937,6 +1007,15 @@ class Match(commands.Cog):
     @app_commands.describe(match_id="Just the number is fine (e.g. 1234 or CQ-1234)", screenshot="Match scoreboard")
     async def match_submit(self, interaction: discord.Interaction, match_id: str,
                            screenshot: discord.Attachment):
+        # Entry-point switch (2026-09-28): off = point the host at +result
+        # and stop. One ephemeral reply, nothing else touched.
+        if not switches.RESULT_SLASH_COMMAND:
+            await interaction.response.send_message(
+                "`/match-submit` is switched off right now — send `+result` with your "
+                "scoreboard screenshot attached in your match channel instead.",
+                ephemeral=True,
+            )
+            return
         # Unified 2026-07-29: was region-aware (had to fetch the match
         # first to know which region's channel was correct). Now there's
         # one upload channel for all 4 queues, so the channel check no
@@ -986,10 +1065,11 @@ class Match(commands.Cog):
 
         attachments = (screenshot,)
         for attachment in attachments:
-            if not (attachment.content_type or "").startswith("image/"):
+            problem = self._image_problem(attachment)
+            if problem == "not_image":
                 await interaction.response.send_message("The upload must be an image file.", ephemeral=True)
                 return
-            if attachment.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
+            if problem == "too_big":
                 await interaction.response.send_message("Each image must be within the configured upload limit.", ephemeral=True)
                 return
 
@@ -999,55 +1079,270 @@ class Match(commands.Cog):
             await interaction.response.send_message(self._friendly_review_message(), ephemeral=True)
             return
 
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        # Shared with "+result": if either entry point is already processing
+        # this match, the second one is refused instead of racing it.
+        if not self._claim_result_slot(match["match_id"]):
+            await interaction.response.send_message(
+                "This match's result is already being processed — hang tight.", ephemeral=True
+            )
+            return
         try:
-            # Unified 2026-07-29: uploaded_by on match_screenshots now
-            # stores the Discord user ID of whoever actually clicked
-            # submit — the host's ID in the normal case, or the admin's
-            # ID when the admin-upload exception above was used. This is
-            # deliberately interaction.user.id, NOT player["id"] — an
-            # admin uploading on the host's behalf may have no players
-            # row at all, and match_screenshots.uploaded_by no longer has
-            # an FK to players(id) (see migration_010), so there's no
-            # reason to force it through the player lookup anymore.
-            await self._submit_body(interaction, match, player, maps, attachments, interaction.user.id)
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            # uploaded_by = interaction.user.id, NOT player["id"] — an admin
+            # uploading on the host's behalf may have no players row at all
+            # (see migration_010 and the note inside _run_submission).
+            await self._run_submission(
+                _InteractionReply(interaction), match, player, maps, attachments,
+                interaction.user.id, getattr(interaction.user, "display_name", str(interaction.user.id)),
+                safety_net_text=(
+                    "Something went wrong on our end processing this submission — it's been flagged for admin "
+                    "review automatically. Sorry about that, we'll sort it out."
+                ),
+            )
+        finally:
+            self._release_result_slot(match["match_id"])
+
+    # ── "+result" text trigger (2026-09-28) ─────────────────────────
+    # The host types +result in the match channel with the scoreboard
+    # screenshot attached to the SAME message. The channel name (cq-0042)
+    # identifies the match, so nothing else needs typing.
+    #
+    # Reply policy, chosen to spend as few Discord calls as possible:
+    #   - anyone who isn't the host or an admin: ignored, zero calls
+    #   - repeat +result while one is processing: ignored, zero calls
+    #   - repeat +result after it's already submitted: ignored, zero calls
+    #   - a real mistake by the host/admin (no image, room code not shared,
+    #     switch off): ONE short notice per kind, per match — then silence
+    #   - accepted: one "processing" message, later edited into the outcome
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        channel_name = getattr(message.channel, "name", "") or ""
+        if not channel_name.startswith("cq-"):
+            return
+        words = (message.content or "").split()
+        if not words or words[0].lower() != "+result":
+            return
+        try:
+            await self._handle_result_text(message)
+        except Exception:
+            # Last-resort guard for the up-front checks (the pipeline itself
+            # has its own safety net in _run_submission). A crash here must
+            # never bubble into discord.py's listener machinery.
+            logger.exception("+result: unhandled exception before processing for %s", channel_name)
+
+    async def _handle_result_text(self, message: discord.Message) -> None:
+        match_code = message.channel.name.upper()          # cq-0042 -> CQ-0042
+
+        # Already processing this match? Ignore before spending anything.
+        inflight, _, _ = self._result_state()
+        started = inflight.get(match_code)
+        if started is not None and time.monotonic() - started < config.RESULT_INFLIGHT_STALE_SECONDS:
+            return
+
+        match = await with_retry(adb.get_match_by_code, match_code)
+        if not match:
+            return                                          # not one of our match channels
+        player = await with_retry(adb.get_player_by_discord_id, message.author.id)
+        uploader_is_admin = is_admin_user(message.author)
+        is_host = bool(player) and match.get("room_code_shared_by") == player["id"]
+        if not (is_host or uploader_is_admin):
+            return                                          # silent for everyone else
+
+        async def notice(key: str) -> None:
+            if self._notice_once(match_code, key):
+                try:
+                    await message.channel.send(_RESULT_NOTICES[key])
+                except discord.HTTPException as exc:
+                    logger.warning("+result notice %s dropped for %s: %r", key, match_code, exc)
+
+        if not switches.RESULT_TEXT_TRIGGER:
+            await notice("text_off")
+            return
+
+        status = match.get("status")
+        if status != "awaiting_result":
+            if status in ("awaiting_room", "forming"):
+                await notice("no_room_code")
+            # pending_verification / awaiting_review / completed / anything
+            # else: already submitted or out of the host's hands -> silent.
+            # An awaiting_review match is re-opened with /admin-reset-match.
+            return
+
+        images = [a for a in message.attachments if (a.content_type or "").startswith("image/")]
+        if not message.attachments:
+            await notice("no_image")
+            return
+        if not images or self._image_problem(images[0]) is not None:
+            await notice("bad_file")
+            return
+        attachment = images[0]                              # first image only; extras are ignored
+
+        if not self._claim_result_slot(match_code):
+            return
+        try:
+            status_message = None
+            try:
+                status_message = await message.channel.send(_RESULT_PROCESSING_TEXT)
+            except discord.HTTPException as exc:
+                # Not fatal: the reply below falls back to one plain send.
+                logger.warning("+result processing message failed for %s: %r", match_code, exc)
+            reply = _MessageReply(message.channel, status_message)
+
+            maps = match.get("map_pool") or []
+            if len(maps) != 1:
+                await self._route_to_review(match, player["id"] if player else None, "result_issue",
+                                             "match has no valid map announcement (map_pool missing or incomplete)")
+                await reply.send(self._friendly_review_message())
+                return
+
+            await self._run_submission(
+                reply, match, player, maps, (attachment,),
+                message.author.id, getattr(message.author, "display_name", str(message.author.id)),
+                safety_net_text=self._friendly_review_message(),
+            )
+            # Outcome delivered: notices for this match are no longer useful.
+            _, notices, _ = self._result_state()
+            notices.pop(match_code, None)
+        finally:
+            self._release_result_slot(match_code)
+
+    # ── Shared result pipeline (2026-09-28) ─────────────────────────
+    # /match-submit and "+result" both land here. Each entry point does its
+    # own up-front checks (they differ on purpose: slash replies privately,
+    # "+result" stays silent for non-hosts) and then hands over a `reply`
+    # object with one method, send(text). Everything from reading the image
+    # onwards is identical for both, so a fix here fixes both.
+
+    def _result_state(self) -> tuple[dict, dict, set]:
+        # Lazily created (not in __init__) so tests that build the cog with
+        # Match.__new__ still work. (inflight, notices_sent, bg_tasks)
+        d = self.__dict__
+        return (d.setdefault("_result_inflight", {}),
+                d.setdefault("_result_notices", {}),
+                d.setdefault("_result_bg_tasks", set()))
+
+    def _claim_result_slot(self, match_code: str) -> bool:
+        """In-memory guard: True = you may process this match now. A slot
+        older than RESULT_INFLIGHT_STALE_SECONDS counts as abandoned (a hung
+        run must never lock the host out). A restart clears every slot —
+        safe, because nothing in the pipeline changes the match's status
+        until its last step, and every write before that replaces rather
+        than adds (screenshot upsert, migration_017 atomic round data), so
+        a re-send after a restart simply redoes the work cleanly."""
+        inflight, _, _ = self._result_state()
+        started = inflight.get(match_code)
+        now = time.monotonic()
+        if started is not None and now - started < config.RESULT_INFLIGHT_STALE_SECONDS:
+            return False
+        inflight[match_code] = now
+        return True
+
+    def _release_result_slot(self, match_code: str) -> None:
+        inflight, _, _ = self._result_state()
+        inflight.pop(match_code, None)
+
+    def _notice_once(self, match_code: str, key: str) -> bool:
+        """True the first time `key` is raised for this match, False after."""
+        _, notices, _ = self._result_state()
+        sent = notices.setdefault(match_code, set())
+        if key in sent:
+            return False
+        sent.add(key)
+        return True
+
+    @staticmethod
+    def _image_problem(attachment) -> str | None:
+        """Shared image gate for both entry points: None = usable."""
+        if not (attachment.content_type or "").startswith("image/"):
+            return "not_image"
+        if attachment.size > config.MAX_SCOREBOARD_UPLOAD_BYTES:
+            return "too_big"
+        return None
+
+    async def _run_submission(self, reply, match: dict, player: dict | None, maps: list[str],
+                              attachments, uploader_discord_id: int, uploader_name: str,
+                              *, safety_net_text: str) -> None:
+        """_submit_body plus the unhandled-exception safety net, shared by
+        both entry points (moved here unchanged from match_submit).
+
+        uploaded_by on match_screenshots stores the Discord user ID of
+        whoever actually submitted — the host's in the normal case, the
+        admin's when the admin-upload exception is used. Deliberately a
+        Discord ID, NOT player["id"]: an admin uploading on the host's
+        behalf may have no players row at all, and uploaded_by has no FK
+        to players(id) any more (see migration_010)."""
+        try:
+            await self._submit_body(reply, match, player, maps, attachments,
+                                    uploader_discord_id, uploader_name)
         except Exception as exc:
             # Safety net for anything NOT already caught by the specific
             # try/excepts inside _submit_body (OCR failure, validation
             # failure, etc.) — an unhandled crash here should never leave
-            # the player staring at "thinking..." forever with silence.
-            # Found live 2026-07-18: a return-value mismatch in
-            # _prepare_round crashed match_submit with zero notification
-            # to anyone, player or admin.
-            logger.exception("match_submit: unhandled exception for match_id=%s", match_id)
+            # the player waiting forever in silence. Found live 2026-07-18:
+            # a return-value mismatch in _prepare_round crashed match_submit
+            # with zero notification to anyone, player or admin.
+            match_code = match.get("match_id")
+            logger.exception("result submission: unhandled exception for match_id=%s", match_code)
             await incident_log.post(
                 self.bot,
                 category="MATCH_SUBMIT_UNHANDLED",
-                summary=f"Unhandled exception in match_submit for match_id={match_id}",
+                summary=f"Unhandled exception in result submission for match_id={match_code}",
                 exc=exc,
                 match=match,
             )
             try:
                 await self._route_to_review(match, player["id"] if player else None, "vision_failure",
-                                             f"Unhandled exception in match_submit: {exc!r}")
+                                             f"Unhandled exception in result submission: {exc!r}")
             except Exception as route_exc:
-                logger.exception("match_submit: even _route_to_review failed while handling the original exception")
+                logger.exception("result submission: even _route_to_review failed while handling the original exception")
                 await incident_log.post(
                     self.bot,
                     category="MATCH_SUBMIT_UNHANDLED",
-                    summary=f"_route_to_review ALSO failed while handling original match_submit exception for match_id={match_id}",
+                    summary=f"_route_to_review ALSO failed while handling original submission exception for match_id={match_code}",
                     exc=route_exc,
                     match=match,
                 )
-            await interaction.followup.send(
-                "Something went wrong on our end processing this submission — it's been flagged for admin "
-                "review automatically. Sorry about that, we'll sort it out.", ephemeral=True
-            )
+            await reply.send(safety_net_text)
 
-    async def _submit_body(self, interaction: discord.Interaction, match: dict, player: dict | None,
+    def _forward_result_screenshot(self, match: dict, image_bytes: bytes, attachment, uploader_name: str) -> None:
+        """Background re-post of the scoreboard into RESULT_SS_CHANNEL_ID as
+        a real image file (links often won't open on phones). One Discord
+        call, zero DB calls. Scheduled as a task and never awaited by the
+        pipeline: it cannot delay, block, or fail a submission. Any error
+        (429, missing channel, network) is one warning line and nothing
+        else — no retry, by design."""
+        if not config.RESULT_SS_CHANNEL_ID:
+            return
+
+        async def _post():
+            try:
+                channel = self.bot.get_channel(config.RESULT_SS_CHANNEL_ID)
+                if channel is None:
+                    logger.warning("RESULT_SS_CHANNEL_ID=%s not found — screenshot not forwarded", config.RESULT_SS_CHANNEL_ID)
+                    return
+                filename = getattr(attachment, "filename", None) or "scoreboard.png"
+                await channel.send(
+                    content=f"`{match.get('match_id')}` result screenshot · uploaded by {uploader_name}",
+                    file=discord.File(io.BytesIO(image_bytes), filename=filename),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception as exc:
+                logger.warning("screenshot forward failed for %s: %r", match.get("match_id"), exc)
+
+        _, _, tasks_ = self._result_state()
+        task = asyncio.get_running_loop().create_task(_post())
+        tasks_.add(task)                       # keep a reference so it isn't garbage-collected mid-flight
+        task.add_done_callback(tasks_.discard)
+
+    async def _submit_body(self, reply, match: dict, player: dict | None,
                             maps: list[str], attachments: tuple[discord.Attachment, ...],
-                            uploader_discord_id: int) -> None:
+                            uploader_discord_id: int, uploader_name: str = "unknown") -> None:
         payloads = await asyncio.gather(*(attachment.read() for attachment in attachments))
+        for image_bytes, attachment in zip(payloads, attachments):
+            self._forward_result_screenshot(match, image_bytes, attachment, uploader_name)
         try:
             extractions = await asyncio.gather(*(
                 asyncio.to_thread(vision_extraction.extract_scoreboard, image_bytes, attachment.content_type or "image/png")
@@ -1063,7 +1358,7 @@ class Match(commands.Cog):
                 match=match,
             )
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", f"OCR/extraction raised an exception: {exc}")
-            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+            await reply.send(self._friendly_review_message())
             return
 
         match_players = await with_retry(adb.get_match_players, match["id"])
@@ -1239,7 +1534,7 @@ class Match(commands.Cog):
                     and 1 <= len(ign_mismatch_unmatched) <= 5):
                 screenshot_url = ordered_pairs[0][1].url
                 await self._route_to_ign_confirmation(
-                    interaction, match, match_players, ign_failures, ign_mismatch_unmatched,
+                    reply, match, match_players, ign_failures, ign_mismatch_unmatched,
                     screenshot_url, leavers=leavers,
                 )
                 return
@@ -1247,7 +1542,7 @@ class Match(commands.Cog):
             screenshot_links = "\n".join(pair[1].url for pair in ordered_pairs)
             technical_detail = "Validation failed: " + "; ".join(review_reasons) + f"\n\nScreenshot:\n{screenshot_links}"
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", technical_detail)
-            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+            await reply.send(self._friendly_review_message())
             return
 
         validations = await asyncio.gather(*(
@@ -1259,7 +1554,7 @@ class Match(commands.Cog):
             players = {item["id"]: item for item in await with_retry(adb.get_players_by_ids, list(flags))}
             summary_parts = [f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items()]
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", "Stat validation flagged: " + "; ".join(summary_parts))
-            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+            await reply.send(self._friendly_review_message())
             return
 
         deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
@@ -1297,17 +1592,43 @@ class Match(commands.Cog):
             # Fail safe rather than fail silent — the match is validly at
             # pending_verification in the DB, but nobody can see the card
             # to approve it until this env var is set. Tell the uploader.
-            await interaction.followup.send(
+            await reply.send(
                 "Scoreboards accepted, but the approval channel isn't configured — "
-                "an admin needs to set RESULT_APPROVAL_CHANNEL_ID before this match can be approved.",
-                ephemeral=True,
+                "an admin needs to set RESULT_APPROVAL_CHANNEL_ID before this match can be approved."
             )
             return
-        await approval_channel.send(embed=verification_card(match, round_data, ordered_extractions[0], maps[0]), view=HostApprovalView(self, match["id"]))
-        await interaction.followup.send(
-            f"Submitted. Check {approval_channel.mention} to approve once you've verified the result.",
-            ephemeral=True,
-        )
+        # The approval card is the one Discord call on this path that really
+        # matters: the match is already pending_verification, and without a
+        # card nobody can press Approve (the sweep will still auto-approve at
+        # the deadline). So it gets exactly ONE retry after a short pause —
+        # nothing more, a tripped limiter only gets worse with hammering.
+        card_posted = False
+        for attempt in (1, 2):
+            try:
+                await approval_channel.send(embed=verification_card(match, round_data, ordered_extractions[0], maps[0]),
+                                            view=HostApprovalView(self, match["id"]))
+                card_posted = True
+                break
+            except discord.HTTPException as exc:
+                logger.warning("approval card post failed (attempt %d/2) for %s: %r", attempt, match["match_id"], exc)
+                if attempt == 1:
+                    await asyncio.sleep(2)
+                else:
+                    await incident_log.post(
+                        self.bot,
+                        category="MATCH_APPROVAL_CARD_FAIL",
+                        summary=f"Approval card failed to post twice for {match['match_id']} — match is "
+                                f"pending_verification with no card; the approval sweep will still auto-approve it",
+                        exc=exc,
+                        match=match,
+                    )
+        if card_posted:
+            await reply.send(f"Submitted. Check {approval_channel.mention} to approve once you've verified the result.")
+        else:
+            await reply.send(
+                "Result submitted, but we couldn't post the approval card — admins have been notified. "
+                "It will still be approved automatically if nobody objects."
+            )
 
     @staticmethod
     def _fuzzy_lookup(ign: str, roster: dict) -> tuple[dict | None, str | None]:
@@ -1500,7 +1821,7 @@ class Match(commands.Cog):
 
     async def _route_to_ign_confirmation(
         self,
-        interaction: discord.Interaction,
+        reply,
         match: dict,
         match_players: list[dict],
         ign_failures: list[dict],
@@ -1527,17 +1848,16 @@ class Match(commands.Cog):
         await adb.update_match(match["id"], {"status": "awaiting_review"})
 
         # --- Player-facing: reassuring message in the match text channel ---
+        # For "+result" the reply already IS the match channel (it edits the
+        # processing message), so the battling line goes out through the
+        # reply at the end instead — posting it here too would say it twice.
         text_channel = (
             self.bot.get_channel(int(match["text_channel_id"]))
-            if match.get("text_channel_id") else None
+            if match.get("text_channel_id") and not getattr(reply, "in_match_channel", False) else None
         )
         if text_channel:
             try:
-                await text_channel.send(
-                    "⚔️ ChampQueue is battling special characters! "
-                    "An admin is sending reinforcements — result will "
-                    "be confirmed shortly. Hang tight!"
-                )
+                await text_channel.send(_RESULT_BATTLING_TEXT)
             except discord.HTTPException:
                 pass
 
@@ -1583,7 +1903,10 @@ class Match(commands.Cog):
                 )
 
         # --- Uploader (host) response ---
-        await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
+        if getattr(reply, "in_match_channel", False):
+            await reply.send(_RESULT_BATTLING_TEXT)
+        else:
+            await reply.send(self._friendly_review_message())
 
     async def _complete_ign_confirmed(
         self,

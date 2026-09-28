@@ -13,9 +13,17 @@ def is_admin(interaction: discord.Interaction) -> bool:
     # scoreboard-upload-on-host's-behalf exception, and every @admin_only()
     # decorator in cogs/admin.py, cogs/queue.py, cogs/stats.py) — changing
     # it here is sufficient, no other file needs its own role-set logic.
-    if not isinstance(interaction.user, discord.Member):
+    return is_admin_user(interaction.user)
+
+
+def is_admin_user(user) -> bool:
+    """The actual admin-role check, on a user/member object rather than an
+    interaction. Split out 2026-09-28 so text-message entry points (the
+    "+result" trigger has message.author, not interaction.user) share the
+    exact same rule as every slash command — still one seam, not two."""
+    if not isinstance(user, discord.Member):
         return False
-    return any(role.id in config.ADMIN_ROLE_IDS for role in interaction.user.roles)
+    return any(role.id in config.ADMIN_ROLE_IDS for role in user.roles)
 
 
 def admin_only():

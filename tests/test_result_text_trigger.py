@@ -402,6 +402,7 @@ async def _run_submit_body(monkeypatch, approval_chan):
         async def get_match_players(self, pk): return [{"player_id": 1, "team": "A", "players": {"ign": "Ravi"}}]
         async def upsert_match_screenshot(self, *a, **kw): return None
         async def recompute_player_career_stats(self, pid): return None
+        async def recompute_player_career_stats_bulk(self, ids): return []   # branch 8: one call for all players
         async def update_match(self, pk, fields): self.updates.append(fields)
     fake = A()
     monkeypatch.setattr(match, "adb", fake)

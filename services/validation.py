@@ -11,6 +11,7 @@ eligible for host approval.
 """
 
 from __future__ import annotations
+import asyncio
 import statistics
 from typing import Any
 
@@ -41,24 +42,48 @@ async def check_stat_outliers(player_id: int, new_stats: dict) -> list[str]:
     return flags
 
 
-async def validate_submission(match_id: int, extraction: dict, player_votes: list[dict] | None = None) -> dict[str, Any]:
+# How many players' history lookups run at the same time. The old loop asked
+# for them one after another (10 round trips in a row, ~3 s in the Sep 2026
+# logs); firing all 10 at once would recreate the simultaneous burst on the
+# shared HTTP/2 connection that branch 8 exists to remove. 3 at a time is the
+# middle: ~4 short rounds instead of 10, never a burst.
+HISTORY_LOOKUP_CONCURRENCY = 3
+
+
+async def validate_submission(match_id: int, extraction: dict, player_votes: list[dict] | None = None,
+                              match_players: list[dict] | None = None) -> dict[str, Any]:
     """
+    match_players: pass the roster the caller already loaded to skip a second
+    identical get_match_players round trip. None = load it here (old behaviour).
+
     Returns:
         {"auto_accept": bool, "flags": {player_id: [flag strings]}}
     """
     all_flags: dict[int, list[str]] = {}
-    match_players = await with_retry(adb.get_match_players, match_id)
+    if match_players is None:
+        match_players = await with_retry(adb.get_match_players, match_id)
     players_by_ign = {
         candidate.get("players", {}).get("ign", "").strip().lower(): candidate
         for candidate in match_players
     }
+    checks: list[tuple[int, dict]] = []
     for p in extraction.get("players", []):
         ign = str(p.get("ign") or "").strip().lower()
         player = players_by_ign.get(ign)
         if not player:
             continue
-        flags = await check_stat_outliers(player["player_id"], p)
+        checks.append((player["player_id"], p))
+
+    gate = asyncio.Semaphore(HISTORY_LOOKUP_CONCURRENCY)
+
+    async def _check(player_id: int, stats: dict) -> tuple[int, list[str]]:
+        async with gate:
+            return player_id, await check_stat_outliers(player_id, stats)
+
+    # gather() returns results in input order, so the flags dict is built in
+    # the same order the old sequential loop built it.
+    for player_id, flags in await asyncio.gather(*(_check(pid, st) for pid, st in checks)):
         if flags:
-            all_flags[player["player_id"]] = flags
+            all_flags[player_id] = flags
 
     return {"auto_accept": not all_flags, "flags": all_flags}

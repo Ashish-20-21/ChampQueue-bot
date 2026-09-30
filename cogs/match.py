@@ -1337,6 +1337,54 @@ class Match(commands.Cog):
         tasks_.add(task)                       # keep a reference so it isn't garbage-collected mid-flight
         task.add_done_callback(tasks_.discard)
 
+    async def _recompute_career_stats_bulk(self, match: dict, match_players: list[dict], *, stale_note: str) -> None:
+        """Refresh career stats for every player in the match with ONE bulk
+        RPC (migration_040) instead of one request per player.
+
+        Why: the old code fired 10 recompute requests in the same millisecond
+        over the shared HTTP/2 connection; in the Sep 2026 logs every big
+        connection-drop cluster lined up with one of those bursts, and the two
+        real recompute failures were both a KeyError inside that HTTP/2 layer
+        (which with_retry does not retry) -- so this gets exactly one more
+        attempt after a pause.
+
+        Never raises and never blocks the submission: career stats are a
+        best-effort derived view, MMR is unaffected. A failure is reported in
+        #botlog: either "everyone" (the call itself failed twice) or the exact
+        player ids the database could not recompute (failed_ids)."""
+        player_ids = [mp["player_id"] for mp in match_players]
+        if not player_ids:
+            return
+        failed_ids = None
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                failed_ids = await with_retry(adb.recompute_player_career_stats_bulk, player_ids)
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("bulk career-stat recompute failed (attempt %d/2) for %s: %r",
+                               attempt, match.get("match_id"), exc)
+                if attempt == 1:
+                    await asyncio.sleep(1)
+        if failed_ids is None:
+            await incident_log.post(
+                self.bot,
+                category="MATCH_STAT_RECOMPUTE_FAIL",
+                summary=f"bulk recompute_player_career_stats failed twice for {match.get('match_id')} — "
+                        f"career stats stale for all {len(player_ids)} players {stale_note}; MMR unaffected",
+                exc=last_exc,
+                match=match,
+            )
+        elif failed_ids:
+            await incident_log.post(
+                self.bot,
+                category="MATCH_STAT_RECOMPUTE_FAIL",
+                summary=f"bulk recompute_player_career_stats could not recompute player_id(s) {failed_ids} for "
+                        f"{match.get('match_id')} — career stats stale for them {stale_note}; MMR unaffected",
+                match=match,
+            )
+
     async def _submit_body(self, reply, match: dict, player: dict | None,
                             maps: list[str], attachments: tuple[discord.Attachment, ...],
                             uploader_discord_id: int, uploader_name: str = "unknown") -> None:
@@ -1420,21 +1468,12 @@ class Match(commands.Cog):
                 )
                 for item in clean_rounds
             ))
-            # Same fire-and-forget pattern as _do_approve's post-approval
-            # recompute — a partial (clean-rounds-only) write should still
-            # surface on /player-stats right away rather than waiting for
-            # the whole match to eventually clear review. Never blocks or
-            # fails the submission itself.
-            recompute_results = await asyncio.gather(
-                *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
-                return_exceptions=True,
-            )
-            for mp, result in zip(match_players, recompute_results):
-                if isinstance(result, Exception):
-                    logger.exception(
-                        "recompute_player_career_stats (provisional, partial-clean-rounds) failed for "
-                        "player_id=%s after match_id=%s submission", mp["player_id"], match["id"], exc_info=result,
-                    )
+            # (No career-stat recompute here any more: at this point the match is
+            # still 'awaiting_result', a status recompute_player_career_stats does
+            # not count -- migration_011/019 only count completed,
+            # pending_verification and awaiting_review -- so the old first wave
+            # recomputed numbers that did not yet include this match. The one
+            # recompute that matters runs after the status changes, below.)
 
             # AFK notice — fires once per submission if _prepare_round
             # synthesized a leaver's row (see the "afk" key added there).
@@ -1546,7 +1585,7 @@ class Match(commands.Cog):
             return
 
         validations = await asyncio.gather(*(
-            validation.validate_submission(match["id"], extraction)
+            validation.validate_submission(match["id"], extraction, match_players=match_players)
             for extraction in ordered_extractions
         ))
         flags = {pid: issues for result in validations for pid, issues in result["flags"].items()}
@@ -1554,6 +1593,11 @@ class Match(commands.Cog):
             players = {item["id"]: item for item in await with_retry(adb.get_players_by_ids, list(flags))}
             summary_parts = [f"{players.get(pid, {}).get('ign', pid)}: {', '.join(issues)}" for pid, issues in flags.items()]
             await self._route_to_review(match, player["id"] if player else None, "vision_failure", "Stat validation flagged: " + "; ".join(summary_parts))
+            # The clean round was written above, and awaiting_review is a status
+            # career stats count (migration_011), so refresh them now -- the old
+            # first wave ran before this status existed and never did, leaving
+            # flagged matches invisible on /player-stats until approval.
+            await self._recompute_career_stats_bulk(match, match_players, stale_note="until this match is reviewed and approved")
             await reply.send(self._friendly_review_message())
             return
 
@@ -1562,27 +1606,14 @@ class Match(commands.Cog):
         await _post_match_status(self.bot, match["match_id"], match.get("queue_key", ""), "result submitted, awaiting host approval")
 
         # Reform 2026-07-29: career stats (K/D, matches played, avg damage,
-        # etc.) are now visible on /player-stats as soon as OCR passes and
-        # a match reaches pending_verification — not gated on host/sweep
-        # approval anymore. See migration_011_provisional_stats.sql for
-        # the read-path change this depends on. MMR/rank are UNCHANGED —
-        # still only committed by approve_match inside _do_approve().
-        # Same fire-and-forget pattern as that call site: a recompute
-        # failure here must never block or fail the submission itself.
-        # (This runs again here even though the clean-rounds block above
-        # may have already recomputed once — harmless, same idempotent
-        # full-aggregate function, just cheap redundancy on the all-clean
-        # happy path rather than added complexity to skip it.)
-        recompute_results = await asyncio.gather(
-            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
-            return_exceptions=True,
-        )
-        for mp, result in zip(match_players, recompute_results):
-            if isinstance(result, Exception):
-                logger.exception(
-                    "recompute_player_career_stats (provisional, pending_verification) failed for "
-                    "player_id=%s after match_id=%s submission", mp["player_id"], match["id"], exc_info=result,
-                )
+        # etc.) are visible on /player-stats as soon as OCR passes and a match
+        # reaches pending_verification -- not gated on host/sweep approval. See
+        # migration_011_provisional_stats.sql. MMR/rank are UNCHANGED -- still
+        # only committed by approve_match inside _do_approve().
+        # Branch 8: ONE bulk RPC (migration_040) instead of 10 simultaneous
+        # requests. Runs BEFORE the approval card on purpose (stats first);
+        # never raises, see _recompute_career_stats_bulk.
+        await self._recompute_career_stats_bulk(match, match_players, stale_note="until this match is approved")
 
         # Channel lock: the verification card always posts in the
         # configured approval channel, never wherever /match-submit

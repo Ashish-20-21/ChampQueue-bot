@@ -255,3 +255,36 @@ def test_bulk_sql_follows_the_house_rules_and_never_touches_season_points():
     assert "exception when others" in code                                     # one bad player can't sink nine
     assert "grant execute on function recompute_player_career_stats_bulk(bigint[]) to service_role" in code
     assert "season_point" not in code                                          # the no-negative-SP floor is out of reach
+
+
+# ---------------- approval (commit 3) ----------------
+
+async def test_approval_refreshes_stats_with_one_bulk_call(monkeypatch):
+    class A(Recorder):
+        async def has_open_issue(self, mid): return False
+        async def approve_match(self, mid, by): self.log.append("approve_match")
+        async def get_match(self, mid): self.log.append("get_match"); return {"id": mid, "match_id": "CQ-0042"}   # no season_id: SP check skipped
+    fake = A(); monkeypatch.setattr(match, "adb", fake)
+    c = match.Match.__new__(match.Match); c.bot = None
+
+    async def cleanup(guild, m): fake.log.append("cleanup")
+    c._run_post_approval_cleanup = cleanup
+    ok, msg = await c._do_approve(None, 7, 1)
+    assert (ok, msg) == (True, "approved")
+    assert fake.log.count("bulk:10") == 1 and not [e for e in fake.log if e.startswith("recompute_one")]
+    assert fake.log.index("approve_match") < fake.log.index("bulk:10") < fake.log.index("cleanup")   # MMR first, then stats
+    assert fake.log.count("get_match") == 1                                                          # moved, not added
+
+
+async def test_approval_still_succeeds_when_the_stats_refresh_fails(monkeypatch, incidents):
+    class A(Recorder):
+        async def has_open_issue(self, mid): return False
+        async def approve_match(self, mid, by): pass
+        async def get_match(self, mid): return {"id": mid, "match_id": "CQ-0042"}
+    fake = A([KeyError(73), KeyError(81)]); monkeypatch.setattr(match, "adb", fake)
+    c = match.Match.__new__(match.Match); c.bot = None
+
+    async def cleanup(guild, m): pass
+    c._run_post_approval_cleanup = cleanup
+    assert await c._do_approve(None, 7, 1) == (True, "approved")        # MMR already committed; stats are best-effort
+    assert incidents and "CQ-0042" in incidents[0]["summary"]

@@ -2117,24 +2117,9 @@ class Match(commands.Cog):
             for item in round_data
         ))
 
-        # Recompute career stats (fire-and-forget, same as _submit_body)
-        recompute_results = await asyncio.gather(
-            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
-            return_exceptions=True,
-        )
-        for mp, result in zip(match_players, recompute_results):
-            if isinstance(result, Exception):
-                logger.exception(
-                    "recompute_player_career_stats failed for player_id=%s after IGN-confirmed match %s",
-                    mp["player_id"], match["match_id"], exc_info=result,
-                )
-                await incident_log.post(
-                    self.bot,
-                    category="MATCH_STAT_RECOMPUTE_FAIL",
-                    summary=f"recompute_player_career_stats failed for player_id={mp['player_id']} after IGN-confirmed match {match['match_id']} — career stats now stale for this player, MMR already committed and unaffected",
-                    exc=result,
-                    match=match,
-                )
+        # Recompute career stats: ONE bulk RPC (branch 8), same never-raises
+        # contract as _submit_body.
+        await self._recompute_career_stats_bulk(match, match_players, stale_note="after IGN confirmation")
 
         # AFK notice for any leavers auto-resolved alongside this
         # confirmed IGN mapping — informational only, same as the
@@ -2500,33 +2485,20 @@ class Match(commands.Cog):
         except Exception as exc:
             return False, f"Approval could not be committed safely: {exc}"
 
-        # P6: career-stat recompute, one call per player in this match.
+        # P6: career-stat recompute for this match's players.
         # Deliberately AFTER the MMR commit above and wrapped so a
         # recompute failure never rolls back or blocks an approval that
         # has already landed — MMR is the authoritative, already-committed
         # outcome; career stats (record/KD/avg damage/etc.) are a
-        # best-effort derived view and can be caught up later (e.g. by
-        # re-running recompute_player_career_stats for the affected
-        # player) without needing to touch matches or MMR at all.
+        # best-effort derived view and can be caught up later without
+        # needing to touch matches or MMR at all.
+        # Branch 8: ONE bulk RPC (migration_040) instead of one request per
+        # player (a burst of 10 on the shared HTTP/2 connection). The match
+        # row is fetched first (same single get_match call, just moved up) so
+        # a failure can be reported with the match code.
         match_players = await adb.get_match_players(match_id)
-        results = await asyncio.gather(
-            *(with_retry(adb.recompute_player_career_stats, mp["player_id"]) for mp in match_players),
-            return_exceptions=True,
-        )
-        for mp, result in zip(match_players, results):
-            if isinstance(result, Exception):
-                logger.exception(
-                    "recompute_player_career_stats failed for player_id=%s after match_id=%s approval",
-                    mp["player_id"], match_id, exc_info=result,
-                )
-                await incident_log.post(
-                    self.bot,
-                    category="MATCH_STAT_RECOMPUTE_FAIL",
-                    summary=f"recompute_player_career_stats failed for player_id={mp['player_id']} after match_id={match_id} approval — career stats now stale for this player, MMR already committed and unaffected",
-                    exc=result,
-                )
-
         match = await adb.get_match(match_id)
+        await self._recompute_career_stats_bulk(match, match_players, stale_note="after approval")
 
         # ── Season Points (migration_029) ──
         # Points are already committed inside approve_match's SQL

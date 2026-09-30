@@ -959,6 +959,15 @@ def _recompute_player_career_stats(self: Database, player_id: int) -> None:
     self.client.rpc("recompute_player_career_stats", {"p_player_id": player_id}).execute()
 
 
+def _recompute_player_career_stats_bulk(self: Database, player_ids: list[int]) -> list[int]:
+    """migration_040: ONE rpc that runs recompute_player_career_stats for every
+    id inside the database, instead of one request per player (a burst of 10
+    on the shared HTTP/2 connection). Returns the ids that FAILED inside the
+    loop -- [] means every player was recomputed."""
+    res = self.client.rpc("recompute_player_career_stats_bulk", {"p_player_ids": list(player_ids)}).execute()
+    return list(res.data or [])
+
+
 def _region_leaderboard(self: Database) -> list[dict]:
     """Full roster, MMR-ordered, no LIMIT — deliberately separate from the
     older leaderboard() method (still used as-is by digest.py, top-N only).
@@ -1012,6 +1021,7 @@ Database.set_approval_deadline = _set_approval_deadline
 Database.get_match_screenshot = _get_match_screenshot
 Database.correct_match_round_result = _correct_match_round_result
 Database.recompute_player_career_stats = _recompute_player_career_stats
+Database.recompute_player_career_stats_bulk = _recompute_player_career_stats_bulk  # migration_040
 Database.region_leaderboard = _region_leaderboard
 Database.weekly_leaders = _weekly_leaders
 Database.live_player_titles = _live_player_titles

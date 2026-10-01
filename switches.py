@@ -57,3 +57,10 @@ if not RESULT_TEXT_TRIGGER and not RESULT_SLASH_COMMAND:
     )
     RESULT_TEXT_TRIGGER = True
     RESULT_SLASH_COMMAND = True
+
+# Per-interaction timing meter (2026-10): one INTERACTION_TIMING log line per
+# button press / slash command / modal submit, showing where the time went
+# (see utils/interaction_timer.py). Read-only: it only reads clocks and logs.
+# Default ON. Set INTERACTION_TIMING=false and restart to turn it off (nothing
+# is patched then). Read at startup.
+INTERACTION_TIMING = os.getenv("INTERACTION_TIMING", "true").strip().lower() == "true"

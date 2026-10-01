@@ -16,6 +16,11 @@ import httpx
 from supabase import create_client, Client
 import config
 
+try:   # per-interaction timing (utils/interaction_timer.py); optional, never required
+    from utils import interaction_timer as _itimer
+except Exception:   # pragma: no cover - the DB layer must import even if the meter can't
+    _itimer = None
+
 logger = logging.getLogger("champions_queue")
 
 # Transient transport-layer failures worth a retry — NOT application errors
@@ -86,6 +91,10 @@ async def with_retry(coro_fn, *args, attempts: int = 3, base_delay: float = 0.5,
             return await coro_fn(*args, **kwargs)
         except _RETRYABLE_EXCEPTIONS as exc:
             last_exc = exc
+            try:
+                _itimer.note_retry()   # timing meter only; never affects the retry
+            except Exception:
+                pass
             if attempt < attempts - 1:
                 logger.warning(
                     "Transient network error on attempt %d/%d for %s: %r — retrying in %.1fs",
@@ -804,6 +813,15 @@ class _AsyncDatabaseProxy:
             return attr
 
         async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Inside a timed interaction (button/command/modal) the call is
+            # timed by utils/interaction_timer; everywhere else it is the
+            # exact same plain to_thread call as before.
+            try:
+                timed = _itimer is not None and _itimer.current() is not None
+            except Exception:
+                timed = False
+            if timed:
+                return await _itimer.timed_db(name, attr, args, kwargs)
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _wrapper

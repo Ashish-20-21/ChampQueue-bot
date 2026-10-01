@@ -10,7 +10,7 @@ from discord.ext import commands
 
 import config
 
-from utils import discord_meter
+from utils import discord_meter, interaction_timer
 
 # File handler alongside the existing stdout one — recommended in the
 # post-P6 architecture review (§6.3) since the bot currently runs as a
@@ -83,6 +83,7 @@ class ChampionsQueueBot(commands.Bot):
 
     async def setup_hook(self):
         discord_meter.install(self)
+        interaction_timer.install(self)
         _install_tree_error_handler(self.tree)
         for cog in COGS:
             await self.load_extension(cog)

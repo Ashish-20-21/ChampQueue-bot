@@ -14,7 +14,7 @@ import switches
 from database.db import db, adb, with_retry
 from services import matchmaking, mmr_engine, reputation
 from utils.permissions import admin_only, mod_or_admin_only
-from utils import incident_log
+from utils import incident_log, interaction_timer
 
 logger = logging.getLogger("champions_queue")
 
@@ -536,7 +536,7 @@ class Queue(commands.Cog):
             await _safe_ack(lambda: interaction.followup.send(reason, ephemeral=True), what="join-ineligible", player_id=player["id"])
             return
 
-        async with self._locks[queue_key]:
+        async with interaction_timer.timed_lock(self._locks[queue_key]):
             try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
             except Exception as exc:
@@ -632,7 +632,7 @@ class Queue(commands.Cog):
             await _safe_ack(lambda: interaction.followup.send("You're not registered.", ephemeral=True), what="leave-unregistered")
             return
 
-        async with self._locks[queue_key]:
+        async with interaction_timer.timed_lock(self._locks[queue_key]):
             try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
             except Exception as exc:
@@ -689,7 +689,7 @@ class Queue(commands.Cog):
             await _safe_ack(lambda: interaction.followup.send("You're not registered.", ephemeral=True), what="start-unregistered")
             return
 
-        async with self._locks[queue_key]:
+        async with interaction_timer.timed_lock(self._locks[queue_key]):
             try:
                 current_queue = await with_retry(adb.queue_current, queue_key=queue_key)
             except Exception as exc:

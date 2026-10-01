@@ -176,6 +176,24 @@ def _log_429(method: str, path: str, kind: str, cat: str, exc: Exception, ts: fl
         pass
 
 
+def _timing_label(method: str, path: str, kind: str, cat: str) -> str:
+    """Short name for one Discord call, used by the per-interaction timer
+    (utils/interaction_timer.py). Never raises."""
+    try:
+        if kind:
+            return kind
+        if cat == "reply":
+            if method == "POST":
+                return "followup_send"
+            if method == "PATCH":
+                return "webhook_edit"
+            return f"webhook_{method.lower()}"
+        parts = _simplify_path(path).strip("/").split("/")
+        return f"chan.{method} {'/'.join(parts[-3:])}"
+    except Exception:
+        return "call"
+
+
 def _after_call(method: str, path: str, kind: str, cat: str, t0: float,
                 exc: Exception | None) -> None:
     """All metering for one finished call, fully guarded: the meter must never
@@ -189,6 +207,14 @@ def _after_call(method: str, path: str, kind: str, cat: str, t0: float,
         _record(method, path, outcome, kind, cat, t0)
         if outcome == "429":
             _log_429(method, path, kind, cat, exc, t0)
+    except Exception:
+        pass
+    # Also report to the per-interaction timer (no-op outside a timed interaction).
+    try:
+        from utils import interaction_timer
+        if interaction_timer.current() is not None:
+            interaction_timer.note_discord(
+                _timing_label(method, path, kind, cat), (_now() - t0) * 1000.0, cat)
     except Exception:
         pass
 

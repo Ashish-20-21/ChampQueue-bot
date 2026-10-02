@@ -103,14 +103,6 @@ The scoreboard is the source of truth: teams and winner come from the screenshot
 
 </details>
 
-### `db` vs `adb` — which to use
-`database/db.py` exposes two things: `db` (synchronous — blocks the whole
-bot while waiting on Supabase) and `adb` (async-safe wrapper — doesn't
-block). **All new or edited code must use `adb`, always, no exceptions.**
-See `DECISIONS.md` → "db vs adb" for the full reasoning. If you find a
-`db.<method>(...)` call anywhere in a cog, that's leftover/unmigrated code,
-not an intentional choice.
-
 ---
 
 ## Documentation

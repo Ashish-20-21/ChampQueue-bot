@@ -270,15 +270,20 @@ class Stats(commands.Cog):
     @app_commands.describe(user="Leave blank to see your own stats, or mention someone else to see theirs")
     async def player_stats(self, interaction: discord.Interaction, user: discord.Member | None = None):
         target = user or interaction.user
+        # Ack first (2026-10-03): the DB calls below can stall for seconds
+        # after an idle gap, and Discord drops the interaction (10062) if
+        # it isn't acknowledged within 3 s. Ephemeral is fixed by this
+        # defer and can't change later, so it must match the reply.
+        await interaction.response.defer(ephemeral=True)
         player = await adb.get_player_by_discord_id(target.id)
         if not player:
-            await interaction.response.send_message(f"{target.mention} isn't registered.", ephemeral=True)
+            await interaction.followup.send(f"{target.mention} isn't registered.", ephemeral=True)
             return
         weekly = await adb.weekly_leaders()
         # Only visible to the person who ran the command — locked 2026-07-19,
         # this card was public before P6 and that was a real gap, not the
         # intended behavior.
-        await interaction.response.send_message(embed=player_stats_card(player, weekly), ephemeral=True)
+        await interaction.followup.send(embed=player_stats_card(player, weekly), ephemeral=True)
 
     @app_commands.command(name="cs-stats", description="View your (or another player's) stats for the current season")
     @app_commands.describe(user="Leave blank to see your own stats, or mention someone else to see theirs")
@@ -290,16 +295,17 @@ class Stats(commands.Cog):
         # unlike season_points. See cs_stats_card's docstring in
         # utils/embeds.py for the exact field set / what's omitted.
         target = user or interaction.user
+        await interaction.response.defer(ephemeral=True)  # ack first, see /player-stats
         player = await adb.get_player_by_discord_id(target.id)
         if not player:
-            await interaction.response.send_message(f"{target.mention} isn't registered.", ephemeral=True)
+            await interaction.followup.send(f"{target.mention} isn't registered.", ephemeral=True)
             return
         season = await adb.get_active_season()
         if not season:
-            await interaction.response.send_message("No active season right now.", ephemeral=True)
+            await interaction.followup.send("No active season right now.", ephemeral=True)
             return
         season_stats = await adb.current_season_stats(player["id"], season["id"])
-        await interaction.response.send_message(embed=cs_stats_card(player, season, season_stats), ephemeral=True)
+        await interaction.followup.send(embed=cs_stats_card(player, season, season_stats), ephemeral=True)
 
     @app_commands.command(name="leaderboard-post", description="Post the persistent unified leaderboard panel")
     @mod_or_admin_only()
@@ -356,12 +362,13 @@ class Stats(commands.Cog):
 
     @app_commands.command(name="rank-progress", description="See your progress toward the next rank/division")
     async def rank_progress(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)  # ack first, see /player-stats
         player = await adb.get_player_by_discord_id(interaction.user.id)
         if not player:
-            await interaction.response.send_message("You're not registered.", ephemeral=True)
+            await interaction.followup.send("You're not registered.", ephemeral=True)
             return
         tier, division = mmr_engine.derive_rank(player["mmr"])
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=rank_progress_card(player, tier),
             view=RankProgressView(player, tier),
             ephemeral=True,
@@ -387,13 +394,17 @@ class Stats(commands.Cog):
         # discussion), same reasoning as the user param existing here in
         # the first place.
         target = user or interaction.user
+        # Ephemeral matches what this command has always actually sent
+        # (the comment above says "NOT ephemeral" but the code has always
+        # passed ephemeral=True — behaviour kept, not changed here).
+        await interaction.response.defer(ephemeral=True)  # ack first, see /player-stats
         player = await adb.get_player_by_discord_id(target.id)
         if not player:
-            await interaction.response.send_message(f"{target.mention} isn't registered.", ephemeral=True)
+            await interaction.followup.send(f"{target.mention} isn't registered.", ephemeral=True)
             return
         earned = await adb.get_player_achievements(player["id"])
         live_titles = await adb.live_player_titles(player["id"])
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=achievements_card(player, earned, live_titles),
             view=AchievementsBrowseView(player, earned, live_titles),
             ephemeral=True,

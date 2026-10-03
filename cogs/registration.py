@@ -57,9 +57,16 @@ class Registration(commands.Cog):
             )
             return
 
+        # Pure-CPU checks above reply instantly. From here on every step is
+        # a DB call (up to 4 in a row), so ack first (2026-10-03) — a slow
+        # first call used to push the reply past Discord's 3 s limit and
+        # the player saw "application did not respond" even though the
+        # registration itself could still land.
+        await interaction.response.defer(ephemeral=True)
+
         existing = await adb.get_player_by_discord_id(interaction.user.id)
         if existing:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"You're already registered as **{existing['ign']}** (status: `{existing['status']}`). "
                 f"Contact an admin if you need your IGN updated.",
                 ephemeral=True,
@@ -68,7 +75,7 @@ class Registration(commands.Cog):
 
         uid_taken = await adb.get_player_by_uid(cod_uid)
         if uid_taken:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "That COD Mobile UID is already registered to another Discord account. "
                 "If this is your UID, contact an admin.",
                 ephemeral=True,
@@ -95,7 +102,7 @@ class Registration(commands.Cog):
             if is_discord_id_conflict:
                 existing_now = await adb.get_player_by_discord_id(interaction.user.id)
                 if existing_now:
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         f"You're already registered as **{existing_now['ign']}** "
                         f"(status: `{existing_now['status']}`). That last click just duplicated "
                         f"your own request — no action needed.",
@@ -107,13 +114,13 @@ class Registration(commands.Cog):
             if is_uid_conflict:
                 winner = await adb.get_player_by_uid(cod_uid)
                 if winner and str(winner.get("discord_id")) == str(interaction.user.id):
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         f"You're already registered as **{winner['ign']}** (status: `{winner['status']}`). "
                         f"That last click just duplicated your own request — no action needed.",
                         ephemeral=True,
                     )
                 else:
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         "That COD Mobile UID is already registered to another Discord account. "
                         "If this is your UID, contact an admin.",
                         ephemeral=True,
@@ -122,7 +129,7 @@ class Registration(commands.Cog):
             raise
 
         await adb.approve_player(player["id"], approved_by="auto")
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"You're registered and approved, **{ign}**! (UID `{cod_uid}`, region `{region}`) "
             f"You can head to any of the queue channels and join now — your region is just a "
             f"label for us, it doesn't limit which queue you can play in.",
@@ -136,11 +143,12 @@ class Registration(commands.Cog):
 
     @app_commands.command(name="whoami", description="Check your registration status")
     async def whoami(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)  # ack first, see stats.py /player-stats
         player = await adb.get_player_by_discord_id(interaction.user.id)
         if not player:
-            await interaction.response.send_message("You're not registered yet — use `/register` first.", ephemeral=True)
+            await interaction.followup.send("You're not registered yet — use `/register` first.", ephemeral=True)
             return
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"**{player['ign']}** — UID `{player['cod_uid']}` — status: `{player['status']}` "
             f"— rank: {player['current_rank']} — MMR: {player['mmr']}",
             ephemeral=True,

@@ -1016,6 +1016,12 @@ class Match(commands.Cog):
                 ephemeral=True,
             )
             return
+        # Ack first (2026-10-03). The checks below start with a DB call and
+        # chain several more; when the first one stalls (seen ~4 s after an
+        # idle gap) the 3 s deadline passed and Discord reported "Unknown
+        # interaction" before the host got any answer. Ephemeral is fixed by
+        # this defer — every reply in this command is ephemeral already.
+        await interaction.response.defer(thinking=True, ephemeral=True)
         # Unified 2026-07-29: was region-aware (had to fetch the match
         # first to know which region's channel was correct). Now there's
         # one upload channel for all 4 queues, so the channel check no
@@ -1025,12 +1031,12 @@ class Match(commands.Cog):
         match_id = normalize_match_code(match_id)
         match = await adb.get_match_by_code(match_id)
         if not match:
-            await interaction.response.send_message("Match not found.", ephemeral=True)
+            await interaction.followup.send("Match not found.", ephemeral=True)
             return
 
         if not self._in_upload_channel(interaction):
             channel_mention = f"<#{config.RESULT_UPLOAD_CHANNEL_ID}>" if config.RESULT_UPLOAD_CHANNEL_ID else "the result-upload channel"
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Match results can only be submitted in {channel_mention}.", ephemeral=True
             )
             return
@@ -1038,12 +1044,12 @@ class Match(commands.Cog):
         player = await adb.get_player_by_discord_id(interaction.user.id)
         if match.get("status") != "awaiting_result":
             if match["status"] in ("pending_verification", "awaiting_review", "completed"):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "This match's results were already submitted. If something looks wrong, "
                     "contact an admin rather than resubmitting.", ephemeral=True
                 )
             else:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "This match isn't ready for scoreboard submission yet — make sure the room code has been shared first.",
                     ephemeral=True,
                 )
@@ -1060,34 +1066,33 @@ class Match(commands.Cog):
         uploader_is_admin = is_admin(interaction)
         if not uploader_is_admin:
             if not player or match.get("room_code_shared_by") != player["id"]:
-                await interaction.response.send_message("Only the Match Host can upload scoreboards.", ephemeral=True)
+                await interaction.followup.send("Only the Match Host can upload scoreboards.", ephemeral=True)
                 return
 
         attachments = (screenshot,)
         for attachment in attachments:
             problem = self._image_problem(attachment)
             if problem == "not_image":
-                await interaction.response.send_message("The upload must be an image file.", ephemeral=True)
+                await interaction.followup.send("The upload must be an image file.", ephemeral=True)
                 return
             if problem == "too_big":
-                await interaction.response.send_message("Each image must be within the configured upload limit.", ephemeral=True)
+                await interaction.followup.send("Each image must be within the configured upload limit.", ephemeral=True)
                 return
 
         maps = match.get("map_pool") or []
         if len(maps) != 1:
             await self._route_to_review(match, player["id"] if player else None, "result_issue", "match has no valid map announcement (map_pool missing or incomplete)")
-            await interaction.response.send_message(self._friendly_review_message(), ephemeral=True)
+            await interaction.followup.send(self._friendly_review_message(), ephemeral=True)
             return
 
         # Shared with "+result": if either entry point is already processing
         # this match, the second one is refused instead of racing it.
         if not self._claim_result_slot(match["match_id"]):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This match's result is already being processed — hang tight.", ephemeral=True
             )
             return
         try:
-            await interaction.response.defer(thinking=True, ephemeral=True)
             # uploaded_by = interaction.user.id, NOT player["id"] — an admin
             # uploading on the host's behalf may have no players row at all
             # (see migration_010 and the note inside _run_submission).

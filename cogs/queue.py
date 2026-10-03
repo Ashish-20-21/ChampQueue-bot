@@ -419,9 +419,12 @@ class Queue(commands.Cog):
         app_commands.Choice(name=display, value=key) for display, key in config.queue_choice_items()
     ])
     async def queue_status(self, interaction: discord.Interaction, queue: app_commands.Choice[str]):
+        # Public reply, so the defer is public too (ephemeral can't be
+        # changed after the ack). Ack first, see stats.py /player-stats.
+        await interaction.response.defer()
         current = await adb.queue_current(queue_key=queue.value)
         names = ", ".join(p["players"]["ign"] for p in current) or "empty"
-        await interaction.response.send_message(f"**{queue.name} Queue ({len(current)}/10):** {names}")
+        await interaction.followup.send(f"**{queue.name} Queue ({len(current)}/10):** {names}")
 
     async def _report_queue_action_failure(
         self, interaction: discord.Interaction, exc: Exception, *,
@@ -1372,22 +1375,26 @@ class Queue(commands.Cog):
             await interaction.response.send_message("You can't report a bot.", ephemeral=True)
             return
 
+        # The cheap checks above reply instantly. Everything below starts
+        # with 3 DB calls in a row, so ack first (2026-10-03).
+        await interaction.response.defer(ephemeral=True)
+
         reporter = await adb.get_player_by_discord_id(interaction.user.id)
         reported = await adb.get_player_by_discord_id(target.id)
         if not reporter or not reported:
-            await interaction.response.send_message("Both players need to be registered.", ephemeral=True)
+            await interaction.followup.send("Both players need to be registered.", ephemeral=True)
             return
 
         match_code = interaction.channel.name.upper()
         match = await adb.get_match_by_code(match_code)
         if not match:
-            await interaction.response.send_message("Couldn't find a match tied to this channel.", ephemeral=True)
+            await interaction.followup.send("Couldn't find a match tied to this channel.", ephemeral=True)
             return
 
         match_players = await adb.get_match_players(match["id"])
         match_player_ids = {mp["player_id"] for mp in match_players}
         if reporter["id"] not in match_player_ids or reported["id"] not in match_player_ids:
-            await interaction.response.send_message("Both players need to be part of this match.", ephemeral=True)
+            await interaction.followup.send("Both players need to be part of this match.", ephemeral=True)
             return
 
         # Rate limit LAST among the rejections, so a request that was
@@ -1401,7 +1408,7 @@ class Queue(commands.Cog):
         retry_after = self._report_cooldown.get_bucket(_Ctx()).update_rate_limit()
         if retry_after:
             minutes = max(1, int(retry_after // 60) + 1)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"You've hit the report limit ({config.REPORT_COOLDOWN_USES} per hour). "
                 f"Try again in about {minutes} minute{'s' if minutes != 1 else ''}. "
                 "If something is urgent, ping an admin directly.",
@@ -1410,7 +1417,7 @@ class Queue(commands.Cog):
             return
 
         is_host = reported["id"] == match.get("room_code_shared_by")
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Report sent to admins for review — no action has been taken automatically.", ephemeral=True
         )
 

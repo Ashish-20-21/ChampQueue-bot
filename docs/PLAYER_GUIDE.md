@@ -24,7 +24,7 @@ Run `/register` with:
 
 A valid UID is approved instantly. A wrong UID saves nothing, so just run `/register` again. `/whoami` shows your status.
 
-**Renamed in-game?** Use `/ign-change` (2 per week). Your stats follow your UID, so a rename loses nothing.
+**Renamed in-game?** Use `/ign-change` (limited per week; the current limit is set by the admins). Your stats follow your UID, so a rename loses nothing.
 
 ---
 
@@ -123,7 +123,7 @@ After approval nothing is reversed automatically. Staff fix mistakes by adjustin
 | Command | Who | Purpose |
 |---|---|---|
 | `/register`, `/whoami` | Everyone | Sign up, check your status |
-| `/ign-change` | Everyone (2 per week) | Update your in-game name |
+| `/ign-change` | Everyone (weekly limit) | Update your in-game name |
 | `/queue-status` | Everyone | See who is in a queue |
 | `/player-stats`, `/cs-stats` | Everyone | Career and current-season stats |
 | `/rank-progress`, `/achievements` | Everyone | Progress to the next rank, badges |

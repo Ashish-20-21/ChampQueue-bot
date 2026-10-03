@@ -229,6 +229,21 @@ MATCH_STATUS_CHANNEL_ID = int(os.getenv("MATCH_STATUS_CHANNEL_ID")) if os.getenv
 # 0 = feature disabled. Read at startup (needs restart to change).
 HOST_REPLACE_LIMIT = int(os.getenv("HOST_REPLACE_LIMIT", "2"))
 
+# /ign-change: how many times a PLAYER may change their own IGN inside a
+# rolling 7-day window. Admins are never limited (and admin-made changes do
+# not count against a player's allowance). To raise or lower the limit, set
+# IGN_CHANGE_LIMIT (2, 3, 4, 5, ...) and restart - no code edit. Read at
+# startup. A missing, non-numeric or <1 value falls back to 2, so a typo in
+# the env can never lock every player out or crash the bot at boot.
+def _ign_change_limit() -> int:
+    try:
+        value = int(os.getenv("IGN_CHANGE_LIMIT", "2"))
+    except ValueError:
+        return 2
+    return value if value >= 1 else 2
+
+IGN_CHANGE_LIMIT = _ign_change_limit()
+
 # --- Supabase / Postgres ---
 SUPABASE_URL = _require("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _require("SUPABASE_SERVICE_KEY")

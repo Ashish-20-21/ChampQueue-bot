@@ -1111,8 +1111,8 @@ def _log_ign_change(self: Database, player_id: int, old_ign: str, new_ign: str, 
 
 def _count_recent_ign_changes(self: Database, player_id: int, since_iso: str) -> int:
     """Count SELF-initiated ign_change_history rows for a player since
-    the given timestamp. Used by /ign-change to enforce the 2-per-7-days
-    rate limit for non-admin players.
+    the given timestamp. Used by /ign-change to enforce the per-7-days
+    rate limit (config.IGN_CHANGE_LIMIT) for non-admin players.
 
     Filtered to changed_by == 'self' deliberately (2026-08-19 fix) —
     without this filter, an admin fixing a player's IGN (changed_by =

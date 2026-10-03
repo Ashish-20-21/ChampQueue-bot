@@ -651,15 +651,16 @@ class Admin(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /ign-change (2026-08-15) ─────────────────────────────────
-    # Shared command: players change their own IGN (rate-limited, 2 per
-    # rolling 7-day window); admins can change any player's IGN by
-    # specifying the optional `user` parameter (unlimited, no rate limit).
+    # Shared command: players change their own IGN (rate-limited to
+    # config.IGN_CHANGE_LIMIT per rolling 7-day window, default 2); admins
+    # can change any player's IGN by specifying the optional `user`
+    # parameter (unlimited, no rate limit).
     # The `user` field only appears in the slash-command picker for
     # members with admin/HOD roles — regular players see only `new_ign`.
     # Deliberately allowed even while in queue — see SESSION_HANDOFF
     # 2026-08-15 for the full reasoning trail.
     @app_commands.command(name="ign-change",
-                          description="Change your in-game name (2 per week for players, unlimited for admins)")
+                          description=f"Change your in-game name ({config.IGN_CHANGE_LIMIT} per week for players, unlimited for admins)")
     @app_commands.describe(
         new_ign="Your new in-game name exactly as it appears in CODM",
         user="[Admin only] The player whose IGN to change — omit to change your own",
@@ -694,14 +695,18 @@ class Admin(commands.Cog):
             await interaction.response.send_message(f"**{old_ign}** is already the current IGN.", ephemeral=True)
             return
 
-        # Rate limit: 2 per rolling 7-day window, non-admins only,
-        # only when changing their own IGN (not when admin targets them)
+        # Rate limit: config.IGN_CHANGE_LIMIT per rolling 7-day window,
+        # non-admins only, only when changing their own IGN (not when an
+        # admin targets them)
         if not caller_is_admin:
+            limit = config.IGN_CHANGE_LIMIT
             week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             recent_count = await adb.count_recent_ign_changes(player["id"], week_ago)
-            if recent_count >= 2:
+            if recent_count >= limit:
+                # Same wording players see today ("twice") for the default 2.
+                times = {1: "once", 2: "twice"}.get(limit, f"{limit} times")
                 await interaction.response.send_message(
-                    "You've already changed your IGN twice this week — try again in a few days. "
+                    f"You've already changed your IGN {times} this week — try again in a few days. "
                     "If this is urgent, ask an admin.",
                     ephemeral=True,
                 )

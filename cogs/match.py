@@ -820,7 +820,8 @@ class Match(commands.Cog):
             try:
                 cap = f" ({used}/{config.HOST_REPLACE_LIMIT})" if not caller_is_admin else ""
                 await text_channel.send(
-                    f"🔄 **{old['ign']}** replaced by **{new['ign']}** by {interaction.user.display_name}{cap}. "
+                    f"🔄 **{old['ign']}** ({old_player.mention}) replaced by **{new['ign']}** ({new_player.mention}) "
+                    f"by {interaction.user.display_name}{cap}. "
                     f"Discuss operator skills with your team."
                 )
             except discord.HTTPException:

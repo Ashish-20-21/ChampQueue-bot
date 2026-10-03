@@ -1131,6 +1131,22 @@ Database.log_ign_change = _log_ign_change
 Database.count_recent_ign_changes = _count_recent_ign_changes
 
 
+# ── /admin-look-up (2026-10-03) ──────────────────────────────────
+def _find_players_by_ign(self: Database, ign: str, limit: int = 6) -> list[dict]:
+    """Case-insensitive EXACT match on players.ign. IGNs are not unique in the
+    schema, so this can return several rows (callers show them all). Backslash,
+    `%` and `_` are escaped so a name like 'Pro_Player' is matched literally
+    and not as a LIKE wildcard."""
+    escaped = ign.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    res = (self.client.table("players")
+           .select("id, discord_id, ign, cod_uid, status")
+           .ilike("ign", escaped).limit(limit).execute())
+    return res.data or []
+
+
+Database.find_players_by_ign = _find_players_by_ign
+
+
 # ── /admin-enter-result (2026-08-15) ─────────────────────────────
 def _insert_match_round_results_batch(self: Database, rows: list[dict]) -> list[dict]:
     """Bulk-insert match_round_results rows. Used by /admin-enter-result

@@ -735,6 +735,78 @@ class Admin(commands.Cog):
                 f"-# Run `/player-stats` to confirm.",
             )
 
+    # ── /admin-look-up (2026-10-03) ──────────────────────────────
+    # Staff lookup in both directions. One dropdown (search_by) decides which
+    # field is used, same single-choice pattern as /admin-dispatch: Discord
+    # shows both optional fields, only the selected one is read. One DB read
+    # per lookup, no Discord API call. Replies are ephemeral and never ping.
+    @app_commands.command(name="admin-look-up",
+                          description="[Staff] Find a player's IGN from their Discord user, or their Discord user from an IGN")
+    @app_commands.describe(
+        search_by="What you are searching with",
+        user="Discord user — used when searching by username",
+        ign="In-game name (not case-sensitive) — used when searching by IGN",
+    )
+    @app_commands.choices(search_by=[
+        app_commands.Choice(name="Username → IGN", value="username"),
+        app_commands.Choice(name="IGN → Username", value="ign"),
+    ])
+    @mod_or_admin_only()
+    async def look_up(self, interaction: discord.Interaction, search_by: app_commands.Choice[str],
+                      user: discord.Member | None = None, ign: str | None = None):
+        await interaction.response.defer(ephemeral=True)  # ack first, DB work after
+        no_ping = discord.AllowedMentions.none()
+
+        if search_by.value == "username":
+            if user is None:
+                await interaction.followup.send("Pick a Discord user in the `user` field.", ephemeral=True)
+                return
+            try:
+                player = await with_retry(adb.get_player_by_discord_id, user.id)  # idempotent read
+            except Exception:
+                await self._look_up_failed(interaction)
+                return
+            if not player:
+                await interaction.followup.send(f"{user.mention} isn't registered.",
+                                                ephemeral=True, allowed_mentions=no_ping)
+                return
+            await interaction.followup.send(
+                f"{user.mention} → IGN **{player['ign']}** · UID `{player['cod_uid']}` · status `{player['status']}`",
+                ephemeral=True, allowed_mentions=no_ping,
+            )
+            return
+
+        name = (ign or "").strip()
+        if not name:
+            await interaction.followup.send("Type an IGN in the `ign` field.", ephemeral=True)
+            return
+        try:
+            found = await with_retry(adb.find_players_by_ign, name)  # idempotent read
+        except Exception:
+            await self._look_up_failed(interaction)
+            return
+        if not found:
+            await interaction.followup.send(f"No registered player with the IGN **{name}**.", ephemeral=True)
+            return
+        lines = [
+            f"**{p['ign']}** → <@{p['discord_id']}> (`{p['discord_id']}`) · UID `{p['cod_uid']}` · status `{p['status']}`"
+            for p in found[:5]
+        ]
+        if len(found) > 5:
+            lines.append("-# More than 5 players match this IGN — showing the first 5.")
+        elif len(found) > 1:
+            lines.append("-# More than one player has this IGN.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=no_ping)
+
+    async def _look_up_failed(self, interaction: discord.Interaction):
+        """DB still failing after with_retry: log it and answer, so the deferred
+        reply never hangs on 'thinking...' / 'application did not respond'."""
+        logger.exception("admin-look-up: DB read failed")
+        await interaction.followup.send(
+            "Couldn't look that up right now (temporary connection issue) — try again in a moment.",
+            ephemeral=True,
+        )
+
     # ── /admin-enter-result (2026-08-15, Approach A: multi-step) ─
     @app_commands.command(name="admin-enter-result",
                           description="[Admin] Manually enter match result data (bypasses OCR)")
@@ -1278,6 +1350,7 @@ class Admin(commands.Cog):
     @adjust_mmr.error
     @adjust_sp.error
     @ign_change.error
+    @look_up.error
     @scrap_match.error
     @reset_match.error
     @match_card.error

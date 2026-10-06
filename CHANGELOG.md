@@ -14,6 +14,7 @@ What changed in Champion's Queue, newest first. The project doesn't cut tagged r
 - **Crown picker:** when the crown is hidden, missing, doubled or on a lower-Impact player, admins and moderators pick the crown position (top Impact is highlighted as a hint, never auto-applied). Runs before the IGN confirmation when both are needed.
 - `/admin-correct-round`: the `is_mvp` option is now `is_crown`; MVP follows position 1. Manual entry checks exactly one crown per team.
 - Approve card and `/admin-match-card`: older matches show a plain `+5` and no Impact line.
+- **Low-resolution rule:** a screenshot whose longer side is under `CROWN_MIN_IMAGE_SIDE` (default 1000 px) always goes to the admin crown picker, because the crown (especially in an Impact tie) can't be trusted on a tiny image. Lower limit only: iPad and any large image are never affected. `0` switches it off. The image size is stored in the raw extraction as `image_size`.
 
 ---
 

@@ -512,3 +512,10 @@ def _parse_hhmm(raw: str, default: tuple[int, int] = (5, 59)) -> tuple[int, int]
 
 
 MAINTENANCE_NOTICE_HHMM = _parse_hhmm(MAINTENANCE_NOTICE_TIME_RAW)
+
+# Impact-crown safety rule (2026-10): a screenshot whose LONGER side is below
+# this many pixels is too small to trust the crown icon (a tie on Impact can
+# then be read wrong with no way for the bot to notice), so an admin confirms
+# the crown. Lower limit ONLY — big images (iPad, any resolution) are never
+# affected. Set 0 to switch the rule off.
+CROWN_MIN_IMAGE_SIDE = int(os.getenv("CROWN_MIN_IMAGE_SIDE", "1000"))

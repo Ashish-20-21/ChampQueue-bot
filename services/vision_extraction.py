@@ -278,6 +278,50 @@ def get_provider() -> VisionProvider:
     return factory()
 
 
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) of a PNG / JPEG / WebP straight from the file header —
+    no image library needed. None when the format isn't recognised or the
+    header is damaged; callers must treat None as "unknown", never as small."""
+    import struct
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", data[16:24])
+        if data[:2] == b"\xff\xd8":                       # JPEG: walk segments to the SOF marker
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                    return w, h
+                i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+            return None
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            kind = data[12:16]
+            if kind == b"VP8X":
+                return (1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little"))
+            if kind == b"VP8 ":
+                return (struct.unpack("<H", data[26:28])[0] & 0x3FFF, struct.unpack("<H", data[28:30])[0] & 0x3FFF)
+            if kind == b"VP8L":
+                b = data[21:25]
+                return (1 + (((b[1] & 0x3F) << 8) | b[0]), 1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6)))
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
 def extract_scoreboard(image_bytes: bytes, media_type: str = "image/png") -> dict[str, Any]:
     provider = get_provider()
-    return provider.extract(image_bytes, media_type)
+    result = provider.extract(image_bytes, media_type)
+    # Stored with the raw extraction (audit trail) and read by the crown check:
+    # a very small screenshot is never trusted to show the crown (see
+    # cogs/match.py _crown_problems). Recorded only — no behaviour here.
+    size = image_size(image_bytes)
+    if size and isinstance(result, dict):
+        result["image_size"] = [size[0], size[1]]
+    return result

@@ -150,9 +150,22 @@ def _crown_problems(extraction: dict, trusted_teams=()) -> dict[str, str]:
     their pick is final and skips the Impact cross-check."""
     problems: dict[str, str] = {}
     players = extraction.get("players") or []
+    size = extraction.get("image_size")
+    small_side = None
+    if config.CROWN_MIN_IMAGE_SIDE and isinstance(size, (list, tuple)) and len(size) == 2:
+        try:
+            long_side = max(int(size[0]), int(size[1]))      # long side: orientation/aspect-ratio proof
+            if long_side < config.CROWN_MIN_IMAGE_SIDE:
+                small_side = long_side
+        except (TypeError, ValueError):
+            small_side = None
     for team in ("A", "B"):
         rows = [r for r in players if r.get("team") == team]
         if not rows:
+            continue
+        if small_side is not None and team not in trusted_teams:
+            problems[team] = (f"Team {team}: low-resolution screenshot (longest side {small_side}px, "
+                              f"minimum {config.CROWN_MIN_IMAGE_SIDE}px) — an admin must confirm the Impact crown")
             continue
         crowned = [r for r in rows if r.get("has_crown") is True]
         if len(crowned) != 1:

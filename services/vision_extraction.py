@@ -38,16 +38,21 @@ no commentary, matching exactly this schema:
           team's list). This is NOT their overall placement across all 10 players —
           each team has its own 1-5 ranking. Never derive this from score/kills
           yourself; read the number the game already shows.
-      "has_crown": true or false — true for exactly one player per team: the player
-          whose row shows the small CROWN icon sitting on/above their IMPACT number
-          (the Impact column, far right of the row). The crown marks the team's top
-          Impact player and can be on ANY row 1-5, not just row 1. Exactly one true
-          per team, never more, never fewer if a crown is visible.
+      "has_crown": true or false — true ONLY for a player whose row you can actually
+          SEE the small CROWN icon on/above their IMPACT number (the Impact column,
+          far right of the row). The crown marks the team's top Impact player and can
+          be on ANY row 1-5, not just row 1. At most one true per team.
+          It is NORMAL and CORRECT for a team to have NO crown in your answer: when the
+          icon is hidden (covered by a loading bar, notification or overlay, blurred
+          or cut off), set has_crown to false for EVERY row of that team. Zero crowns
+          for a team is a valid answer and is handled downstream by a human; a guessed
+          crown would pay +5 MMR to the wrong player. NEVER choose a crown because one
+          "should" exist, and never infer it from the Impact numbers (two players can
+          show the same Impact and only one has the crown), from the MVP tag, or from
+          the row position.
           IGNORE the yellow "MVP" tag/flag next to a player's name — that is a
           different marker, it is NOT the crown, and it must never make has_crown
-          true. Do NOT pick the crown player yourself by comparing Impact numbers:
-          two players can show the same Impact value and only one of them has the
-          crown. Report the crown only where you actually see the icon.
+          true. Report the crown only where you actually see the icon.
       "kills": integer,
       "deaths": integer,
       "assists": integer or null if not shown,
@@ -76,8 +81,9 @@ that field, not a value copied from a neighboring column.
 "position" and "has_crown" are REQUIRED for every player — they are read directly off
 the scoreboard (a numbered rank badge and a crown icon by the Impact number), not
 calculated. "position" must still be returned even if you are unsure; "has_crown" must
-be true or false for every player (false when no crown icon is on that row). Both are
-load-bearing for match results.
+be true or false for every player (false when no crown icon is visible on that row —
+this includes every row of a team whose crown is hidden). Both are load-bearing for
+match results.
 
 If a field is not legible or not present in the image, use null for that field —
 never guess or fabricate a number, and never substitute a different column's value.

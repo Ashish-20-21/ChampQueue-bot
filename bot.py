@@ -2,6 +2,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import signal
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
@@ -42,6 +43,7 @@ COGS = [
     "cogs.admin",
     "cogs.points",
     "cogs.digest",
+    "cogs.maintenance",
 ]
 
 
@@ -105,6 +107,13 @@ class ChampionsQueueBot(commands.Bot):
                 log.warning(f"Bot is in unauthorized guild '{guild.name}' ({guild.id}) — leaving.")
                 await guild.leave()
 
+    async def close(self):
+        # Runs on SIGTERM (panel Stop/Restart) and on a normal exit. Only a
+        # log line: it makes "was that restart clean?" answerable from bot.log.
+        if not self.is_closed():
+            log.info("Shutting down cleanly (close() called).")
+        await super().close()
+
     async def on_guild_join(self, guild: discord.Guild):
         if guild.id != config.GUILD_ID:
             log.warning(f"Added to unauthorized guild '{guild.name}' ({guild.id}) — leaving immediately.")
@@ -135,6 +144,15 @@ async def main():
     loop.set_default_executor(ThreadPoolExecutor(max_workers=50, thread_name_prefix="db-io"))
 
     bot = ChampionsQueueBot()
+
+    # Katabump's Stop/Restart sends SIGTERM. Without a handler Python dies on
+    # the spot; with it the bot closes its gateway connection properly.
+    # add_signal_handler is unsupported on Windows (local test bot) -> skip.
+    try:
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(bot.close()))
+    except (NotImplementedError, RuntimeError):
+        pass
+
     async with bot:
         await bot.start(config.DISCORD_BOT_TOKEN)
 

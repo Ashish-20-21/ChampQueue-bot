@@ -21,3 +21,5 @@ logs/
 # Supabase log puller: token file (never commit). Saved logs live in logs/ (already ignored).
 .supabase_logs.env
 journal
+# Runtime marker for the nightly maintenance notice
+data/

@@ -481,3 +481,34 @@ MODERATOR_MMR_ADJUST_LIMIT = 50
 # Points leaderboard display
 POINTS_LEADERBOARD_PAGE_SIZE = 50
 POINTS_LEADERBOARD_COOLDOWN_SECONDS = 60  # per-user reload rate limit
+
+# --- Nightly maintenance restart notice (2026-10) ---
+# See cogs/maintenance.py and switches.NIGHTLY_RESTART_NOTICES. Unset channel
+# = feature off (same fail-open pattern as the other channels).
+MAINTENANCE_CHANNEL_ID = int(os.getenv("MAINTENANCE_CHANNEL_ID")) if os.getenv("MAINTENANCE_CHANNEL_ID") else None
+# When the "nap" notice goes out, HH:MM in IST. The Katabump restart should
+# fire about a minute later. Default 05:59 (restart at 06:00 IST = 00:30 UTC).
+# Handy for a trial: set it a few minutes ahead of "now".
+MAINTENANCE_NOTICE_TIME_RAW = os.getenv("MAINTENANCE_NOTICE_TIME", "05:59")
+# Marker file left by the notice so the next boot knows the restart was planned.
+MAINTENANCE_MARKER_PATH = os.getenv("MAINTENANCE_MARKER_PATH", "data/planned_restart.json")
+
+
+def _parse_hhmm(raw: str, default: tuple[int, int] = (5, 59)) -> tuple[int, int]:
+    """'05:59' -> (5, 59). Anything malformed falls back to the default
+    (logged), because a typo here must not stop the bot from booting."""
+    try:
+        hh, mm = raw.strip().split(":")
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except (ValueError, AttributeError):
+        pass
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "MAINTENANCE_NOTICE_TIME=%r is not HH:MM — using %02d:%02d.", raw, *default
+    )
+    return default
+
+
+MAINTENANCE_NOTICE_HHMM = _parse_hhmm(MAINTENANCE_NOTICE_TIME_RAW)

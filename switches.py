@@ -64,3 +64,11 @@ if not RESULT_TEXT_TRIGGER and not RESULT_SLASH_COMMAND:
 # Default ON. Set INTERACTION_TIMING=false and restart to turn it off (nothing
 # is patched then). Read at startup.
 INTERACTION_TIMING = os.getenv("INTERACTION_TIMING", "true").strip().lower() == "true"
+
+# Nightly maintenance-restart notice (2026-10). Only controls the BOT's
+# messages (the "nap" notice, the edit back to "refreshed", the skipped-
+# restart check, the #botlog boot line). The restart itself is a Katabump
+# schedule, so to stop the restarts switch that schedule off in the panel.
+# Default OFF: deploying the code changes nothing until this is "true" and
+# MAINTENANCE_CHANNEL_ID is set. Read at startup, so a change needs a restart.
+NIGHTLY_RESTART_NOTICES = os.getenv("NIGHTLY_RESTART_NOTICES", "false").strip().lower() == "true"

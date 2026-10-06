@@ -102,9 +102,12 @@ def test_legacy_is_mvp_only_extraction_is_refused_not_guessed():
 def test_zero_or_two_crowns_on_a_team_goes_to_review(bad_team_flags):
     rows = [(t, p, i, k, d, a, s, imp, (p in bad_team_flags) if t == "A" else c)
             for (t, p, i, k, d, a, s, imp, c) in SUMMIT]
-    rd, reasons, *_ = _run(rows)
+    rd, reasons, _, non_ign = _run(rows)
     assert not rd["clean"]
-    assert match._crown_count_reason("A") in reasons
+    # screenshot-level crown problem -> admin crown picker, not "bad data"
+    assert any(r.startswith("Team A:") and "Impact crowns read on the screenshot" in r for r in reasons)
+    assert non_ign is False
+    assert "A" in match._crown_problems(_extraction(rows))
 
 
 def test_crown_on_a_player_with_lower_impact_than_a_teammate_is_flagged():
@@ -112,7 +115,7 @@ def test_crown_on_a_player_with_lower_impact_than_a_teammate_is_flagged():
     rows = [(t, p, i, k, d, a, s, imp, (p == 5) if t == "A" else c)
             for (t, p, i, k, d, a, s, imp, c) in SUMMIT]
     rd, reasons, _, non_ign = _run(rows)
-    assert not rd["clean"] and non_ign
+    assert not rd["clean"] and non_ign is False
     assert any("crown read on vulture_002as" in r and "Cyfur." in r for r in reasons)
 
 
@@ -148,5 +151,82 @@ def test_crown_below_readable_teammate_is_flagged_even_if_other_impacts_unreadab
          ("B", 3, "xJutal", 17, 37, 6, 2197, 60, False), ("B", 4, "ICNMido", 14, 38, 8, 1903, None, False),
          ("B", 5, "worry", 16, 46, 0, 1646, None, False)]
     rd, reasons, _, non_ign = _run(rows + b)
-    assert not rd["clean"] and non_ign
+    assert not rd["clean"] and non_ign is False
     assert any("crown read on Beboh" in r and "EXGRaiden" in r for r in reasons)
+
+
+# ---------------------------------------------------------------- migration_041
+
+def test_result_rows_carry_all_three_flags():
+    rd, reasons, *_ = _run(SUMMIT)
+    by_ign = {r["player_id"]: r for r in rd["results"]}
+    roster = {r[2]: i + 1 for i, r in enumerate(SUMMIT)}
+    cyfur, cvx = by_ign[roster["Cyfur."]], by_ign[roster["CVX_Pride_"]]
+    assert (cyfur["is_crown"], cyfur["bonus_5"], cyfur["is_mvp"]) == (True, True, False)
+    assert (cvx["is_crown"], cvx["bonus_5"], cvx["is_mvp"]) == (False, False, True)   # MVP = row 1, stat only
+    assert all(r["bonus_5"] == r["is_crown"] for r in rd["results"])                   # the DB CHECK invariant
+
+
+def test_admin_crown_override_fixes_a_hidden_crown():
+    rows = [(t, p, i, k, d, a, s, imp, False if t == "A" else c)    # crown hidden on team A
+            for (t, p, i, k, d, a, s, imp, c) in SUMMIT]
+    rd, reasons, *_ = _run(rows)
+    assert not rd["clean"]
+    override = {"A": {"position": 2, "by": "123", "at": "x"}}
+    rd2, reasons2, *_ = match.Match._prepare_round(_roster(rows), "Summit", _extraction(rows), crown_override=override)
+    assert reasons2 == [] and rd2["clean"]
+    assert _deltas(rd2, "A") == [-3, 1, -6, -8, -9]
+
+
+def test_admin_pick_is_final_even_against_the_impact_hint():
+    # Admin sees the crown on row 5 (lower Impact than row 2) — their pick
+    # wins; the Impact cross-check is skipped for a trusted team.
+    override = {"A": {"position": 5, "by": "1", "at": "x"}}
+    rd, reasons, *_ = match.Match._prepare_round(_roster(SUMMIT), "Summit", _extraction(SUMMIT), crown_override=override)
+    assert reasons == []
+    assert _deltas(rd, "A") == [-3, -4, -6, -8, -4]
+
+
+def test_override_never_edits_the_raw_extraction():
+    ext = _extraction(SUMMIT)
+    before = [p["has_crown"] for p in ext["players"]]
+    match._apply_crown_override(ext, {"A": {"position": 4}})
+    assert [p["has_crown"] for p in ext["players"]] == before
+
+
+def test_crown_candidates_mark_top_impact():
+    cands = match._crown_candidates(_extraction(SUMMIT), "A")
+    assert [c["position"] for c in cands] == [1, 2, 3, 4, 5]
+    assert [c["position"] for c in cands if c["top"]] == [2]
+
+
+def test_old_match_card_shows_plain_plus5_and_no_impact_line():
+    # Stored rows from before migration_041: is_crown NULL, bonus_5 from is_mvp.
+    rd, *_ = _run(SUMMIT)
+    for r in rd["results"]:
+        r["bonus_5"] = r["position"] == 1
+        r["is_crown"] = None
+        r["mmr_delta"] = match.mmr_engine.calculate_mmr_change(r["position"], r["team"] == "B", r["position"] == 1)
+    ext = _extraction(SUMMIT)
+    for p in ext["players"]:
+        p["has_crown"] = None
+        p["bonus_5"] = p["position"] == 1
+    text = embeds.verification_card({"match_id": "CQ-1"}, [rd], ext, "Summit").fields[0].value
+    assert "👑" not in text and "Impact 👑" not in text
+    assert text.count("  +5") == 2
+    assert "SP (proposed): A -3  ·  B +5" in text     # the losing +5 holder (-3+5=+2) is still a loss
+
+
+def test_card_marks_an_admin_set_crown():
+    override = {"A": {"position": 2, "by": "1", "at": "x"}}
+    rd, *_ = match.Match._prepare_round(_roster(SUMMIT), "Summit", _extraction(SUMMIT), crown_override=override)
+    text = embeds.verification_card({"match_id": "CQ-1", "crown_override": override}, [rd],
+                                    match._apply_crown_override(_extraction(SUMMIT), override), "Summit").fields[0].value
+    assert "L — pos 2 Cyfur. (set by admin)" in text
+
+
+def test_crown_pick_embed_renders():
+    rows = [(t, p, i, k, d, a, s, imp, False if t == "A" else c) for (t, p, i, k, d, a, s, imp, c) in SUMMIT]
+    ext = _extraction(rows)
+    e = embeds.crown_pick_embed({"match_id": "CQ-9"}, ext, match._crown_problems(ext), "https://x/y.png")
+    assert "Team A" in e.fields[0].name and "⭐" in e.fields[0].value

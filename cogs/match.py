@@ -19,7 +19,7 @@ import logging
 import switches
 from database.db import adb, with_retry
 from services import localization, mmr_engine, reputation, validation, vision_extraction
-from utils.embeds import ign_confirmation_embed, verification_card
+from utils.embeds import crown_pick_embed, ign_confirmation_embed, verification_card
 from utils.permissions import admin_only, is_admin, is_admin_user, is_mod_or_admin
 from utils import incident_log
 
@@ -99,18 +99,104 @@ _HILL_TIME_RE = re.compile(r"^\d+(\.\d+)?$")
 _SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
 
 
-# Impact-crown bonus (2026-10). The +5 MMR bonus goes to the player holding
-# the game's CROWN icon on the Impact column (top Impact player of each
-# team, any row 1-5) — NOT to the yellow "MVP" tag, which is always row 1
-# and only reflects K/D. The DB column / dict key is still called
-# "is_mvp" on purpose: every SQL function strips the bonus with
-# `mmr_delta - (5 if is_mvp)` to tell a win from a loss, so the column
-# must keep meaning "this row received the +5". Only the *source* of the
-# flag changed (crown instead of MVP tag). The reason text lives in one
-# helper so the validation site and the IGN-confirm "expected reasons"
-# set can never drift apart.
+# Impact-crown bonus (2026-10, migration_041). The +5 MMR bonus goes to the
+# player holding the game's CROWN icon on the Impact column (top Impact
+# player of each team, any row 1-5) — NOT to the yellow "MVP" tag.
+# match_round_results now carries three separate flags:
+#   is_crown  — the crown holder, read from the screenshot (or set by an
+#               admin). NULL on matches from before migration_041: never
+#               recorded, so never guessed.
+#   bonus_5   — "this row received the +5". The ONLY flag the win/loss
+#               maths reads (mmr_delta - 5 if bonus_5). Equals is_crown
+#               for new rows (a DB CHECK enforces it); backfilled from
+#               is_mvp for old rows, which is who got the +5 back then.
+#   is_mvp    — stat only (career/HoF/weekly MVP counts). The game always
+#               puts the MVP tag on row 1, so it is set as position == 1,
+#               never read by the vision model.
 def _crown_count_reason(team: str) -> str:
+    """Results-based count check — fires when the crown holder's row is
+    missing from the RESOLVED results (e.g. their IGN didn't resolve).
+    Treated as an expected consequence in the IGN-confirm flow. A crown
+    problem on the screenshot itself uses _crown_problems() below and a
+    different text, so the IGN flow can never mistake one for the other."""
     return f"Team {team} must have exactly one Impact crown"
+
+
+def _impact_number(raw) -> float | None:
+    text = str(raw if raw is not None else "").strip()
+    return float(text) if _HILL_TIME_RE.fullmatch(text) else None
+
+
+def _apply_crown_override(extraction: dict, override: dict | None) -> dict:
+    """Return a COPY of the extraction with an admin's crown pick applied
+    (override = {"A": {"position": 2, "by": "<discord id>", "at": "..."}}).
+    The stored raw OCR is never modified — it stays the audit record."""
+    if not override:
+        return extraction
+    players = []
+    for row in extraction.get("players") or []:
+        row = dict(row)
+        pick = override.get(row.get("team"))
+        if isinstance(pick, dict) and pick.get("position") is not None:
+            row["has_crown"] = str(row.get("position")).strip() == str(pick["position"])
+        players.append(row)
+    return {**extraction, "players": players}
+
+
+def _crown_problems(extraction: dict, trusted_teams=()) -> dict[str, str]:
+    """Crown problems on the screenshot itself, per team -> reason text.
+    Read from the raw extraction rows, so it works whether or not every
+    IGN resolved. trusted_teams: teams whose crown an admin set by hand —
+    their pick is final and skips the Impact cross-check."""
+    problems: dict[str, str] = {}
+    players = extraction.get("players") or []
+    for team in ("A", "B"):
+        rows = [r for r in players if r.get("team") == team]
+        if not rows:
+            continue
+        crowned = [r for r in rows if r.get("has_crown") is True]
+        if len(crowned) != 1:
+            problems[team] = (f"Team {team}: {len(crowned)} Impact crowns read on the screenshot "
+                              f"(need exactly 1) — crown hidden or unclear")
+            continue
+        if team in trusted_teams:
+            continue
+        # Safety net: the crown sits on the team's top Impact player, so
+        # the crown holder's Impact must never be LOWER than a readable
+        # teammate's. Equal is fine (ties exist; the crown breaks them).
+        crown_row = crowned[0]
+        crown_val = _impact_number(crown_row.get("impact"))
+        readable = [(r, v) for r in rows if (v := _impact_number(r.get("impact"))) is not None]
+        if crown_val is None or not readable:
+            continue
+        top_row, top_val = max(readable, key=lambda rv: rv[1])
+        if top_val > crown_val:
+            problems[team] = (f"Team {team} crown read on {crown_row.get('ign')} (Impact {crown_val:g}) but "
+                              f"{top_row.get('ign')} has higher Impact ({top_val:g}) — check which row has the crown")
+    return problems
+
+
+def _crown_candidates(extraction: dict, team: str) -> list[dict]:
+    """Rows of one team for the admin crown picker, sorted by position,
+    each marked top=True when its Impact equals the team's highest
+    readable Impact (the likely crown holder — shown, never auto-picked)."""
+    rows = [r for r in extraction.get("players") or [] if r.get("team") == team]
+    vals = [v for r in rows if (v := _impact_number(r.get("impact"))) is not None]
+    top = max(vals) if vals else None
+
+    def _pos(r):
+        try:
+            return int(r.get("position"))
+        except (TypeError, ValueError):
+            return 9
+    out = []
+    for r in sorted(rows, key=_pos):
+        if _pos(r) == 9:
+            continue
+        v = _impact_number(r.get("impact"))
+        out.append({"position": _pos(r), "ign": str(r.get("ign") or "?"), "impact": v,
+                    "top": top is not None and v == top})
+    return out
 _DISCORD_MESSAGE_LIMIT = 2000
 _DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
 
@@ -388,6 +474,129 @@ class IGNConfirmView(discord.ui.View):
         else:
             self.add_item(IGNMapButton(match_db_id))
         self.add_item(IGNRejectButton(match_db_id))
+
+
+class CrownPickSelect(discord.ui.DynamicItem[discord.ui.Select],
+                      template=r"crown_pick:(?P<match_db_id>[0-9]+):(?P<team>[AB])"):
+    """Admin/moderator picks which position holds the Impact crown for one
+    team, when the screenshot didn't show it clearly (hidden by a loading
+    bar or notification, blurred, two crowns read, or the crown read on a
+    lower-Impact player). Picking by POSITION needs no IGN at all — the
+    rank badge is read separately. The pick is stored on
+    matches.crown_override and never edits the raw OCR record.
+    DynamicItem so it survives bot restarts, same as the IGN buttons."""
+
+    def __init__(self, match_db_id: int, team: str, options: list[discord.SelectOption] | None = None):
+        if not options:
+            # Rebuilt after a restart: Discord sends the chosen value, the
+            # option list itself is only needed when the message is first sent.
+            options = [discord.SelectOption(label=f"Position {i}", value=str(i)) for i in range(1, 6)]
+        super().__init__(
+            discord.ui.Select(
+                custom_id=f"crown_pick:{match_db_id}:{team}",
+                placeholder=f"Team {team}: which position has the Impact crown?",
+                min_values=1, max_values=1, options=options,
+            )
+        )
+        self.match_db_id = match_db_id
+        self.team = team
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Select, match: "re.Match[str]"):
+        return cls(int(match["match_db_id"]), match["team"])
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can set the Impact crown.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cog = interaction.client.get_cog("Match")
+        try:
+            position = int(self.item.values[0])
+        except (IndexError, ValueError):
+            await interaction.followup.send("No position selected.", ephemeral=True)
+            return
+        await cog._set_crown_override(interaction, self.match_db_id, self.team, position)
+
+
+class CrownRejectButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"crown_reject:(?P<match_db_id>[0-9]+)"):
+    """Nobody can tell where the crown is (e.g. hidden on every screenshot
+    available) — send the match to the regular full manual review."""
+
+    def __init__(self, match_db_id: int):
+        super().__init__(
+            discord.ui.Button(label="❌ Can't tell — send to review", style=discord.ButtonStyle.secondary,
+                              custom_id=f"crown_reject:{match_db_id}")
+        )
+        self.match_db_id = match_db_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(int(match["match_db_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_mod_or_admin(interaction):
+            await interaction.response.send_message("Only admins or moderators can review matches.", ephemeral=True)
+            return
+        cog = interaction.client.get_cog("Match")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        match_row = await adb.get_match(self.match_db_id)
+        if not match_row or match_row["status"] != "awaiting_review":
+            await interaction.followup.send("This match is no longer awaiting review.", ephemeral=True)
+            return
+        issue = await adb.create_match_issue(
+            match_row["id"], match_row.get("room_code_shared_by"),
+            "vision_failure", "Admin could not confirm the Impact crown — sent to full manual review.",
+        )
+        intake_channel = cog.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID) if config.ISSUE_INTAKE_CHANNEL_ID else None
+        if intake_channel:
+            try:
+                await intake_channel.send(
+                    embed=discord.Embed(
+                        title=f"Match {match_row['match_id']} — needs review",
+                        description="Impact crown could not be confirmed. Full manual review required.",
+                        color=discord.Color.orange(),
+                    ).add_field(name="Reason", value="vision_failure")
+                     .add_field(name="Issue ID", value=str(issue["id"])),
+                    view=IssueResolveView(cog, issue["id"]),
+                )
+            except discord.HTTPException:
+                pass
+        await _mark_admin_message(interaction, f"❌ {interaction.user.mention} couldn't confirm the crown — sent to full review", discord.Color.red())
+        await interaction.followup.send("Sent to full manual review.", ephemeral=True)
+
+
+class CrownPickView(discord.ui.View):
+    """Container for the per-team crown selects + the reject button."""
+
+    def __init__(self, match_db_id: int, team_options: dict[str, list[discord.SelectOption]]):
+        super().__init__(timeout=None)
+        for team in ("A", "B"):
+            if team in team_options:
+                self.add_item(CrownPickSelect(match_db_id, team, team_options[team]))
+        self.add_item(CrownRejectButton(match_db_id))
+
+
+async def _mark_admin_message(interaction: discord.Interaction, status: str, color: discord.Color) -> None:
+    """Stamp the admin-facing embed with the outcome and remove its controls."""
+    try:
+        embed = interaction.message.embeds[0]
+        embed.color = color
+        embed.add_field(name="Status", value=status, inline=False)
+        await interaction.message.edit(embed=embed, view=None)
+    except (discord.HTTPException, IndexError, AttributeError):
+        pass
+
+
+class _SilentReply:
+    """Stand-in for the uploader 'reply' when _route_to_ign_confirmation is
+    called from the crown-pick completion: the players were already told
+    the result is being checked, so nothing is sent twice."""
+    in_match_channel = True
+
+    async def send(self, *args, **kwargs):
+        return None
 
 
 class HostApprovalButton(discord.ui.DynamicItem[discord.ui.Button], template=r"host_approve:(?P<match_id>[0-9]+)"):
@@ -1467,7 +1676,7 @@ class Match(commands.Cog):
         # has no such column — confirmed live via a 400 PGRST204 error when
         # this wasn't stripped first. Strip it only for the DB payload; the
         # embed still gets the full row with discord_id intact via round_data.
-        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "mmr_delta", "team")
+        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "is_crown", "bonus_5", "mmr_delta", "team")
         _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
         clean_rounds = [item for item in round_data if item["clean"]]
         if clean_rounds:
@@ -1542,55 +1751,23 @@ class Match(commands.Cog):
             # as leavers (offered the existing -9 AFK treatment); the
             # remainder are the genuine IGN-mismatch case this flow was
             # built for (offered a mapping to an OCR name).
-            resolved_ids = {r["player_id"] for r in round_data[0]["results"]}
-            unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
-            total_ocr_rows = len(ordered_extractions[0].get("players", []))
-            true_leaver_count = max(0, len(match_players) - total_ocr_rows)
-            # WHICH unmatched players are leavers, not just how many:
-            # an unmatched roster player counts as an IGN-mismatch
-            # candidate only if their own IGN is a plausible fuzzy
-            # neighbor of at least one OCR string that failed to
-            # resolve — i.e. _fuzzy_lookup's own cutoff, applied here
-            # just to rank/split rather than to accept a match outright.
-            # Anyone left over with no such neighbor has nothing on the
-            # scoreboard that could plausibly be them — a likely leaver.
-            ocr_fail_strings = [str(f.get("ocr_ign") or "").strip().lower() for f in ign_failures]
-            def _resembles_any_failure(mp: dict) -> bool:
-                candidate = mp["players"]["ign"].strip().lower()
-                return any(
-                    difflib.SequenceMatcher(None, candidate, ocr).ratio() >= 0.5
-                    for ocr in ocr_fail_strings if ocr
-                )
-            mismatch_candidates = [mp for mp in unmatched if _resembles_any_failure(mp)]
-            no_signal = [mp for mp in unmatched if mp not in mismatch_candidates]
-            if len(no_signal) == true_leaver_count:
-                # Clean case: resemblance signal exactly accounts for
-                # every unmatched slot — auto-split with confidence,
-                # leavers never shown as mapping candidates at all.
-                leavers = no_signal
-                ign_mismatch_unmatched = mismatch_candidates
-            else:
-                # Ambiguous case (2026-09, CQ-6867 follow-up): e.g. the
-                # OCR name genuinely belongs to NONE of the roster (an
-                # unregistered/wrong-lobby name), so resemblance finds
-                # zero matches even though a real IGN-mismatch case
-                # still exists among the unmatched players — a "no
-                # signal" count that overshoots true_leaver_count is
-                # not proof everyone in it is a leaver. Rather than
-                # silently guess (risk: wrongly AFK someone who played)
-                # or silently give up to full review (worse UX for a
-                # case an admin can resolve in five seconds by eye),
-                # surface EVERY unmatched player as a mapping candidate
-                # and let the admin pick who mamaa/etc actually is —
-                # whichever candidates they don't map are then treated
-                # as the leavers. See _complete_ign_confirmed for the
-                # "unmapped candidates become leavers" completion side
-                # of this same logic.
-                leavers = []
-                ign_mismatch_unmatched = unmatched
-            if (ign_failures and not has_non_ign_issue
-                    and len(ign_failures) <= len(ign_mismatch_unmatched)
-                    and 1 <= len(ign_mismatch_unmatched) <= 5):
+            ign_eligible, ign_mismatch_unmatched, leavers = self._ign_route_plan(
+                match_players, round_data[0], ordered_extractions[0], ign_failures, has_non_ign_issue)
+
+            # Impact crown hidden/unclear on the screenshot (loading bar,
+            # notification, blur, or the crown on a lower-Impact player):
+            # an admin picks the crown position first. Then, if IGNs are
+            # also unresolved, the normal IGN confirmation follows (it
+            # reads the stored pick). Anything else wrong with the data
+            # still goes to full review as before.
+            crown_problems = _crown_problems(ordered_extractions[0])
+            other_reasons = [r for r in review_reasons if r not in set(crown_problems.values())]
+            if crown_problems and not has_non_ign_issue and (ign_eligible or not other_reasons):
+                await self._route_to_crown_pick(
+                    reply, match, ordered_extractions[0], crown_problems, ordered_pairs[0][1].url)
+                return
+
+            if ign_eligible:
                 screenshot_url = ordered_pairs[0][1].url
                 await self._route_to_ign_confirmation(
                     reply, match, match_players, ign_failures, ign_mismatch_unmatched,
@@ -1959,6 +2136,184 @@ class Match(commands.Cog):
         else:
             await reply.send(self._friendly_review_message())
 
+    async def _route_to_crown_pick(
+        self,
+        reply,
+        match: dict,
+        extraction: dict,
+        problems: dict[str, str],
+        screenshot_url: str,
+    ) -> None:
+        """Impact crown hidden or unclear on the screenshot. Same shape as
+        _route_to_ign_confirmation: status -> awaiting_review (blocks a
+        re-upload), players get the "being checked" message, admins and
+        moderators get the screenshot plus one select per problem team.
+        Only the crown POSITION is asked for — no IGN needed. The top
+        Impact row is highlighted as a hint but is never applied by itself."""
+        await adb.update_match(match["id"], {"status": "awaiting_review"})
+
+        text_channel = (
+            self.bot.get_channel(int(match["text_channel_id"]))
+            if match.get("text_channel_id") and not getattr(reply, "in_match_channel", False) else None
+        )
+        if text_channel:
+            try:
+                await text_channel.send(_RESULT_BATTLING_TEXT)
+            except discord.HTTPException:
+                pass
+
+        intake_channel = (
+            self.bot.get_channel(config.ISSUE_INTAKE_CHANNEL_ID)
+            if config.ISSUE_INTAKE_CHANNEL_ID else None
+        )
+        if intake_channel:
+            team_options: dict[str, list[discord.SelectOption]] = {}
+            for team in problems:
+                opts = []
+                for c in _crown_candidates(extraction, team):
+                    impact_txt = f"Impact {c['impact']:g}" if c["impact"] is not None else "Impact unreadable"
+                    opts.append(discord.SelectOption(
+                        label=f"Position {c['position']} · {c['ign'][:60]}",
+                        value=str(c["position"]),
+                        description=impact_txt + (" · ⭐ top Impact" if c["top"] else ""),
+                    ))
+                if opts:
+                    team_options[team] = opts
+            admin_roles = " ".join(f"<@&{rid}>" for rid in sorted(config.ADMIN_ROLE_IDS | config.MODERATOR_ROLE_IDS)) if config.ADMIN_ROLE_IDS else ""
+            try:
+                await intake_channel.send(
+                    content=admin_roles or None,
+                    embed=crown_pick_embed(match, extraction, problems, screenshot_url),
+                    view=CrownPickView(match["id"], team_options),
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            except discord.HTTPException as exc:
+                logger.exception("Failed to send crown pick embed for match %s", match["match_id"])
+                await incident_log.post(
+                    self.bot,
+                    category="MATCH_CROWN_PICK_SEND_FAIL",
+                    summary=f"Crown pick embed failed to send for match {match['match_id']} — match is stuck in awaiting_review with no admin-visible embed",
+                    exc=exc,
+                    match=match,
+                )
+
+        if getattr(reply, "in_match_channel", False):
+            await reply.send(_RESULT_BATTLING_TEXT)
+        else:
+            await reply.send(self._friendly_review_message())
+
+    async def _set_crown_override(self, interaction: discord.Interaction, match_db_id: int,
+                                  team: str, position: int) -> None:
+        """Store an admin's crown pick for one team, then finish the match
+        once every team's crown is settled."""
+        match = await adb.get_match(match_db_id)
+        if not match or match["status"] != "awaiting_review":
+            await interaction.followup.send("This match is no longer awaiting review.", ephemeral=True)
+            return
+        screenshot = await with_retry(adb.get_match_screenshot, match["id"], 1)
+        if not screenshot or not screenshot.get("raw_extraction"):
+            await interaction.followup.send("Screenshot data not found — use manual review.", ephemeral=True)
+            return
+        extraction = screenshot["raw_extraction"]
+        valid_positions = {c["position"] for c in _crown_candidates(extraction, team)}
+        if position not in valid_positions:
+            await interaction.followup.send(
+                f"Position {position} isn't on Team {team}'s scoreboard for this match.", ephemeral=True)
+            return
+
+        override = dict(match.get("crown_override") or {})
+        override[team] = {"position": position, "by": str(interaction.user.id),
+                          "at": discord.utils.utcnow().isoformat()}
+        await with_retry(adb.update_match, match["id"], {"crown_override": override})
+        match["crown_override"] = override
+        logger.info("Crown override for match %s: team %s -> position %s by %s",
+                    match["match_id"], team, position, interaction.user.id)
+
+        remaining = _crown_problems(_apply_crown_override(extraction, override), trusted_teams=tuple(override))
+        if remaining:
+            await interaction.followup.send(
+                f"Team {team} crown set to position {position}. Still needed: "
+                + ", ".join(f"Team {t}" for t in remaining) + ".",
+                ephemeral=True,
+            )
+            return
+        await self._complete_after_crown(interaction, match, extraction, screenshot)
+
+    async def _complete_after_crown(self, interaction: discord.Interaction, match: dict,
+                                    extraction: dict, screenshot: dict) -> None:
+        """Every crown is settled. Re-run validation with the stored pick:
+        clean -> host approval (same tail as the IGN completion);
+        IGN-only leftovers -> the normal IGN confirmation (it reads the
+        stored pick too); anything else -> full manual review."""
+        match_players = await with_retry(adb.get_match_players, match["id"])
+        maps = match.get("map_pool") or []
+        if not maps:
+            await interaction.followup.send("Map pool missing — use manual review.", ephemeral=True)
+            return
+        override = match.get("crown_override")
+        round_item, reasons, ign_failures, has_non_ign = Match._prepare_round(
+            match_players, maps[0], extraction, crown_override=override)
+
+        if not reasons:
+            _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "is_crown", "bonus_5", "mmr_delta", "team")
+            _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
+            await with_retry(
+                adb.replace_match_round_data,
+                match["id"], round_item["round_number"],
+                [{k: v for k, v in row.items() if k in _ROUND_RESULT_FIELDS} for row in round_item["results"]],
+                [{k: v for k, v in row.items() if k in _PLAYER_STAT_FIELDS} for row in round_item["results"]],
+            )
+            await self._recompute_career_stats_bulk(match, match_players, stale_note="after admin crown pick")
+            for row in round_item["results"]:
+                if row.get("afk"):
+                    ign = next((mp["players"]["ign"] for mp in match_players if mp["player_id"] == row["player_id"]), "unknown player")
+                    await self._notify_afk_leaver(match, row, ign)
+
+            deadline = (discord.utils.utcnow() + timedelta(seconds=config.APPROVAL_TIMEOUT_SECONDS)).isoformat()
+            await with_retry(adb.update_match, match["id"], {"status": "pending_verification", "approval_deadline": deadline})
+            await _post_match_status(self.bot, match["match_id"], match.get("queue_key", ""), "result submitted (crown confirmed), awaiting host approval")
+            approval_channel = (
+                self.bot.get_channel(config.RESULT_APPROVAL_CHANNEL_ID)
+                if config.RESULT_APPROVAL_CHANNEL_ID else None
+            )
+            if approval_channel:
+                await approval_channel.send(
+                    embed=verification_card(match, [round_item], _apply_crown_override(extraction, override), maps[0]),
+                    view=HostApprovalView(self, match["id"]),
+                )
+            await _mark_admin_message(interaction, f"✅ Crown set by {interaction.user.mention} — sent to host approval", discord.Color.green())
+            text_channel = self.bot.get_channel(int(match["text_channel_id"])) if match.get("text_channel_id") else None
+            if text_channel:
+                try:
+                    await text_channel.send(
+                        "✅ Reinforcements arrived! Result has been confirmed and "
+                        "sent for host approval. Check the approval channel!"
+                    )
+                except discord.HTTPException:
+                    pass
+            await interaction.followup.send("Crown confirmed — verification card posted.", ephemeral=True)
+            return
+
+        eligible, unmatched, leavers = self._ign_route_plan(
+            match_players, round_item, extraction, ign_failures, has_non_ign)
+        if eligible:
+            await self._route_to_ign_confirmation(
+                _SilentReply(), match, match_players, ign_failures, unmatched,
+                screenshot.get("image_url") or "", leavers=leavers,
+            )
+            await _mark_admin_message(interaction, f"✅ Crown set by {interaction.user.mention} — IGN confirmation posted next", discord.Color.green())
+            await interaction.followup.send(
+                "Crown saved. Some names still need matching — an IGN confirmation was posted next.", ephemeral=True)
+            return
+
+        await self._route_to_review(match, None, "vision_failure",
+                                    "After admin crown pick, other issues remain: " + "; ".join(reasons))
+        await _mark_admin_message(interaction, f"⚠️ Crown set by {interaction.user.mention} — other issues, sent to full review", discord.Color.orange())
+        await interaction.followup.send(
+            "Crown saved, but other validation issues remain: " + "; ".join(reasons[:3]) + ". Sent to full manual review.",
+            ephemeral=True,
+        )
+
     async def _complete_ign_confirmed(
         self,
         interaction: discord.Interaction,
@@ -1993,7 +2348,7 @@ class Match(commands.Cog):
             return
 
         # Re-derive unresolved state to build force_map
-        _, _, ign_failures, has_non_ign = Match._prepare_round(match_players, maps[0], extraction)
+        _, _, ign_failures, has_non_ign = Match._prepare_round(match_players, maps[0], extraction, crown_override=match.get("crown_override"))
         if not ign_failures or has_non_ign:
             await interaction.followup.send(
                 "Match state changed — IGN confirmation no longer applicable. Use manual review.",
@@ -2002,7 +2357,7 @@ class Match(commands.Cog):
             return
 
         # Identify unmatched roster players
-        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction)
+        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction, crown_override=match.get("crown_override"))
         resolved_ids = {r["player_id"] for r in temp_round["results"]}
         unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
 
@@ -2063,7 +2418,8 @@ class Match(commands.Cog):
         # Re-run with force_map — this time IGN resolution is bypassed
         # for the confirmed entries, but all other validation still runs.
         round_data_dict, reasons, _, _ = Match._prepare_round(
-            match_players, maps[0], extraction, force_map=force_map
+            match_players, maps[0], extraction, force_map=force_map,
+            crown_override=match.get("crown_override"),
         )
         # If leavers were identified alongside the IGN mismatch (see
         # split above), _prepare_round's OWN built-in AFK synthesis
@@ -2098,6 +2454,7 @@ class Match(commands.Cog):
                     break
                 results.append({
                     "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
+                    "is_crown": False, "bonus_5": False,
                     "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, False, False),
                     "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
                     "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
@@ -2123,7 +2480,7 @@ class Match(commands.Cog):
             return
 
         round_data = [round_data_dict]
-        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "mmr_delta", "team")
+        _ROUND_RESULT_FIELDS = ("player_id", "position", "is_mvp", "is_crown", "bonus_5", "mmr_delta", "team")
         _PLAYER_STAT_FIELDS = ("player_id", "kills", "deaths", "assists", "damage", "hill_time", "impact", "score")
 
         # Write round data (same as _submit_body's clean-round write path)
@@ -2160,7 +2517,7 @@ class Match(commands.Cog):
         )
         if approval_channel:
             await approval_channel.send(
-                embed=verification_card(match, round_data, extraction, maps[0]),
+                embed=verification_card(match, round_data, _apply_crown_override(extraction, match.get("crown_override")), maps[0]),
                 view=HostApprovalView(self, match["id"]),
             )
 
@@ -2218,7 +2575,7 @@ class Match(commands.Cog):
             await interaction.followup.send("Map pool missing — use manual review.", ephemeral=True)
             return
 
-        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction)
+        temp_round, _, _, _ = Match._prepare_round(match_players, maps[0], extraction, crown_override=match.get("crown_override"))
         resolved_ids = {r["player_id"] for r in temp_round["results"]}
         unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
 
@@ -2238,8 +2595,67 @@ class Match(commands.Cog):
         await self._complete_ign_confirmed(interaction, match_db_id, confirmed_pids)
 
     @staticmethod
+    def _ign_route_plan(match_players: list[dict], round_item: dict, extraction: dict,
+                        ign_failures: list[dict], has_non_ign_issue: bool) -> tuple[bool, list[dict], list[dict]]:
+        """Moved verbatim out of _submit_body (2026-10) so the crown-pick
+        completion can reuse it. Returns (eligible_for_ign_confirmation,
+        ign_mismatch_unmatched, leavers) — see the long comment at the
+        call site in _submit_body for the leaver/mismatch split."""
+        resolved_ids = {r["player_id"] for r in round_item["results"]}
+        unmatched = [mp for mp in match_players if mp["player_id"] not in resolved_ids]
+        total_ocr_rows = len(extraction.get("players", []))
+        true_leaver_count = max(0, len(match_players) - total_ocr_rows)
+        # WHICH unmatched players are leavers, not just how many:
+        # an unmatched roster player counts as an IGN-mismatch
+        # candidate only if their own IGN is a plausible fuzzy
+        # neighbor of at least one OCR string that failed to
+        # resolve — i.e. _fuzzy_lookup's own cutoff, applied here
+        # just to rank/split rather than to accept a match outright.
+        # Anyone left over with no such neighbor has nothing on the
+        # scoreboard that could plausibly be them — a likely leaver.
+        ocr_fail_strings = [str(f.get("ocr_ign") or "").strip().lower() for f in ign_failures]
+        def _resembles_any_failure(mp: dict) -> bool:
+            candidate = mp["players"]["ign"].strip().lower()
+            return any(
+                difflib.SequenceMatcher(None, candidate, ocr).ratio() >= 0.5
+                for ocr in ocr_fail_strings if ocr
+            )
+        mismatch_candidates = [mp for mp in unmatched if _resembles_any_failure(mp)]
+        no_signal = [mp for mp in unmatched if mp not in mismatch_candidates]
+        if len(no_signal) == true_leaver_count:
+            # Clean case: resemblance signal exactly accounts for
+            # every unmatched slot — auto-split with confidence,
+            # leavers never shown as mapping candidates at all.
+            leavers = no_signal
+            ign_mismatch_unmatched = mismatch_candidates
+        else:
+            # Ambiguous case (2026-09, CQ-6867 follow-up): e.g. the
+            # OCR name genuinely belongs to NONE of the roster (an
+            # unregistered/wrong-lobby name), so resemblance finds
+            # zero matches even though a real IGN-mismatch case
+            # still exists among the unmatched players — a "no
+            # signal" count that overshoots true_leaver_count is
+            # not proof everyone in it is a leaver. Rather than
+            # silently guess (risk: wrongly AFK someone who played)
+            # or silently give up to full review (worse UX for a
+            # case an admin can resolve in five seconds by eye),
+            # surface EVERY unmatched player as a mapping candidate
+            # and let the admin pick who mamaa/etc actually is —
+            # whichever candidates they don't map are then treated
+            # as the leavers. See _complete_ign_confirmed for the
+            # "unmapped candidates become leavers" completion side
+            # of this same logic.
+            leavers = []
+            ign_mismatch_unmatched = unmatched
+        eligible = bool(ign_failures and not has_non_ign_issue
+                        and len(ign_failures) <= len(ign_mismatch_unmatched)
+                        and 1 <= len(ign_mismatch_unmatched) <= 5)
+        return eligible, ign_mismatch_unmatched, leavers
+
+    @staticmethod
     def _prepare_round(match_players: list[dict], announced_map: str, extraction: dict,
-                       force_map: dict[str, int] | None = None) -> tuple[dict, list[str], list[dict], bool]:
+                       force_map: dict[str, int] | None = None,
+                       crown_override: dict | None = None) -> tuple[dict, list[str], list[dict], bool]:
         """RO1 (2026-08): de-looped from the original _prepare_rounds,
         which processed 3 rounds via enumerate(zip(maps, extractions)).
         Same validation logic per round, just run once instead of
@@ -2263,10 +2679,18 @@ class Match(commands.Cog):
           Empty when force_map resolves everything.
         - has_non_ign_issue: True if any failure OTHER than IGN
           resolution was detected (map mismatch, bad digits, invalid
-          position, etc.). Completeness/MVP-count checks at the end
-          do NOT set this flag — those are consequences of IGN
-          failures, not independent problems.
+          position, etc.). Completeness/crown checks at the end do
+          NOT set this flag — completeness and the results-based crown
+          count are consequences of IGN failures, and a crown problem on
+          the screenshot (_crown_problems) is routed to the admin crown
+          picker, not treated as bad data.
+
+        crown_override: an admin's crown pick per team (stored on
+        matches.crown_override). Applied to a COPY of the extraction
+        before anything else, and those teams skip the Impact cross-check.
         """
+        extraction = _apply_crown_override(extraction, crown_override)
+        trusted_crown_teams = tuple((crown_override or {}).keys())
         roster = {mp["players"]["ign"].strip().lower(): mp for mp in match_players}
         roster_by_pid = {mp["player_id"]: mp for mp in match_players}
         reasons: list[str] = []
@@ -2360,7 +2784,7 @@ class Match(commands.Cog):
                 has_non_ign_issue = True
                 reasons.append(f"Impact crown flag is missing or invalid for {row.get('ign')}")
                 continue
-            is_mvp = row["has_crown"]  # column name unchanged; means "gets the +5"
+            is_crown = row["has_crown"]  # the +5 holder — see header note above _crown_count_reason
             # damage is deliberately excluded from _INTEGER_FIELDS (see
             # module-level NOTE) — it can be legitimately absent or
             # non-numeric when a screenshot's scoreboard view doesn't
@@ -2373,8 +2797,11 @@ class Match(commands.Cog):
             # it's always a clean number.
             raw_impact = str(row.get("impact", ""))
             impact_value = float(raw_impact) if _HILL_TIME_RE.fullmatch(raw_impact) else None
-            results.append({"player_id": mp["player_id"], "position": position, "is_mvp": is_mvp,
-                            "mmr_delta": mmr_engine.calculate_mmr_change(position, round_team == winner, is_mvp),
+            results.append({"player_id": mp["player_id"], "position": position,
+                            # MVP tag is always row 1 in the game — stat only.
+                            "is_mvp": position == 1,
+                            "is_crown": is_crown, "bonus_5": is_crown,
+                            "mmr_delta": mmr_engine.calculate_mmr_change(position, round_team == winner, is_crown),
                             "team": round_team, "discord_id": mp["players"]["discord_id"],
                             # Raw stats, kept alongside the MMR/position outcome so
                             # match_player_stats can be written from this same pass
@@ -2432,6 +2859,7 @@ class Match(commands.Cog):
             # in this function uses two lines up.
             results.append({
                 "player_id": leaver["player_id"], "position": leaver_position, "is_mvp": False,
+                "is_crown": False, "bonus_5": False,
                 "mmr_delta": mmr_engine.calculate_mmr_change(leaver_position, False, False),
                 "team": leaver_team, "discord_id": leaver["players"]["discord_id"],
                 "kills": 0, "deaths": 0, "assists": 0, "damage": 0, "hill_time": 0.0, "impact": 0.0, "score": 0,
@@ -2441,45 +2869,23 @@ class Match(commands.Cog):
             per_team[leaver_team] += 1
         if len(results) != 10 or set(seen_players) != {mp["player_id"] for mp in match_players} or per_team != Counter({"A": 5, "B": 5}):
             reasons.append("scoreboard does not contain one valid row for every match player")
+        # Crown checks. Screenshot-level problems first (0 or 2+ crowns, or
+        # the crown on a lower-Impact player): these go to the admin crown
+        # picker. Then the results-level count, only for teams whose
+        # screenshot crown was fine — if it still fails there, the crown
+        # holder's IGN didn't resolve (an IGN-flow consequence).
+        crown_problems = _crown_problems(extraction, trusted_teams=trusted_crown_teams)
+        reasons.extend(crown_problems.values())
         for team in ("A", "B"):
-            if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
+            if team in crown_problems:
+                continue
+            if sum(1 for row in results if row["team"] == team and row["is_crown"]) != 1:
                 reasons.append(_crown_count_reason(team))
-        # Safety net on the crown read: the crown sits on the team's top
-        # Impact player, so the crown holder's Impact must never be LOWER
-        # than a teammate's (equal is fine — ties exist, and the crown is
-        # the tie-break, which is exactly why we read the icon and never
-        # pick by number). Checked on the raw extraction rows so it works
-        # even while an IGN is unresolved. Compared against every teammate
-        # whose Impact IS readable (a "?" or blank on one row must not
-        # switch the whole check off); skipped only when the crown
-        # holder's own Impact is unreadable.
-        for team in ("A", "B"):
-            team_rows = [r for r in extraction.get("players", []) if r.get("team") == team]
-            if len(team_rows) < 2:
-                continue
-            impacts = []
-            for r in team_rows:
-                raw = str(r.get("impact", ""))
-                impacts.append(float(raw) if _HILL_TIME_RE.fullmatch(raw) else None)
-            crowned = [(r, v) for r, v in zip(team_rows, impacts) if r.get("has_crown") is True]
-            if len(crowned) != 1:
-                continue  # the count check above already reports this
-            crown_row, crown_val = crowned[0]
-            readable = [(r, v) for r, v in zip(team_rows, impacts) if v is not None]
-            if crown_val is None or not readable:
-                continue
-            top_row, top_val = max(readable, key=lambda rv: rv[1])
-            if top_val > crown_val:
-                has_non_ign_issue = True
-                reasons.append(
-                    f"Team {team} crown read on {crown_row.get('ign')} (Impact {crown_val:g}) but "
-                    f"{top_row.get('ign')} has higher Impact ({top_val:g}) — check which row has the crown"
-                )
         round_dict = {
             "round_number": 1, "map_name": announced_map, "final_score": score, "results": results,
             # Reform 2026-07-29 (RO3-era): a round is "clean" only if
             # nothing in its own checks (map, score, per-player OCR
-            # fields, roster completeness, MVP count) added a reason.
+            # fields, roster completeness, crown count) added a reason.
             # With RO1 there's only ever one round, so this flag now
             # just means "did the whole submission validate cleanly" —
             # match_submit still uses it to decide whether to write
@@ -2737,4 +3143,6 @@ async def setup(bot: commands.Bot):
     bot.add_dynamic_items(IGNConfirmButton)
     bot.add_dynamic_items(IGNMapButton)
     bot.add_dynamic_items(IGNRejectButton)
+    bot.add_dynamic_items(CrownPickSelect)
+    bot.add_dynamic_items(CrownRejectButton)
     cog.approval_sweep.start()

@@ -26,16 +26,18 @@ _TIER_LADDER = (
 )
 
 
-def calculate_mmr_change(position: int, won: bool, is_mvp: bool) -> int:
+def calculate_mmr_change(position: int, won: bool, has_bonus: bool) -> int:
     """Return the MMR change for one player in one round.
 
-    ``position`` and ``is_mvp`` are game-provided scoreboard values; this
-    function intentionally does not derive either from other stat columns.
+    ``position`` comes from the scoreboard rank badge. ``has_bonus`` is the
+    +5 holder: the Impact CROWN holder since migration_041 (it was the MVP
+    tag before). Neither is derived from other stat columns. Whoever has
+    the bonus is stored as bonus_5, which every SQL win/loss check strips.
     """
     if position not in _WINNING_DELTAS:
         raise ValueError("position must be an integer from 1 through 5")
     delta = (_WINNING_DELTAS if won else _LOSING_DELTAS)[position]
-    return delta + (5 if is_mvp else 0)
+    return delta + (5 if has_bonus else 0)
 
 
 def derive_rank(mmr: int) -> tuple[str, str]:

@@ -964,8 +964,12 @@ def _get_match_screenshot(self: Database, match_id: int, round_number: int) -> O
     return res.data[0] if res.data else None
 
 
-def _correct_match_round_result(self: Database, row_id: int, position: int, is_mvp: bool, mmr_delta: int) -> dict:
-    payload = {"position": position, "is_mvp": is_mvp, "mmr_delta": mmr_delta}
+def _correct_match_round_result(self: Database, row_id: int, position: int, is_mvp: bool,
+                                is_crown: bool | None, bonus_5: bool, mmr_delta: int) -> dict:
+    """migration_041: writes all three flags together. The DB CHECK
+    (is_crown is null or bonus_5 = is_crown) rejects any drift."""
+    payload = {"position": position, "is_mvp": is_mvp, "is_crown": is_crown,
+               "bonus_5": bonus_5, "mmr_delta": mmr_delta}
     return self.client.table("match_round_results").update(payload).eq("id", row_id).execute().data[0]
 
 
@@ -1069,6 +1073,7 @@ def _reset_match_for_resubmission(self: Database, match_id: int) -> dict:
         "winner_team": None,
         "final_score": None,
         "mvp_player_id": None,
+        "crown_override": None,
         "approved_by": None,
         "approved_at": None,
     }).eq("id", match_id).execute()
@@ -1574,9 +1579,9 @@ def _current_season_stats(self: Database, player_id: int, season_id: int) -> Opt
     computed fresh via the current_season_stats() SQL function
     (migration_034), same pattern as the hof_* calls above (no
     precomputed table exists for this, unlike season_points). Win/loss
-    uses the mmr_delta-minus-MVP-bonus signal, same as
-    recompute_player_career_stats() — see engineering-rules' MVP-sign-
-    flip trap: a losing team's position-1 MVP scores -3+5=+2, positive
+    uses the mmr_delta-minus-bonus signal (bonus_5 since migration_041),
+    same as recompute_player_career_stats() — see engineering-rules'
+    sign-flip trap: a losing team's +5 holder scores e.g. -3+5=+2, positive
     despite losing, so win/loss is never inferred from mmr_delta sign
     alone. Returns None if the player has zero completed matches this
     season, so callers can show an explicit empty state rather than a

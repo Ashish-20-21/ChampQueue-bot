@@ -83,11 +83,11 @@ class Admin(commands.Cog):
     @app_commands.command(name="admin-correct-round", description="[Admin] Correct one player's position / Impact-crown (+5) flag for a round")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", round_number="Which round (always 1 for new RO1 matches; 1-3 kept for old RO3 matches)",
                             user="The player to correct", position="New position (1-5) — leave blank to keep current",
-                            is_mvp="New Impact-crown (+5 bonus) flag — leave blank to keep current")
+                            is_crown="Holds the Impact crown (+5 MMR)? — leave blank to keep current")
     @admin_only()
     async def correct_round(self, interaction: discord.Interaction, match_id: str, round_number: app_commands.Range[int, 1, 3],
                              user: discord.Member, position: app_commands.Range[int, 1, 5] | None = None,
-                             is_mvp: bool | None = None):
+                             is_crown: bool | None = None):
         match = await adb.get_match_by_code(match_id.strip().upper())
         if not match:
             await interaction.response.send_message("Match not found.", ephemeral=True)
@@ -96,8 +96,8 @@ class Admin(commands.Cog):
         if not player:
             await interaction.response.send_message("Player not found.", ephemeral=True)
             return
-        if position is None and is_mvp is None:
-            await interaction.response.send_message("Provide at least one of position or is_mvp to change.", ephemeral=True)
+        if position is None and is_crown is None:
+            await interaction.response.send_message("Provide at least one of position or is_crown to change.", ephemeral=True)
             return
 
         existing = [row for row in await adb.get_match_round_results(match["id"]) if row["round_number"] == round_number]
@@ -111,7 +111,17 @@ class Admin(commands.Cog):
             return
 
         new_position = position if position is not None else target["position"]
-        new_is_mvp = is_mvp if is_mvp is not None else target["is_mvp"]
+        # migration_041: MVP tag is always row 1 (stat only). The +5 follows
+        # bonus_5. For a crown-era row bonus_5 == is_crown. For an older row
+        # (is_crown NULL — crown never recorded) the +5 stays where it was
+        # unless the admin explicitly sets is_crown, which converts the row.
+        new_is_mvp = new_position == 1
+        if is_crown is not None:
+            new_is_crown = is_crown
+            new_bonus = is_crown
+        else:
+            new_is_crown = target.get("is_crown")
+            new_bonus = bool(target.get("bonus_5")) if new_is_crown is None else bool(new_is_crown)
 
         # Same guardrails _prepare_rounds already enforces at submission
         # time — reused here, not reimplemented, so an admin correction
@@ -124,17 +134,20 @@ class Admin(commands.Cog):
                 f"Position {new_position} is already taken on team {team} for round {round_number}.", ephemeral=True
             )
             return
-        if new_is_mvp and any(row["is_mvp"] for row in others_same_team):
+        if new_bonus and any(row.get("bonus_5") for row in others_same_team):
+            holder = next(row for row in others_same_team if row.get("bonus_5"))
             await interaction.response.send_message(
-                f"Team {team} already has an MVP for round {round_number} — only one allowed.", ephemeral=True
+                f"Team {team} already has the +5 (Impact crown) holder for round {round_number} "
+                f"(position {holder['position']}) — set is_crown False on them first. Only one allowed.",
+                ephemeral=True,
             )
             return
 
         # Determine "won" from the round's actual recorded final_score —
         # the same source of truth _prepare_rounds uses at submission time.
         # NOT derived from the existing row's mmr_delta sign: that's
-        # provably unsafe, e.g. a 1st-place MVP on the LOSING team scores
-        # -3 (loss) + 5 (MVP) = +2, a positive delta despite losing —
+        # provably unsafe, e.g. a 1st-place +5 holder on the LOSING team scores
+        # -3 (loss) + 5 (bonus) = +2, a positive delta despite losing —
         # inferring "won" from a positive sign there would be backwards.
         screenshot = await adb.get_match_screenshot(match["id"], round_number)
         score_text = str((screenshot or {}).get("raw_extraction", {}).get("final_score") or "")
@@ -148,12 +161,13 @@ class Admin(commands.Cog):
             return
         winning_team = "A" if int(score_match.group(1)) > int(score_match.group(2)) else "B"
         won = team == winning_team
-        new_delta = mmr_engine.calculate_mmr_change(new_position, won, new_is_mvp)
+        new_delta = mmr_engine.calculate_mmr_change(new_position, won, new_bonus)
 
-        await adb.correct_match_round_result(target["id"], new_position, new_is_mvp, new_delta)
+        await adb.correct_match_round_result(target["id"], new_position, new_is_mvp, new_is_crown, new_bonus, new_delta)
+        crown_txt = "not recorded (older match)" if new_is_crown is None else str(new_is_crown)
         await interaction.response.send_message(
-            f"Round {round_number}, **{player['ign']}**: position → {new_position}, MVP → {new_is_mvp}, "
-            f"MMR delta → {new_delta:+d}. Not yet applied to their MMR — still needs approval.",
+            f"Round {round_number}, **{player['ign']}**: position → {new_position}, Impact crown → {crown_txt}, "
+            f"+5 → {new_bonus}, MMR delta → {new_delta:+d}. Not yet applied to their MMR — still needs approval.",
             ephemeral=True,
         )
 
@@ -597,10 +611,11 @@ class Admin(commands.Cog):
                 "ign": player.get("ign", "?"),
                 "team": r["team"],
                 "position": r["position"],
-                # Stored is_mvp == "received the +5" (crown holder for
-                # matches after the 2026-10 impact change, MVP-tag holder
-                # before it) — verification_card reads has_crown.
-                "has_crown": r["is_mvp"],
+                # migration_041: is_crown is NULL on matches from before the
+                # crown was recorded — the card then shows a plain "+5" from
+                # bonus_5 and leaves the Impact line out.
+                "has_crown": r.get("is_crown"),
+                "bonus_5": r.get("bonus_5"),
                 # None (not "—") for missing stats — verification_card's
                 # display layer converts None to "—" for rendering; this
                 # keeps the data itself consistently typed (int or None,
@@ -622,7 +637,7 @@ class Admin(commands.Cog):
                     "ign": player.get("ign", "?"),
                     "team": mp["team"],
                     "position": None,
-                    "has_crown": False,
+                    "has_crown": None,
                     "kills": None,
                     "deaths": None,
                     "assists": None,
@@ -1473,8 +1488,8 @@ class MatchInfoModal(discord.ui.Modal, title="Match Info"):
     """Step 1: map name, score, Impact-crown players (the +5 holders)."""
     map_name = discord.ui.TextInput(label="Map Name", placeholder="e.g. Takeoff", required=True, max_length=30)
     score = discord.ui.TextInput(label="Score (A-B)", placeholder="e.g. 246-250", required=True, max_length=10)
-    mvp_a = discord.ui.TextInput(label="Impact crown Team A (IGN)", placeholder="e.g. Master.Fps", required=True, max_length=40)
-    mvp_b = discord.ui.TextInput(label="Impact crown Team B (IGN)", placeholder="e.g. SumitCantSnipe", required=True, max_length=40)
+    crown_a = discord.ui.TextInput(label="Impact crown Team A (IGN)", placeholder="e.g. Master.Fps", required=True, max_length=40)
+    crown_b = discord.ui.TextInput(label="Impact crown Team B (IGN)", placeholder="e.g. SumitCantSnipe", required=True, max_length=40)
 
     def __init__(self, parent_view: "ManualEntryStep1View"):
         super().__init__()
@@ -1493,8 +1508,8 @@ class MatchInfoModal(discord.ui.Modal, title="Match Info"):
             "map_name": self.map_name.value.strip(),
             "score_a": int(score_match.group(1)),
             "score_b": int(score_match.group(2)),
-            "mvp_a_ign": self.mvp_a.value.strip(),
-            "mvp_b_ign": self.mvp_b.value.strip(),
+            "crown_a_ign": self.crown_a.value.strip(),
+            "crown_b_ign": self.crown_b.value.strip(),
         }
         # Move to step 2
         view = ManualEntryStep2View(pv.cog, pv.match, pv.roster, pv.match_info)
@@ -1722,8 +1737,8 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
     extraction_players = []
     errors = []
 
-    for team, team_stats, mvp_ign in [("A", team_a_stats, match_info["mvp_a_ign"]),
-                                        ("B", team_b_stats, match_info["mvp_b_ign"])]:
+    for team, team_stats, crown_ign in [("A", team_a_stats, match_info["crown_a_ign"]),
+                                          ("B", team_b_stats, match_info["crown_b_ign"])]:
         # 2026-08-20: position now comes directly from what the admin
         # typed (the real rank badge, per TeamStatsModal's format) —
         # no more sorting by a player-typed score to derive it. Guard
@@ -1774,11 +1789,14 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
             # 2026-08-20: every player in a real match got rejected as
             # "wrong team" this way.
 
-            is_mvp = stat["ign"].lower() == mvp_ign.lower() or (
-                roster_entry and roster_entry["ign"].lower() == mvp_ign.lower()
-            )
+            # migration_041: the +5 follows the Impact crown the admin named;
+            # MVP is stat-only and always row 1 in the game.
+            is_crown = bool(stat["ign"].lower() == crown_ign.lower() or (
+                roster_entry and roster_entry["ign"].lower() == crown_ign.lower()
+            ))
+            is_mvp = position == 1
             won = team == winner_team
-            mmr_delta = mmr_engine.calculate_mmr_change(position, won, is_mvp)
+            mmr_delta = mmr_engine.calculate_mmr_change(position, won, is_crown)
 
             round_results.append({
                 "match_id": match["id"],
@@ -1786,6 +1804,8 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
                 "player_id": roster_entry["player_id"],
                 "position": position,
                 "is_mvp": is_mvp,
+                "is_crown": is_crown,
+                "bonus_5": is_crown,
                 "mmr_delta": mmr_delta,
                 "team": team,
             })
@@ -1826,12 +1846,20 @@ async def _process_manual_entry(interaction: discord.Interaction, cog, match: di
                 "ign": roster_entry["ign"],
                 "team": team,
                 "position": position,
-                "is_mvp": is_mvp,
+                "has_crown": is_crown,
                 "kills": stat["kills"],
                 "deaths": stat["deaths"],
                 "assists": stat["assists"],
                 "impact": stat["impact"],
             })
+
+    # Exactly one Impact crown per team — same rule as the screenshot path.
+    # Catches a typo in the crown IGN (would otherwise silently give
+    # nobody the +5) or a name that matches two players.
+    for team, crown_ign in (("A", match_info["crown_a_ign"]), ("B", match_info["crown_b_ign"])):
+        n_crowns = sum(1 for r in round_results if r["team"] == team and r["is_crown"])
+        if n_crowns != 1:
+            errors.append(f"Team {team}: Impact crown IGN {crown_ign!r} matched {n_crowns} players on this team (need exactly 1).")
 
     if errors:
         await interaction.edit_original_response(

@@ -79,7 +79,7 @@ A single Python process connects to Discord, keeps all state in Postgres and cal
 | Win | +9 | +8 | +6 | +4 | +3 |
 | Loss | −3 | −4 | −6 | −8 | −9 |
 
-The player holding the in-game **Impact crown** on each team (any row, not the yellow MVP tag) adds +5, which can turn a loss positive, so a result is never inferred from the sign of a delta. The database column is still named `is_mvp` and means "received the +5"; every SQL function strips that bonus to tell wins from losses, so the name was kept. Matches approved before 2026-10 have the MVP-tag holder in that column.
+The player holding the in-game **Impact crown** on each team (any row, not the yellow MVP tag) adds +5, which can turn a loss positive, so a result is never inferred from the sign of a delta. Since migration_041, `match_round_results` keeps three flags: `is_crown` (the crown holder; NULL on older matches, where it was never recorded), `bonus_5` ("received the +5", the only flag the win/loss SQL strips; backfilled from `is_mvp` for older rows), and `is_mvp` (stat only, always row 1, used for MVP counts). A CHECK keeps `bonus_5 = is_crown` whenever the crown is recorded. If the crown is hidden or unclear on a screenshot, admins pick the crown position in a crown-pick prompt; the pick is stored in `matches.crown_override` and the raw OCR is never edited.
 
 **No negative debt.** After each approved match the stored value becomes `max(0, current + this match's delta)`. Nothing below zero is ever carried. The same rule applies to Season Points.
 

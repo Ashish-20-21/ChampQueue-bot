@@ -587,9 +587,16 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         kda = f"{kills if kills is not None else '—'}/{deaths if deaths is not None else '—'}/{assists if assists is not None else '—'}"
         impact = p.get("impact")
         impact_str = str(impact) if impact is not None else "—"
-        # Impact crown (the +5 holder), read from the screenshot — NOT the
-        # yellow MVP tag. Same key the vision prompt returns.
-        mvp = "  👑 +5" if p.get("has_crown") else ""
+        # Impact crown (the +5 holder), read from the screenshot or set by
+        # an admin — NOT the yellow MVP tag. Matches from before migration_041
+        # have no crown record (has_crown None): their +5 row (bonus_5) is
+        # shown as a plain "+5", never dressed up as a crown.
+        if p.get("has_crown"):
+            mvp = "  👑 +5"
+        elif p.get("has_crown") is None and p.get("bonus_5"):
+            mvp = "  +5"
+        else:
+            mvp = ""
         team_lines.setdefault(p.get("team"), []).append(
             f"{position_str}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
         )
@@ -636,7 +643,11 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             # Majority of a team's rows will agree on win/loss (they're
             # on the same side), just check the first row's signal.
             r0 = team_results[0]
-            base_delta = r0["mmr_delta"] - (5 if r0.get("is_mvp") else 0)
+            # bonus_5 = "received the +5" (crown now, MVP tag on old rows).
+            bonus = r0.get("bonus_5")
+            if bonus is None:
+                bonus = r0.get("is_mvp")
+            base_delta = r0["mmr_delta"] - (5 if bonus else 0)
             return base_delta > 0
 
         team_a_results = [r for r in results if r["team"] == "A" and not r.get("afk")]
@@ -650,16 +661,23 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             # team, so the host (and the whole lobby) can see at a glance
             # where the +5 went. Display only — the +5 itself is already
             # inside each row's mmr_delta above.
+            manual = match.get("crown_override") or {}
+
             def _crown_text(team: str) -> str:
                 holder = next((p for p in players if p.get("team") == team and p.get("has_crown")), None)
                 if not holder:
                     return "no crown read"
                 pos = holder.get("position")
-                return f"pos {pos if pos is not None else '—'} {str(holder.get('ign') or '?')[:16]}"
+                admin_note = " (set by admin)" if team in manual else ""
+                return f"pos {pos if pos is not None else '—'} {str(holder.get('ign') or '?')[:16]}{admin_note}"
 
+            # Only when crown data exists: old matches (before migration_041)
+            # never recorded the crown, so the line is left out for them.
+            has_crown_data = any(p.get("has_crown") is not None
+                                 for p in players if p.get("position") is not None)
             a_won = _team_won(team_a_results)
             b_won = _team_won(team_b_results)
-            if a_won != b_won:
+            if has_crown_data and a_won != b_won:
                 w_team, l_team = ("A", "B") if a_won else ("B", "A")
                 impact_line = (f"\n*Impact 👑 (+5 MMR): W — {_crown_text(w_team)}  ·  "
                                f"L — {_crown_text(l_team)}*")
@@ -790,4 +808,35 @@ def ign_confirmation_embed(
     else:
         embed.set_footer(text="Click Map IGNs and enter the roster number for each OCR name.")
 
+    return embed
+
+def crown_pick_embed(match: dict, extraction: dict, problems: dict[str, str], screenshot_url: str) -> discord.Embed:
+    """Admin-facing embed for the Impact-crown picker (2026-10). Shows why
+    the crown couldn't be trusted, each problem team's rows (position,
+    name, Impact — ⭐ marks the top readable Impact, a hint only), and the
+    screenshot. Admins pick the crown POSITION from the select below."""
+    from cogs.match import _crown_candidates  # local import: avoids a cycle at module load
+
+    embed = discord.Embed(
+        title=f"Match {match['match_id']} — Impact crown needs a check",
+        description=(
+            "The bot couldn't read the **Impact crown** clearly (hidden by a loading bar or "
+            "notification, blurry, or the crown sits on a lower-Impact player). "
+            "The +5 MMR goes to the crown holder, so please look at the screenshot and pick "
+            "the **position** that has the crown for each team below. "
+            "⭐ = highest Impact on that team (a hint only — follow the crown)."
+        ),
+        color=discord.Color.orange(),
+    )
+    for team, reason in problems.items():
+        lines = []
+        for c in _crown_candidates(extraction, team):
+            impact_txt = f"{c['impact']:g}" if c["impact"] is not None else "?"
+            star = " ⭐" if c["top"] else ""
+            lines.append(f"{c['position']}  {c['ign'][:16]:<16} Impact {impact_txt:>5}{star}")
+        body = "```\n" + ("\n".join(lines) or "(no readable rows)") + "\n```"
+        embed.add_field(name=f"Team {team}", value=f"*{reason}*\n{body}"[:1024], inline=False)
+    if screenshot_url:
+        embed.set_image(url=screenshot_url)
+    embed.set_footer(text="Can't tell from any screenshot? Use \"Can't tell — send to review\".")
     return embed

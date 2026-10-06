@@ -10,7 +10,10 @@ What changed in Champion's Queue, newest first. The project doesn't cut tagged r
 - The **+5 MMR bonus now goes to the Impact crown holder** on each team (any row 1–5) instead of the yellow MVP tag, which is always row 1 and only reflects K/D. The vision prompt reads `has_crown`; a legacy `is_mvp`-only extraction is refused, never guessed.
 - Verification card marks the crown rows with `👑 +5` and adds an `Impact` summary line (winner / loser crown positions).
 - A crown on a player whose Impact is lower than a teammate's goes to review as a likely misread. Ties on Impact are fine; the crown breaks them.
-- No database change: `is_mvp` keeps meaning "received the +5". Older matches keep their MVP-tag bonus.
+- **migration_041:** `match_round_results.is_crown` (NULL for older matches) and `bonus_5` (backfilled from `is_mvp`); CHECK `is_crown is null or bonus_5 = is_crown`; `matches.crown_override`. Win/loss SQL (career stats, season points, `/cs-stats`) now strips `bonus_5`. MVP counts, Hall of Fame and badges stay on `is_mvp`, which is now set as position 1 (no vision read).
+- **Crown picker:** when the crown is hidden, missing, doubled or on a lower-Impact player, admins and moderators pick the crown position (top Impact is highlighted as a hint, never auto-applied). Runs before the IGN confirmation when both are needed.
+- `/admin-correct-round`: the `is_mvp` option is now `is_crown`; MVP follows position 1. Manual entry checks exactly one crown per team.
+- Approve card and `/admin-match-card`: older matches show a plain `+5` and no Impact line.
 
 ---
 

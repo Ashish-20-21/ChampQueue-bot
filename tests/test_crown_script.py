@@ -35,3 +35,12 @@ def test_crown_below_teammate_impact_fails():
     ext = {"players": _team("A", 5, [152, 168, 117, 123, 113])}
     ok, problems, _ = tool.evaluate_run(ext, {"A": 5})
     assert not ok and any("below teammate" in p for p in problems)
+
+
+def test_unreadable_teammates_do_not_switch_off_the_impact_check():
+    ext = {"players": [
+        {"team": "B", "position": 1, "ign": "b1", "impact": 63, "has_crown": True},
+        {"team": "B", "position": 2, "ign": "b2", "impact": 73, "has_crown": False},
+        {"team": "B", "position": 3, "ign": "b3", "impact": None, "has_crown": False}]}
+    ok, problems, _ = tool.evaluate_run(ext, {"B": 1})
+    assert not ok and any("below teammate" in p for p in problems)

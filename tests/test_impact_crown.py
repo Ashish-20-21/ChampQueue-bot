@@ -138,3 +138,15 @@ def test_verification_card_shows_crowns_and_impact_line():
     assert "SP (proposed): A -3  ·  B +5" in text
     assert "Impact 👑 (+5 MMR): W — pos 1 TempestAngryyy  ·  L — pos 2 Cyfur." in text
     assert "Impact crown" in card.description
+
+
+def test_crown_below_readable_teammate_is_flagged_even_if_other_impacts_unreadable():
+    # Real case (tiny Summit screenshot): team B crown read on Impact 63 while a
+    # teammate shows 73, and two rows have no readable Impact.
+    rows = [(t, p, i, k, d, a, s, imp, c) for (t, p, i, k, d, a, s, imp, c) in SUMMIT if t == "A"]
+    b = [("B", 1, "Beboh", 24, 32, 5, 2843, 63, True), ("B", 2, "EXGRaiden", 21, 27, 4, 2512, 73, False),
+         ("B", 3, "xJutal", 17, 37, 6, 2197, 60, False), ("B", 4, "ICNMido", 14, 38, 8, 1903, None, False),
+         ("B", 5, "worry", 16, 46, 0, 1646, None, False)]
+    rd, reasons, _, non_ign = _run(rows + b)
+    assert not rd["clean"] and non_ign
+    assert any("crown read on Beboh" in r and "EXGRaiden" in r for r in reasons)

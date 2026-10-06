@@ -76,11 +76,10 @@ def evaluate_run(extraction: dict, expected: dict) -> tuple[bool, list[str], dic
         if c.get("position") != want:
             problems.append(f"Team {team}: crown read on row {c.get('position')} ({c.get('ign')}), expected row {want}")
         imps = [_num(p.get("impact")) for p in rows]
-        if all(v is not None for v in imps):
-            top = max(imps)
-            cv = _num(c.get("impact"))
-            if cv is not None and cv < top:
-                problems.append(f"Team {team}: crown holder Impact {cv:g} is below teammate's {top:g}")
+        readable = [v for v in imps if v is not None]
+        cv = _num(c.get("impact"))
+        if cv is not None and readable and cv < max(readable):
+            problems.append(f"Team {team}: crown holder Impact {cv:g} is below teammate's {max(readable):g}")
     return (not problems), problems, crowns
 
 
@@ -106,6 +105,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default="crown_samples")
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--only", nargs="+", metavar="TEXT",
+                    help="only test images whose filename contains any of these texts, e.g. --only e5a26873 d3231de0")
     ap.add_argument("--template", action="store_true", help="write a blank expected.json and exit")
     args = ap.parse_args()
 
@@ -124,6 +125,11 @@ def main() -> int:
         print(f"Need images + expected.json in {folder} (run with --template first)")
         return 2
     expected_all = json.loads(exp_path.read_text(encoding="utf-8"))
+    if args.only:
+        images = [i for i in images if any(t.lower() in i.name.lower() for t in args.only)]
+        if not images:
+            print(f"No image in {folder} matches {args.only}")
+            return 2
 
     import config
     from services import vision_extraction

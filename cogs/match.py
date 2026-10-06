@@ -2449,8 +2449,10 @@ class Match(commands.Cog):
         # than a teammate's (equal is fine — ties exist, and the crown is
         # the tie-break, which is exactly why we read the icon and never
         # pick by number). Checked on the raw extraction rows so it works
-        # even while an IGN is unresolved. Skipped for a team when any
-        # Impact value is unreadable.
+        # even while an IGN is unresolved. Compared against every teammate
+        # whose Impact IS readable (a "?" or blank on one row must not
+        # switch the whole check off); skipped only when the crown
+        # holder's own Impact is unreadable.
         for team in ("A", "B"):
             team_rows = [r for r in extraction.get("players", []) if r.get("team") == team]
             if len(team_rows) < 2:
@@ -2459,13 +2461,14 @@ class Match(commands.Cog):
             for r in team_rows:
                 raw = str(r.get("impact", ""))
                 impacts.append(float(raw) if _HILL_TIME_RE.fullmatch(raw) else None)
-            if any(v is None for v in impacts):
-                continue
             crowned = [(r, v) for r, v in zip(team_rows, impacts) if r.get("has_crown") is True]
             if len(crowned) != 1:
                 continue  # the count check above already reports this
             crown_row, crown_val = crowned[0]
-            top_row, top_val = max(zip(team_rows, impacts), key=lambda rv: rv[1])
+            readable = [(r, v) for r, v in zip(team_rows, impacts) if v is not None]
+            if crown_val is None or not readable:
+                continue
+            top_row, top_val = max(readable, key=lambda rv: rv[1])
             if top_val > crown_val:
                 has_non_ign_issue = True
                 reasons.append(

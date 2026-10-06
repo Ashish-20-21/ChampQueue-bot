@@ -12,6 +12,10 @@ Setup
   3. Fill expected.json with the row (1-5) that really has the crown, per team.
      Team A = top/left group on the screen, B = the other. Use null for a team
      that is not on the screenshot (e.g. a winners-only view).
+     Use 0 when the crown is HIDDEN (loading bar, notification, painted
+     over): the test then PASSES only if the model reads NO crown for that
+     team (so the bot sends it to the admin crown picker) and FAILS if the
+     model invents one.
          {"summit.png": {"A": 2, "B": 1}, "shipment.png": {"A": 2, "B": null}}
   4. python tools/test_crown_read.py                 (3 runs per image by default)
 
@@ -62,6 +66,13 @@ def evaluate_run(extraction: dict, expected: dict) -> tuple[bool, list[str], dic
         if not rows:
             problems.append(f"Team {team}: no rows read")
             crowns[team] = None
+            continue
+        if want == 0:
+            invented = [p for p in rows if p.get("has_crown") is True]
+            crowns[team] = invented[0].get("position") if invented else None
+            if invented:
+                problems.append(f"Team {team}: crown is hidden in this image but the model read one on row "
+                                f"{invented[0].get('position')} ({invented[0].get('ign')}) — it must not guess")
             continue
         bad = [p.get("ign") for p in rows if not isinstance(p.get("has_crown"), bool)]
         if bad:

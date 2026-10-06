@@ -44,3 +44,12 @@ def test_unreadable_teammates_do_not_switch_off_the_impact_check():
         {"team": "B", "position": 3, "ign": "b3", "impact": None, "has_crown": False}]}
     ok, problems, _ = tool.evaluate_run(ext, {"B": 1})
     assert not ok and any("below teammate" in p for p in problems)
+
+
+def test_hidden_crown_passes_only_when_no_crown_is_read():
+    none_read = {"players": _team("A", 0, [152, 168, 117, 123, 113])}
+    ok, problems, crowns = tool.evaluate_run(none_read, {"A": 0})
+    assert ok and crowns["A"] is None
+    guessed = {"players": _team("A", 2, [152, 168, 117, 123, 113])}
+    ok, problems, _ = tool.evaluate_run(guessed, {"A": 0})
+    assert not ok and any("must not guess" in p for p in problems)

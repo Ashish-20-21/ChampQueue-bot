@@ -38,18 +38,20 @@ no commentary, matching exactly this schema:
           team's list). This is NOT their overall placement across all 10 players —
           each team has its own 1-5 ranking. Never derive this from score/kills
           yourself; read the number the game already shows.
-      "has_crown": true or false — true ONLY for a player whose row you can actually
-          SEE the small CROWN icon on/above their IMPACT number (the Impact column,
-          far right of the row). The crown marks the team's top Impact player and can
-          be on ANY row 1-5, not just row 1. At most one true per team.
-          It is NORMAL and CORRECT for a team to have NO crown in your answer: when the
-          icon is hidden (covered by a loading bar, notification or overlay, blurred
-          or cut off), set has_crown to false for EVERY row of that team. Zero crowns
-          for a team is a valid answer and is handled downstream by a human; a guessed
-          crown would pay +5 MMR to the wrong player. NEVER choose a crown because one
-          "should" exist, and never infer it from the Impact numbers (two players can
-          show the same Impact and only one has the crown), from the MVP tag, or from
-          the row position.
+      "has_crown": true or false. Look closely at the IMPACT column (far right) of
+          EVERY row of each team. On a normal scoreboard each team has exactly ONE row
+          with a small CROWN icon sitting directly above the Impact number — find it and
+          set has_crown true for that row. The crown can be on ANY row 1-5, not just row
+          1. It is small, and its colour differs: usually yellow on the winning team and
+          pale white/lavender on the losing team (the pale one is easy to miss on the
+          dark row background — check every row before concluding it is absent).
+          ONLY IF, after checking every row, the crown of a team is really not visible
+          because that area is covered (loading bar, notification, overlay) or
+          unreadable, set has_crown to false for EVERY row of that team. Zero crowns for
+          a team is then the correct answer and a human resolves it; a guessed crown
+          would pay +5 MMR to the wrong player. Never choose a crown because one "should"
+          exist, and never infer it from the Impact numbers (two players can show the
+          same Impact and only one has the crown), from the MVP tag, or from row position.
           IGNORE the yellow "MVP" tag/flag next to a player's name — that is a
           different marker, it is NOT the crown, and it must never make has_crown
           true. Report the crown only where you actually see the icon.

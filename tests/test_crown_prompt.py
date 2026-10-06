@@ -14,8 +14,15 @@ def _prompt() -> str:
 
 def test_zero_crowns_is_explicitly_allowed():
     p = _prompt()
-    assert "NO crown" in p and "EVERY row of that team" in p
-    assert "NEVER choose a crown because one" in p
+    assert "EVERY row of that team" in p and "Zero crowns for" in p
+    assert "Never choose a crown because one" in p
+
+
+def test_the_model_is_told_where_to_look_and_what_the_pale_crown_looks_like():
+    # A prompt that only talked about hiding made the model miss visible crowns
+    # (~4% of team reads in the 2026-10 regression run).
+    p = _prompt()
+    assert "EVERY row of each team" in p and "pale white/lavender" in p and "exactly ONE row" in p
 
 
 def test_old_wording_that_pushed_the_model_to_guess_is_gone():

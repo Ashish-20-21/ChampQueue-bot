@@ -80,10 +80,10 @@ class Admin(commands.Cog):
         lines = [f"`{m['match_id']}` — maps: {', '.join(m.get('map_pool') or []) or '—'} — created {m['created_at']}" for m in res.data]
         await interaction.response.send_message("**Matches awaiting review:**\n" + "\n".join(lines), ephemeral=True)
 
-    @app_commands.command(name="admin-correct-round", description="[Admin] Correct one player's position/MVP for a round")
+    @app_commands.command(name="admin-correct-round", description="[Admin] Correct one player's position / Impact-crown (+5) flag for a round")
     @app_commands.describe(match_id="The match ID (e.g. CQ-0001)", round_number="Which round (always 1 for new RO1 matches; 1-3 kept for old RO3 matches)",
                             user="The player to correct", position="New position (1-5) — leave blank to keep current",
-                            is_mvp="New MVP flag — leave blank to keep current")
+                            is_mvp="New Impact-crown (+5 bonus) flag — leave blank to keep current")
     @admin_only()
     async def correct_round(self, interaction: discord.Interaction, match_id: str, round_number: app_commands.Range[int, 1, 3],
                              user: discord.Member, position: app_commands.Range[int, 1, 5] | None = None,
@@ -597,7 +597,10 @@ class Admin(commands.Cog):
                 "ign": player.get("ign", "?"),
                 "team": r["team"],
                 "position": r["position"],
-                "is_mvp": r["is_mvp"],
+                # Stored is_mvp == "received the +5" (crown holder for
+                # matches after the 2026-10 impact change, MVP-tag holder
+                # before it) — verification_card reads has_crown.
+                "has_crown": r["is_mvp"],
                 # None (not "—") for missing stats — verification_card's
                 # display layer converts None to "—" for rendering; this
                 # keeps the data itself consistently typed (int or None,
@@ -619,7 +622,7 @@ class Admin(commands.Cog):
                     "ign": player.get("ign", "?"),
                     "team": mp["team"],
                     "position": None,
-                    "is_mvp": False,
+                    "has_crown": False,
                     "kills": None,
                     "deaths": None,
                     "assists": None,
@@ -836,7 +839,7 @@ class Admin(commands.Cog):
         view = ManualEntryStep1View(self, match, roster)
         await interaction.response.send_message(
             f"**Manual Entry for {match['match_id']}**\n"
-            f"Step 1 of 3 — enter map name, score, and MVP players.",
+            f"Step 1 of 3 — enter map name, score, and the Impact-crown player of each team.",
             view=view,
             ephemeral=True,
         )
@@ -1459,19 +1462,19 @@ _STAT_HELP = (
     "```\n1 folks 41 31 11 89 193\n2 GodLSkullG 79 48 13 45 130\n```\n"
     "position is the in-game rank badge (1-5) shown on the scoreboard —\n"
     "type it exactly as shown, never guessed from anything else.\n"
-    "Use seconds for hill_time (e.g. 89 = 1:29). impact can be left as 0 "
-    "if the scoreboard doesn't show it — it's cosmetic, never used for MMR "
-    "(see mmr_engine.calculate_mmr_change, which is position/win/MVP "
-    "based only)."
+    "Use seconds for hill_time (e.g. 89 = 1:29). Type impact exactly as shown. "
+    "The number itself never changes MMR — the +5 bonus goes to the player who "
+    "holds the Impact CROWN on each team (picked in step 1), not the MVP tag "
+    "(see mmr_engine.calculate_mmr_change)."
 )
 
 
 class MatchInfoModal(discord.ui.Modal, title="Match Info"):
-    """Step 1: map name, score, MVPs."""
+    """Step 1: map name, score, Impact-crown players (the +5 holders)."""
     map_name = discord.ui.TextInput(label="Map Name", placeholder="e.g. Takeoff", required=True, max_length=30)
     score = discord.ui.TextInput(label="Score (A-B)", placeholder="e.g. 246-250", required=True, max_length=10)
-    mvp_a = discord.ui.TextInput(label="MVP Team A (IGN)", placeholder="e.g. Master.Fps", required=True, max_length=40)
-    mvp_b = discord.ui.TextInput(label="MVP Team B (IGN)", placeholder="e.g. SumitCantSnipe", required=True, max_length=40)
+    mvp_a = discord.ui.TextInput(label="Impact crown Team A (IGN)", placeholder="e.g. Master.Fps", required=True, max_length=40)
+    mvp_b = discord.ui.TextInput(label="Impact crown Team B (IGN)", placeholder="e.g. SumitCantSnipe", required=True, max_length=40)
 
     def __init__(self, parent_view: "ManualEntryStep1View"):
         super().__init__()

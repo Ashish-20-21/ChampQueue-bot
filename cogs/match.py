@@ -97,6 +97,20 @@ _HILL_TIME_RE = re.compile(r"^\d+(\.\d+)?$")
 # Fixed to accept plain integers; still accepts decimals if a future
 # prompt/provider version returns fractional seconds.
 _SCORE_RE = re.compile(r"^(\d+)\s*[:\-]\s*(\d+)$")
+
+
+# Impact-crown bonus (2026-10). The +5 MMR bonus goes to the player holding
+# the game's CROWN icon on the Impact column (top Impact player of each
+# team, any row 1-5) — NOT to the yellow "MVP" tag, which is always row 1
+# and only reflects K/D. The DB column / dict key is still called
+# "is_mvp" on purpose: every SQL function strips the bonus with
+# `mmr_delta - (5 if is_mvp)` to tell a win from a loss, so the column
+# must keep meaning "this row received the +5". Only the *source* of the
+# flag changed (crown instead of MVP tag). The reason text lives in one
+# helper so the validation site and the IGN-confirm "expected reasons"
+# set can never drift apart.
+def _crown_count_reason(team: str) -> str:
+    return f"Team {team} must have exactly one Impact crown"
 _DISCORD_MESSAGE_LIMIT = 2000
 _DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
 
@@ -2061,7 +2075,7 @@ class Match(commands.Cog):
         # formula, here instead. Any OTHER reason (bad digits, map
         # mismatch, etc.) still aborts to manual review same as before.
         expected_reasons = {"scoreboard does not contain one valid row for every match player"}
-        expected_reasons |= {f"Team {t} must have exactly one game-provided MVP" for t in ("A", "B")}
+        expected_reasons |= {_crown_count_reason(t) for t in ("A", "B")}
         unexpected_reasons = [r for r in reasons if r not in expected_reasons]
         if leavers and not unexpected_reasons:
             results = round_data_dict["results"]
@@ -2338,11 +2352,15 @@ class Match(commands.Cog):
                 has_non_ign_issue = True
                 reasons.append(f"invalid position for {row.get('ign')}")
                 continue
-            if not isinstance(row.get("is_mvp"), bool):
+            # Crown (Impact) flag, not the MVP tag — see _crown_count_reason.
+            # A legacy extraction that only has "is_mvp" is deliberately NOT
+            # accepted here: silently treating an MVP tag as a crown would
+            # pay the bonus to the wrong player.
+            if not isinstance(row.get("has_crown"), bool):
                 has_non_ign_issue = True
-                reasons.append(f"MVP flag is missing or invalid for {row.get('ign')}")
+                reasons.append(f"Impact crown flag is missing or invalid for {row.get('ign')}")
                 continue
-            is_mvp = row["is_mvp"]
+            is_mvp = row["has_crown"]  # column name unchanged; means "gets the +5"
             # damage is deliberately excluded from _INTEGER_FIELDS (see
             # module-level NOTE) — it can be legitimately absent or
             # non-numeric when a screenshot's scoreboard view doesn't
@@ -2425,7 +2443,35 @@ class Match(commands.Cog):
             reasons.append("scoreboard does not contain one valid row for every match player")
         for team in ("A", "B"):
             if sum(1 for row in results if row["team"] == team and row["is_mvp"]) != 1:
-                reasons.append(f"Team {team} must have exactly one game-provided MVP")
+                reasons.append(_crown_count_reason(team))
+        # Safety net on the crown read: the crown sits on the team's top
+        # Impact player, so the crown holder's Impact must never be LOWER
+        # than a teammate's (equal is fine — ties exist, and the crown is
+        # the tie-break, which is exactly why we read the icon and never
+        # pick by number). Checked on the raw extraction rows so it works
+        # even while an IGN is unresolved. Skipped for a team when any
+        # Impact value is unreadable.
+        for team in ("A", "B"):
+            team_rows = [r for r in extraction.get("players", []) if r.get("team") == team]
+            if len(team_rows) < 2:
+                continue
+            impacts = []
+            for r in team_rows:
+                raw = str(r.get("impact", ""))
+                impacts.append(float(raw) if _HILL_TIME_RE.fullmatch(raw) else None)
+            if any(v is None for v in impacts):
+                continue
+            crowned = [(r, v) for r, v in zip(team_rows, impacts) if r.get("has_crown") is True]
+            if len(crowned) != 1:
+                continue  # the count check above already reports this
+            crown_row, crown_val = crowned[0]
+            top_row, top_val = max(zip(team_rows, impacts), key=lambda rv: rv[1])
+            if top_val > crown_val:
+                has_non_ign_issue = True
+                reasons.append(
+                    f"Team {team} crown read on {crown_row.get('ign')} (Impact {crown_val:g}) but "
+                    f"{top_row.get('ign')} has higher Impact ({top_val:g}) — check which row has the crown"
+                )
         round_dict = {
             "round_number": 1, "map_name": announced_map, "final_score": score, "results": results,
             # Reform 2026-07-29 (RO3-era): a round is "clean" only if

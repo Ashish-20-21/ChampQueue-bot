@@ -61,7 +61,7 @@ A single Python process connects to Discord, keeps all state in Postgres and cal
 4. **Resolve names.** Each name is matched to the roster in four steps (exact, fuzzy, strip a truncation suffix then exact, strip then fuzzy). Ambiguous matches are refused, never guessed.
 5. **Decide teams and winner** from the scoreboard's own grouping and score.
 6. **Handle leavers.** The leaver count is ten minus the scoreboard rows. When unmatched players split cleanly into leavers and name typos, leavers get a zero-stat row and a losing result. Anything unclear goes to review.
-7. **Write** the round data in one atomic database function, then validate: map matches, score readable, no tie, exactly one MVP per team, ten rows. Failures become a review issue.
+7. **Write** the round data in one atomic database function, then validate: map matches, score readable, no tie, exactly one Impact crown per team (and the crown holder's Impact is never below a teammate's), ten rows. Failures become a review issue.
 8. **Verify.** The bot posts a verification card with both teams' stats and the proposed MMR and Season Points.
 9. **Approve** by host click, by staff, or by a sweep after 300 seconds. One database function (`approve_match`) commits MMR, rank and Season Points **in a single transaction** and refuses unless the match is pending verification.
 10. **Clean up.** The match channel is deleted 15 minutes later by a sweep stored in the database, so it survives restarts.
@@ -72,14 +72,14 @@ A single Python process connects to Discord, keeps all state in Postgres and cal
 
 ## 4. Rating rules
 
-**MMR change** is a position table plus an MVP bonus:
+**MMR change** is a position table plus an Impact-crown bonus:
 
 | Position | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
 | Win | +9 | +8 | +6 | +4 | +3 |
 | Loss | −3 | −4 | −6 | −8 | −9 |
 
-The in-game MVP adds +5 (which can turn a loss positive, so a result is never inferred from the sign of a delta).
+The player holding the in-game **Impact crown** on each team (any row, not the yellow MVP tag) adds +5, which can turn a loss positive, so a result is never inferred from the sign of a delta. The database column is still named `is_mvp` and means "received the +5"; every SQL function strips that bonus to tell wins from losses, so the name was kept. Matches approved before 2026-10 have the MVP-tag holder in that column.
 
 **No negative debt.** After each approved match the stored value becomes `max(0, current + this match's delta)`. Nothing below zero is ever carried. The same rule applies to Season Points.
 

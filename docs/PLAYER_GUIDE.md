@@ -63,7 +63,7 @@ Every queue feeds **one global pool**: one MMR, one rank ladder, one leaderboard
 
 ## 4. Ranks and MMR
 
-New players start at **200 MMR (Elite1)**. Your change in a match depends on your **position on your team's scoreboard**, the **result**, and the in-game **MVP** tag (+5).
+New players start at **200 MMR (Elite1)**. Your change in a match depends on your **position on your team's scoreboard**, the **result**, and the **Impact crown** (+5). The crown is the small crown icon next to the Impact number on the scoreboard. One player per team holds it, on **any** row 1–5, so play the objective, not just kills. The yellow MVP tag no longer matters for MMR.
 
 | Position | 1st | 2nd | 3rd | 4th | 5th |
 |---|:---:|:---:|:---:|:---:|:---:|

@@ -4,6 +4,16 @@ What changed in Champion's Queue, newest first. The project doesn't cut tagged r
 
 ---
 
+## Unreleased · Impact-crown bonus
+
+### Changed
+- The **+5 MMR bonus now goes to the Impact crown holder** on each team (any row 1–5) instead of the yellow MVP tag, which is always row 1 and only reflects K/D. The vision prompt reads `has_crown`; a legacy `is_mvp`-only extraction is refused, never guessed.
+- Verification card marks the crown rows with `👑 +5` and adds an `Impact` summary line (winner / loser crown positions).
+- A crown on a player whose Impact is lower than a teammate's goes to review as a likely misread. Ties on Impact are fine; the crown breaks them.
+- No database change: `is_mvp` keeps meaning "received the +5". Older matches keep their MVP-tag bonus.
+
+---
+
 ## 2026-09-21 → 2026-10-01 · Performance and measurement
 
 ### Added

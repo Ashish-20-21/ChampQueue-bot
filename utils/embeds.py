@@ -561,7 +561,9 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         title=f"Match {match['match_id']} — Verification",
         description=(
             "Review the round against your own screenshot. Only the Match Host can approve. "
-            "**MMR and SP values are proposed** — nothing is applied until Approve is clicked."
+            "**MMR and SP values are proposed** — nothing is applied until Approve is clicked.\n"
+            "👑 **+5 MMR goes to the Impact crown on each team** (any position) — not the MVP tag. "
+            "Check the crown on your screenshot matches."
         ),
         color=discord.Color.gold(),
     )
@@ -585,7 +587,9 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
         kda = f"{kills if kills is not None else '—'}/{deaths if deaths is not None else '—'}/{assists if assists is not None else '—'}"
         impact = p.get("impact")
         impact_str = str(impact) if impact is not None else "—"
-        mvp = "  MVP" if p.get("is_mvp") else ""
+        # Impact crown (the +5 holder), read from the screenshot — NOT the
+        # yellow MVP tag. Same key the vision prompt returns.
+        mvp = "  👑 +5" if p.get("has_crown") else ""
         team_lines.setdefault(p.get("team"), []).append(
             f"{position_str}  {ign:<16.16} {kda:<10} {impact_str:>4}{mvp}"
         )
@@ -611,6 +615,7 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
 
     mmr_line = ""
     sp_line = ""
+    impact_line = ""
     if results:
         team_a_deltas = "/".join(f"{r['mmr_delta']:+d}" for r in sorted(
             (r for r in results if r["team"] == "A"), key=lambda r: r["position"]))
@@ -641,6 +646,24 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
             b_sp = "+5" if _team_won(team_b_results) else "-3"
             sp_line = f"\n*SP (proposed): A {a_sp}  ·  B {b_sp}*"
 
+            # Impact summary: who holds the crown on the winning vs losing
+            # team, so the host (and the whole lobby) can see at a glance
+            # where the +5 went. Display only — the +5 itself is already
+            # inside each row's mmr_delta above.
+            def _crown_text(team: str) -> str:
+                holder = next((p for p in players if p.get("team") == team and p.get("has_crown")), None)
+                if not holder:
+                    return "no crown read"
+                pos = holder.get("position")
+                return f"pos {pos if pos is not None else '—'} {str(holder.get('ign') or '?')[:16]}"
+
+            a_won = _team_won(team_a_results)
+            b_won = _team_won(team_b_results)
+            if a_won != b_won:
+                w_team, l_team = ("A", "B") if a_won else ("B", "A")
+                impact_line = (f"\n*Impact 👑 (+5 MMR): W — {_crown_text(w_team)}  ·  "
+                               f"L — {_crown_text(l_team)}*")
+
     # Mentions don't render inside code fences (where the "(AFK — left
     # match)" placeholder line above lives), so the actual @mention is
     # appended here instead, outside the block, one line per AFK row.
@@ -653,7 +676,7 @@ def verification_card(match: dict, round_data: list[dict], extraction: dict, map
     final_score = extraction.get("final_score") or "—"
     embed.add_field(
         name=f"{map_name} ({final_score})",
-        value=block + mmr_line + sp_line + afk_line,
+        value=block + mmr_line + sp_line + impact_line + afk_line,
         inline=False,
     )
     return embed

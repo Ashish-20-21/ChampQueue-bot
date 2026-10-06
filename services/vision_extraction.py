@@ -38,9 +38,16 @@ no commentary, matching exactly this schema:
           team's list). This is NOT their overall placement across all 10 players —
           each team has its own 1-5 ranking. Never derive this from score/kills
           yourself; read the number the game already shows.
-      "is_mvp": true or false — true for exactly one player per team, wherever the
-          game shows an "MVP" tag/badge on that player's row. Exactly one true per
-          team, never more, never fewer if the tag is visible.
+      "has_crown": true or false — true for exactly one player per team: the player
+          whose row shows the small CROWN icon sitting on/above their IMPACT number
+          (the Impact column, far right of the row). The crown marks the team's top
+          Impact player and can be on ANY row 1-5, not just row 1. Exactly one true
+          per team, never more, never fewer if a crown is visible.
+          IGNORE the yellow "MVP" tag/flag next to a player's name — that is a
+          different marker, it is NOT the crown, and it must never make has_crown
+          true. Do NOT pick the crown player yourself by comparing Impact numbers:
+          two players can show the same Impact value and only one of them has the
+          crown. Report the crown only where you actually see the icon.
       "kills": integer,
       "deaths": integer,
       "assists": integer or null if not shown,
@@ -66,10 +73,11 @@ that field — never move a value from one column into a different field just be
 that field's own column is missing or you're unsure. A missing column means null for
 that field, not a value copied from a neighboring column.
 
-"position" and "is_mvp" are REQUIRED for every player — they are read directly off
-the scoreboard (a numbered rank badge and an MVP tag), not calculated. If either is
-genuinely not visible for a player, still return your best read rather than omitting
-the field, since both are load-bearing for match results.
+"position" and "has_crown" are REQUIRED for every player — they are read directly off
+the scoreboard (a numbered rank badge and a crown icon by the Impact number), not
+calculated. "position" must still be returned even if you are unsure; "has_crown" must
+be true or false for every player (false when no crown icon is on that row). Both are
+load-bearing for match results.
 
 If a field is not legible or not present in the image, use null for that field —
 never guess or fabricate a number, and never substitute a different column's value.

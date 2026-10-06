@@ -178,6 +178,22 @@ RESULT_SS_CHANNEL_ID = int(os.getenv("RESULT_SS_CHANNEL_ID")) if os.getenv("RESU
 # any channel rather than crashing the bot on boot.
 IGN_CHANGE_CHANNEL_ID = int(os.getenv("IGN_CHANGE_CHANNEL_ID")) if os.getenv("IGN_CHANGE_CHANNEL_ID") else None
 
+# /post-info guide (2026-10): optional channel ids so the guide can show clickable
+# #mentions. Unset (or not a number, e.g. a "<channel id>" placeholder) = the guide
+# shows a plain channel name instead. Never raises at startup.
+def _optional_channel_id(name: str):
+    raw = (os.getenv(name) or "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+INFO_VERIFY_CHANNEL_ID = _optional_channel_id("INFO_VERIFY_CHANNEL_ID")
+INFO_REGISTER_CHANNEL_ID = _optional_channel_id("INFO_REGISTER_CHANNEL_ID")
+INFO_QUEUE_CHANNEL_ID = _optional_channel_id("INFO_QUEUE_CHANNEL_ID")
+INFO_STATS_CHANNEL_ID = _optional_channel_id("INFO_STATS_CHANNEL_ID")
+INFO_LEADERBOARD_CHANNEL_ID = _optional_channel_id("INFO_LEADERBOARD_CHANNEL_ID")
+
 # --- Correction/review system ---
 # Intake: new match_issues rows post here (OCR failures routed automatically,
 # plus anything filed via /correction-result). Outbound: resolutions get

@@ -44,6 +44,7 @@ COGS = [
     "cogs.points",
     "cogs.digest",
     "cogs.maintenance",
+    "cogs.info",
 ]
 
 

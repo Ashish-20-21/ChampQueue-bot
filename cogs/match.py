@@ -2944,6 +2944,17 @@ class Match(commands.Cog):
             except discord.HTTPException:
                 pass
 
+    async def _grant_achievements(self, player_ids: list[int], match_code) -> None:
+        """Never raises. Grants any badge each player now qualifies for."""
+        for pid in player_ids:
+            try:
+                granted = await with_retry(adb.grant_player_achievements, pid)
+                if granted:
+                    logger.info("achievements granted after %s: player_id=%s %s", match_code, pid, granted)
+            except Exception as exc:
+                logger.warning("achievement grant failed after %s for player_id=%s: %r", match_code, pid, exc)
+            await asyncio.sleep(0.3)             # spread the calls out, never a burst
+
     async def _do_approve(self, guild: discord.Guild | None, match_id: int, approved_by_id: int) -> tuple[bool, str]:
         """The one real approval path — used by the manual Approve button,
         /admin-force-approve, and the auto-approve sweep. Returns
@@ -2998,12 +3009,23 @@ class Match(commands.Cog):
         # spawn_background's docstring (cogs/points.py) for the full
         # reasoning and the asyncio pitfalls it specifically guards
         # against.
+        from cogs.points import run_season_lazy_checks, spawn_background
         if match.get("season_id"):
-            from cogs.points import run_season_lazy_checks, spawn_background
             spawn_background(
                 run_season_lazy_checks(self.bot, match["season_id"]),
                 error_label=f"run_season_lazy_checks for match_id={match_id}",
             )
+
+        # Badges: nothing ever called check_and_grant_achievements, so badges only
+        # appeared after a manual SQL backfill. Run it for this match's players,
+        # AFTER the recompute above (it reads career totals and peak_rank, both
+        # fresh by now). Background + one player at a time: it never slows the
+        # Approve click and never makes a burst of requests. A miss costs nothing
+        # -- the player's next match, or opening /achievements, grants it.
+        spawn_background(
+            self._grant_achievements([mp["player_id"] for mp in match_players], match.get("match_id")),
+            error_label=f"grant achievements for match_id={match_id}",
+        )
 
         await self._run_post_approval_cleanup(guild, match)
         return True, "approved"

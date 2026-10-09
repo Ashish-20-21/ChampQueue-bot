@@ -448,7 +448,6 @@ class Admin(commands.Cog):
 
         season_id = season["id"]
         categories = {
-            "most_consistent": adb.hof_most_consistent,
             "fastest_climber": adb.hof_fastest_climber,
             "highest_total_kills": adb.hof_highest_total_kills,
             "best_avg_kills": adb.hof_best_avg_kills,
@@ -458,7 +457,10 @@ class Admin(commands.Cog):
             "best_kd": adb.hof_best_kd,
         }
 
-        winners: dict[str, dict | None] = {}
+        # Most Consistent is worked out in Python below (same win logic as the
+        # other win categories). If that fails it is left off the card rather than
+        # falling back to the old SQL function, whose answer could contradict them.
+        winners: dict[str, dict | None] = {"most_consistent": None}
         notes: list[str] = []
         failed: list[str] = []
         for key, fn in categories.items():

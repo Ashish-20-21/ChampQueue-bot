@@ -29,6 +29,7 @@ logger = logging.getLogger("champions_queue")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 PAGE_SIZE = 1000                 # PostgREST returns at most 1000 rows per request
+CONSISTENT_MIN_MATCHES = 20      # win rate over fewer games than this is luck, not consistency
 MIN_MATCHES_FLOOR = 8            # same sample floor as migration_024
 MIN_STREAK_TO_SHOW = 3           # a 2-game streak is not worth a trophy
 MIN_COVERAGE = 0.9              # an extra needs data for at least 90% of the season, or it is left out
@@ -406,6 +407,23 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
                 rows.append({"player_id": p, "matches_played": len(ms), "streak": longest})
         return _pick(rows, "streak")
 
+    def most_consistent():
+        # Same win logic as Most Wins / Win Streak (team MMR once the +5 bonus is
+        # out), so the three can never contradict each other. The old SQL version
+        # decided wins from the MVP tag per player and had no real floor.
+        rows = []
+        for p, ms in per_player.items():
+            known = [outcomes.get((p, mid), {}).get("won") for mid, _ in ms]
+            decided = [w for w in known if w is not None]
+            if len(decided) >= CONSISTENT_MIN_MATCHES:
+                wins = sum(1 for w in decided if w)
+                rows.append({"player_id": p, "matches_played": len(decided), "wins": wins,
+                             "win_rate_pct": round(100.0 * wins / len(decided), 1)})
+        if not rows:
+            return None
+        return sorted(rows, key=lambda x: (-x["win_rate_pct"], -x["matches_played"], x["player_id"]))[0]
+
+    guarded("most_consistent", most_consistent)
     guarded("best_avg_assists", best_avg_assists)
     guarded("best_avg_impact", best_avg_impact)
     guarded("hill_king", hill_king)
@@ -418,6 +436,7 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
 
 # Same table the embed and the hall_of_fame table use: category -> number that is stored.
 EXTRA_VALUE_KEYS = {
+    "most_consistent": "win_rate_pct",
     "best_avg_assists": "avg_assists",
     "best_avg_impact": "avg_impact",
     "hill_king": "avg_hill_seconds",

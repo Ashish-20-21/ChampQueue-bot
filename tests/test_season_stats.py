@@ -479,7 +479,8 @@ async def test_hof_handler_posts_extras_and_records_them(monkeypatch):
     embed = ch.sent[0]["embed"]
     assert any("Most Wins" in f.name for f in embed.fields) and any("Longest Win Streak" in f.name for f in embed.fields)
     cats = {c for c, _, _ in fake.recorded}
-    assert {"most_consistent", "highest_mmr", "most_wins", "hill_king", "best_single_game"} <= cats
+    assert {"highest_mmr", "most_wins", "hill_king", "best_single_game"} <= cats
+    assert "most_consistent" not in cats                 # 8 matches is below the 20-match floor
 
 
 @pytest.mark.asyncio
@@ -497,3 +498,43 @@ async def test_hof_handler_still_posts_if_saving_to_the_table_fails(monkeypatch)
     cog, inter = cog_and_inter(monkeypatch, fake, ch)
     msg = await cog._dispatch_hall_of_fame(inter, season_id=2)
     assert msg.startswith("✅") and "not saved" in msg and ch.sent
+
+
+# ---------------- Most Consistent (now Python) ----------------
+
+def twenty_matches(winner_for):
+    return [
+        {"id": i, "code": f"CQ-{i:04d}", "created": f"2026-10-{i:02d}T10:00:00+00:00", "winner": winner_for(i)}
+        for i in range(1, 21)
+    ]
+
+
+def test_most_consistent_needs_twenty_decided_matches():
+    # eight perfect matches are luck, not consistency
+    assert season_stats.compute_hof_extras(make_ds(eight_matches(lambda i: "B")))["most_consistent"] is None
+
+
+def test_most_consistent_picks_the_best_win_rate_and_breaks_ties_by_lowest_id():
+    ex = season_stats.compute_hof_extras(make_ds(twenty_matches(lambda i: "B")))
+    row = ex["most_consistent"]
+    assert row["win_rate_pct"] == 100.0 and row["matches_played"] == 20 and row["wins"] == 20
+    assert row["player_id"] == 6                         # 6-10 all tie on 100%: lowest id, same on every run
+    assert season_stats.EXTRA_VALUE_KEYS["most_consistent"] == "win_rate_pct"
+
+
+def test_most_consistent_agrees_with_the_win_streak_logic():
+    # A 100% player must also have a streak as long as their match count; the two
+    # categories share one win definition so the card cannot contradict itself.
+    ds = make_ds(twenty_matches(lambda i: "B"))
+    ex = season_stats.compute_hof_extras(ds)
+    assert ex["longest_win_streak"]["streak"] == ex["most_consistent"]["matches_played"] == 20
+
+
+@pytest.mark.asyncio
+async def test_hof_handler_never_falls_back_to_the_sql_most_consistent(monkeypatch):
+    fake, ch = FakeAdb(None, dataset_boom=True), Channel()
+    fake.hof_most_consistent = lambda sid: (_ for _ in ()).throw(AssertionError("SQL path must not be used"))
+    cog, inter = cog_and_inter(monkeypatch, fake, ch)
+    await cog._dispatch_hall_of_fame(inter, season_id=2)
+    embed = ch.sent[0]["embed"]
+    assert "Not enough matches" in next(f.value for f in embed.fields if "Most Consistent" in f.name)

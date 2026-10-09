@@ -695,6 +695,13 @@ class Database:
         ).execute()
         return res.data[0]
 
+    def grant_player_achievements(self, player_id: int) -> list[str]:
+        """Run migration_020/022's check_and_grant_achievements for one player and
+        return the badge codes that were NEWLY granted (already-held ones are
+        skipped by the function itself, so calling this twice is harmless)."""
+        res = self.client.rpc("check_and_grant_achievements", {"p_player_id": player_id}).execute()
+        return [row["granted_code"] for row in (res.data or []) if row.get("granted_code")]
+
     def get_player_achievements(self, player_id: int) -> list[dict]:
         res = (
             self.client.table("player_achievements")

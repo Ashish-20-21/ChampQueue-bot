@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -11,6 +13,8 @@ from utils.embeds import (
     achievements_card, achievements_browse_embed, cs_stats_card,
 )
 from utils.permissions import admin_only, mod_or_admin_only
+
+logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 50  # players per leaderboard page — Discord embed description
                  # limit is 4096 chars; a real ign+rank+mmr line runs
@@ -402,6 +406,13 @@ class Stats(commands.Cog):
         if not player:
             await interaction.followup.send(f"{target.mention} isn't registered.", ephemeral=True)
             return
+        # Catch up anything this player already qualifies for but was never
+        # granted (badges used to appear only after a manual backfill). Cheap,
+        # idempotent, and a failure here must not stop the card from showing.
+        try:
+            await adb.grant_player_achievements(player["id"])
+        except Exception:
+            logger.warning("achievement refresh failed for player_id=%s", player["id"], exc_info=True)
         earned = await adb.get_player_achievements(player["id"])
         live_titles = await adb.live_player_titles(player["id"])
         await interaction.followup.send(

@@ -726,6 +726,26 @@ class Database:
         res = self.client.rpc("season_recap_stats", {"p_season_id": season_id}).execute()
         return res.data[0] if res.data else None
 
+    def get_season_dataset(self, season_id: int) -> dict:
+        """Everything the Python season-stats code needs for one season (see
+        services/season_stats.py). Plain table reads, no SQL function and no
+        migration, so /admin-dispatch never depends on anyone running SQL."""
+        from services import season_stats
+        return season_stats.load_dataset(self.client, season_id)
+
+    def count_players_registered_since(self, since_iso: str) -> int:
+        """How many approved players registered on or after `since_iso`
+        (the recap's "new faces" number)."""
+        res = (
+            self.client.table("players")
+            .select("id", count="exact")
+            .eq("status", "approved")
+            .gte("created_at", since_iso)
+            .limit(1)
+            .execute()
+        )
+        return int(res.count or 0)
+
     def record_hall_of_fame(self, season_id: int, category: str, player_id: int, value: str) -> dict:
         res = self.client.table("hall_of_fame").upsert(
             {"season_id": season_id, "category": category, "player_id": player_id, "value": value},

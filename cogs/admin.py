@@ -9,7 +9,7 @@ from discord.ext import commands
 
 import config
 from database.db import db, adb, with_retry
-from services import reputation, mmr_engine
+from services import reputation, mmr_engine, season_stats
 from utils.embeds import verification_card, hall_of_fame_embed, season_recap_embed
 from utils.permissions import admin_only, is_admin, hod_or_admin_only, mod_or_admin_only
 from utils import incident_log
@@ -347,6 +347,43 @@ class Admin(commands.Cog):
             return
         await interaction.followup.send(result_message, ephemeral=True)
 
+    async def _ign_map(self, player_ids: list[int]) -> dict[int, str]:
+        """player id -> current IGN for the few players a card names."""
+        ids = sorted({i for i in player_ids if i is not None})
+        if not ids:
+            return {}
+        rows = await with_retry(adb.get_players_by_ids, ids)
+        return {r["id"]: r["ign"] for r in rows or []}
+
+    async def _build_recap_stats(self, season: dict) -> dict | None:
+        """Season Recap numbers, worked out in Python from existing tables
+        (services/season_stats) so the dispatch needs no SQL function and no
+        migration. The old season_recap_stats() SQL function is only a fallback
+        if the Python route itself breaks. Returns None for a season with no
+        recorded matches. Every decoration (names, new players) is optional."""
+        stats = None
+        try:
+            dataset = await with_retry(adb.get_season_dataset, season["id"])
+            stats = season_stats.compute_recap(dataset)
+            if not stats["matches_played"]:
+                return None
+        except Exception:
+            logger.exception("season recap: Python computation failed, falling back to the SQL function")
+            return await with_retry(adb.season_recap_stats, season["id"])
+
+        best = stats.get("best_single_game")
+        if best:
+            try:
+                best["ign"] = (await self._ign_map([best["player_id"]])).get(best["player_id"])
+            except Exception:
+                logger.warning("season recap: could not look up the best-single-game player", exc_info=True)
+        try:
+            if season.get("start_date"):
+                stats["new_players"] = await with_retry(adb.count_players_registered_since, season["start_date"])
+        except Exception:
+            logger.warning("season recap: could not count new players", exc_info=True)
+        return stats
+
     async def _dispatch_season_recap(self, interaction: discord.Interaction, season_id: int | None = None,
                                       ai_tokens_used: str | None = None) -> str:
         """Posts the decorative season-wide stat showcase to
@@ -368,7 +405,7 @@ class Admin(commands.Cog):
             if not season:
                 return "❌ No active season found — pass season_id explicitly to target a specific season."
 
-        stats = await with_retry(adb.season_recap_stats, season["id"])
+        stats = await self._build_recap_stats(season)
         if not stats:
             return f"❌ No recap stats available for season_id={season['id']}."
 
@@ -422,11 +459,41 @@ class Admin(commands.Cog):
         }
 
         winners: dict[str, dict | None] = {}
+        notes: list[str] = []
+        failed: list[str] = []
         for key, fn in categories.items():
-            winners[key] = await with_retry(fn, season_id)
+            # One category failing must not sink the whole card: the others
+            # still post and the result message says which one to retry.
+            try:
+                winners[key] = await with_retry(fn, season_id)
+            except Exception:
+                logger.exception("hall of fame: category %s failed", key)
+                winners[key] = None
+                failed.append(key)
         # highest_mmr takes no season_id — current snapshot, not season-scoped,
         # same regardless of which season is being posted for.
-        winners["highest_mmr"] = await with_retry(adb.hof_highest_mmr)
+        try:
+            winners["highest_mmr"] = await with_retry(adb.hof_highest_mmr)
+        except Exception:
+            logger.exception("hall of fame: category highest_mmr failed")
+            winners["highest_mmr"] = None
+            failed.append("highest_mmr")
+        if failed:
+            notes.append(f"⚠️ Couldn't compute: {', '.join(failed)} (shown as 'not enough matches') — run it again to retry.")
+
+        # Extra categories, worked out in Python from existing data (no SQL
+        # function needed). Shown only when someone actually has a winner.
+        try:
+            dataset = await with_retry(adb.get_season_dataset, season_id)
+            extras = season_stats.compute_hof_extras(dataset)
+            names = await self._ign_map([r["player_id"] for r in extras.values() if r])
+            for key, row in extras.items():
+                if row and names.get(row["player_id"]):
+                    row["ign"] = names[row["player_id"]]
+                    winners[key] = row
+        except Exception:
+            logger.exception("hall of fame: extra categories failed")
+            notes.append("⚠️ The extra categories (wins, streaks, assists…) were skipped — run it again to retry.")
 
 
         # Persist each winner. value column is text — stringify whatever
@@ -438,13 +505,21 @@ class Admin(commands.Cog):
             "best_avg_deaths": "avg_deaths", "most_mvps": "mvp_count",
             "most_matches_played": "matches_played", "best_kd": "kd_ratio",
             "highest_mmr": "mmr",
+            **season_stats.EXTRA_VALUE_KEYS,
         }
+        unrecorded: list[str] = []
         for category, row in winners.items():
-            if row is None:
+            if row is None or category not in value_keys:
                 continue
-            await with_retry(
-                adb.record_hall_of_fame, season_id, category, row["player_id"], str(row[value_keys[category]]),
-            )
+            try:
+                await with_retry(
+                    adb.record_hall_of_fame, season_id, category, row["player_id"], str(row[value_keys[category]]),
+                )
+            except Exception:
+                logger.exception("hall of fame: could not record %s", category)
+                unrecorded.append(category)
+        if unrecorded:
+            notes.append(f"⚠️ Posted, but not saved to the hall_of_fame table: {', '.join(unrecorded)}.")
 
         if not config.HALL_OF_FAME_CHANNEL_ID:
             return "⚠️ Winners recorded to DB, but HALL_OF_FAME_CHANNEL_ID isn't set — nothing posted. Set it and re-run."
@@ -455,7 +530,8 @@ class Admin(commands.Cog):
 
         embed = hall_of_fame_embed(season, winners)
         await channel.send(embed=embed)
-        return f"✅ Hall of Fame posted to {channel.mention} and recorded for {season.get('code') or season.get('name')}."
+        message = f"✅ Hall of Fame posted to {channel.mention} and recorded for {season.get('code') or season.get('name')}."
+        return "\n".join([message, *notes])
 
 
     @app_commands.command(name="admin-scrap-match", description="[Admin] Confirm an AFK report and scrap the match — VCs deleted now, text channel after ~15 min")

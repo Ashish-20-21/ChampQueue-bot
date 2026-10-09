@@ -4,38 +4,98 @@ from services import mmr_engine
 from typing import Optional
 
 
-def season_recap_embed(season: dict, stats: dict, ai_tokens_used: str | None = None) -> discord.Embed:
-    """Decorative season-wide stat showcase — fires before Hall of Fame,
-    "how big was this season" framing rather than per-player winners.
-    Numbers come straight from season_recap_stats() (migration_026);
-    this function only formats, never computes.
+def _recap_end_label(season: dict) -> str:
+    """'today' while the season is still running, the end date once it is over."""
+    from services import season_stats
+    end = season_stats.parse_ts(season.get("end_date"))
+    if end is None:
+        return "today"
+    from datetime import datetime, timezone
+    return "today" if end > datetime.now(timezone.utc) else end.strftime("%Y-%m-%d")
 
-    ai_tokens_used is the one exception — there's no token-usage
-    tracking anywhere in the schema or codebase (confirmed: nothing in
-    vision_extraction.py or elsewhere persists per-call token counts),
-    so this isn't derived from a DB query like every other field here.
-    It's an optional pre-formatted string supplied by whoever triggers
-    the recap, sourced from the OpenAI dashboard directly. Omit the
-    field entirely if not provided, rather than showing a fake/zero
-    value."""
+
+def season_recap_embed(season: dict, stats: dict, ai_tokens_used: str | None = None) -> discord.Embed:
+    """Decorative season-wide stat showcase that fires before Hall of Fame,
+    "how big was this season" framing rather than per-player winners.
+    `stats` comes from services/season_stats.compute_recap() (or, if that ever
+    fails, the old season_recap_stats() SQL result, which only has the first
+    group of keys). This function only formats, never computes. Every extra
+    field is shown only when its number exists, so a thin season simply gets
+    a shorter card instead of an error.
+
+    Rounds Played is shown only when it differs from Matches Played: with
+    single-round (RO1) matches the two are always equal, so it was just the
+    same number twice. MVPs Awarded is gone for the same reason (always two
+    per match).
+
+    ai_tokens_used is the one number not read from the DB: there is no token
+    tracking in the schema, so it is an optional string typed in by whoever
+    runs the recap (OpenAI dashboard). Omitted when not given, never faked."""
     season_label = season.get("code") or season.get("name") or "Season"
     start = (season.get("start_date") or "")[:10]  # YYYY-MM-DD, no time
     embed = discord.Embed(
         title=f"📊 Season Recap — {season_label}",
-        description=f"From **{start}** to today — here's what the community built together. 🔥",
+        description=f"From **{start}** to **{_recap_end_label(season)}** — here's what the community built together. 🔥",
         color=discord.Color.from_rgb(255, 140, 0),
     )
-    embed.add_field(name="🎮 Matches Played", value=f"**{stats['matches_played']:,}**", inline=True)
-    embed.add_field(name="🔄 Rounds Played", value=f"**{stats['rounds_played']:,}**", inline=True)
-    embed.add_field(name="👥 Players", value=f"**{stats['unique_players']:,}**", inline=True)
-    embed.add_field(name="🔫 Total Kills", value=f"**{stats['total_kills']:,}**", inline=True)
-    embed.add_field(name="💀 Total Deaths", value=f"**{stats['total_deaths']:,}**", inline=True)
-    embed.add_field(name="⭐ MVPs Awarded", value=f"**{stats['total_mvps_awarded']:,}**", inline=True)
-    embed.add_field(name="⏱️ Hours of Hardpoint", value=f"**{stats['total_hardpoint_hours']:,}**", inline=True)
+
+    def add(name: str, value) -> None:
+        embed.add_field(name=name, value=value, inline=True)
+
+    def n_matches(n: int) -> str:
+        return f"{n:,} match" if n == 1 else f"{n:,} matches"
+
+    add("🎮 Matches Played", f"**{stats['matches_played']:,}**")
+    if stats.get("rounds_played") and stats["rounds_played"] != stats["matches_played"]:
+        add("🔄 Rounds Played", f"**{stats['rounds_played']:,}**")
+    add("👥 Players", f"**{stats['unique_players']:,}**")
+    if stats.get("new_players"):
+        add("🆕 New Players", f"**{stats['new_players']:,}** joined")
+    add("🔫 Total Kills", f"**{stats['total_kills']:,}**")
+    add("💀 Total Deaths", f"**{stats['total_deaths']:,}**")
+    if stats.get("total_assists"):
+        add("🤝 Total Assists", f"**{stats['total_assists']:,}**")
+    add("⏱️ Hours of Hardpoint", f"**{stats['total_hardpoint_hours']:,}**")
+
+    if stats.get("busiest_day"):
+        d = stats["busiest_day"]
+        add("📅 Busiest Day", f"**{d['label']}**\n{n_matches(d['matches'])}")
+    if stats.get("peak_hour"):
+        h = stats["peak_hour"]
+        add("🕘 Peak Hour", f"**{h['label']}**\n{n_matches(h['matches'])} started")
+    if stats.get("top_map"):
+        m = stats["top_map"]
+        add("🗺️ Most Played Map", f"**{m['name']}**\n{n_matches(m['matches'])}")
+    if stats.get("queue_split"):
+        parts = [f"{q['queue'].replace('_', '/')} {q['pct']}%" for q in stats["queue_split"][:4]]
+        embed.add_field(name="🌍 Where We Queued", value=" · ".join(parts), inline=False)
+    if stats.get("best_single_game") and stats["best_single_game"].get("ign"):
+        b = stats["best_single_game"]
+        add("💥 Best Single Game", f"**{b['ign']}**\n{b['kills']} kills ({b['match_code']})")
+    if stats.get("closest_finish"):
+        c = stats["closest_finish"]
+        add("🎯 Closest Finish", f"**{c['score']}**\n{c['match_code']}")
+    if stats.get("biggest_blowout"):
+        c = stats["biggest_blowout"]
+        add("💣 Biggest Blowout", f"**{c['score']}**\n{c['match_code']}")
     if ai_tokens_used:
-        embed.add_field(name="🤖 AI Tokens Processed", value=f"**{ai_tokens_used}**", inline=True)
-    embed.set_footer(text="Every kill, every clutch, every close call — this was Season 1. 🏆")
+        add("🤖 AI Tokens Processed", f"**{ai_tokens_used}**")
+    embed.set_footer(text=f"Every kill, every clutch, every close call — that was {season_label}. 🏆")
     return embed
+
+
+# Hall of Fame categories that are worked out in Python (services/season_stats).
+# They are optional: a category with no winner is left off the card entirely.
+# key -> (field title, how to write the winner's line)
+HOF_EXTRA_FIELDS = {
+    "most_wins": ("🏅 Most Wins", lambda r: f"{r['wins']} wins ({r['matches_played']} matches)"),
+    "longest_win_streak": ("🔥 Longest Win Streak", lambda r: f"{r['streak']} wins in a row"),
+    "most_assists": ("🤝 Most Assists", lambda r: f"{r['total_assists']:,} assists ({r['matches_played']} matches)"),
+    "best_avg_impact": ("🎖️ Best Avg Impact", lambda r: f"{r['avg_impact']} Impact per match ({r['matches_played']} matches)"),
+    "most_crowns": ("💠 Most Impact Crowns", lambda r: f"{r['crown_count']} crowns ({r['matches_played']} matches)"),
+    "hill_king": ("⏱️ Hill King", lambda r: f"{r['hill_hours']} hours on the hill ({r['matches_played']} matches)"),
+    "best_single_game": ("💣 Best Single Game", lambda r: f"{r['kills']} kills in one game ({r['match_code']})"),
+}
 
 
 def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> discord.Embed:
@@ -47,7 +107,11 @@ def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> disc
 
     Category value/units differ per category (win %, mmr/match, raw kill
     count, K/D ratio, etc.) — each branch below formats its own row rather
-    than trying to force one generic formatter across incompatible units."""
+    than trying to force one generic formatter across incompatible units.
+
+    The HOF_EXTRA_FIELDS categories come after the original nine and are
+    different: they are only shown when someone has a winner (the data may
+    simply not exist for that season), never as a 'not enough' placeholder."""
     season_label = season.get("code") or season.get("name") or "Season"
     embed = discord.Embed(
         title=f"🏆 Hall of Fame — {season_label}",
@@ -63,8 +127,9 @@ def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> disc
     mc = winners.get("most_consistent")
     embed.add_field(name="🎯 Most Consistent", value=_line(mc, f"{mc['win_rate_pct']}% win rate ({mc['matches_played']} matches)" if mc else ""), inline=False)
 
+    # "314 total" used to read like a match count. Say what the numbers are.
     fc = winners.get("fastest_climber")
-    embed.add_field(name="📈 Fastest Climber", value=_line(fc, f"+{fc['mmr_per_match']} MMR/match ({fc['mmr_gained']} total)" if fc else ""), inline=False)
+    embed.add_field(name="📈 Fastest Climber", value=_line(fc, f"+{fc['mmr_per_match']} MMR per match ({fc['mmr_gained']} MMR gained over {fc['matches_played']} matches)" if fc else ""), inline=False)
 
     hk = winners.get("highest_total_kills")
     embed.add_field(name="🔫 Highest Kills", value=_line(hk, f"{hk['total_kills']} kills ({hk['matches_played']} matches)" if hk else ""), inline=False)
@@ -86,6 +151,11 @@ def hall_of_fame_embed(season: dict, winners: dict[str, Optional[dict]]) -> disc
 
     hm = winners.get("highest_mmr")
     embed.add_field(name="👑 Highest Rank/MMR", value=_line(hm, f"{hm['mmr']} MMR ({hm['current_rank']})" if hm else ""), inline=False)
+
+    for key, (title, fmt) in HOF_EXTRA_FIELDS.items():
+        row = winners.get(key)
+        if row and row.get("ign"):
+            embed.add_field(name=title, value=_line(row, fmt(row)), inline=False)
 
     embed.set_footer(text="Congratulations to everyone who competed this season! 🎉")
     return embed

@@ -19,6 +19,7 @@ left out. Nothing here is allowed to take the whole dispatch down.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import Counter, defaultdict
@@ -30,6 +31,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 PAGE_SIZE = 1000                 # PostgREST returns at most 1000 rows per request
 MIN_MATCHES_FLOOR = 8            # same sample floor as migration_024
 MIN_STREAK_TO_SHOW = 3           # a 2-game streak is not worth a trophy
+MIN_COVERAGE = 0.9              # an extra needs data for at least 90% of the season, or it is left out
 BONUS_POINTS = 5                 # the +5 MMR (MVP tag before 2026-10-06, Impact crown after)
 
 _SCORE_RE = re.compile(r"\s*(\d+)\s*[-:]\s*(\d+)\s*")
@@ -38,13 +40,16 @@ _SCORE_RE = re.compile(r"\s*(\d+)\s*[-:]\s*(\d+)\s*")
 # --------------------------------------------------------------------------
 # Loading (the only part that touches the database)
 # --------------------------------------------------------------------------
-def _fetch_all(build) -> list[dict]:
+def _fetch_all(build, order: tuple[str, ...] = ("id",)) -> list[dict]:
     """Read every page of a query. `build` returns a FRESH query each call.
-    Ordered by id so pages never overlap or skip rows."""
+    Ordered by a unique key so pages never overlap or skip rows."""
     rows: list[dict] = []
     start = 0
     while True:
-        batch = build().order("id").range(start, start + PAGE_SIZE - 1).execute().data or []
+        query = build()
+        for column in order:
+            query = query.order(column)
+        batch = query.range(start, start + PAGE_SIZE - 1).execute().data or []
         rows.extend(batch)
         if len(batch) < PAGE_SIZE:
             return rows
@@ -86,7 +91,38 @@ def load_dataset(client, season_id: int) -> dict:
             "match_round_results",
             "id, match_id, player_id, round_number, team, is_mvp, mmr_delta",
         ))
-    return {"season_id": season_id, "matches": matches, "stats": stats, "results": results}
+    return {"season_id": season_id, "matches": matches, "stats": stats, "results": results,
+            "screen_scores": _load_screen_scores(scoped)}
+
+
+def _load_screen_scores(scoped) -> dict[int, str]:
+    """match id -> final score as read from the scoreboard screenshot (the
+    same score the host checked on the verification card). matches.final_score
+    is only filled for some matches, so on its own it would pick a "closest
+    finish" from a small, unrepresentative sample. Best effort: any problem
+    here just means no scores, and the recap leaves those two fields out."""
+    try:
+        shots = _fetch_all(scoped("match_screenshots", "match_id, round_number, raw_extraction"),
+                           order=("match_id", "round_number"))
+    except Exception:
+        logger.warning("season_stats: could not read screenshot scores", exc_info=True)
+        return {}
+    per_match: dict[int, list] = defaultdict(list)
+    for row in shots:
+        per_match[row["match_id"]].append(row.get("raw_extraction"))
+    scores: dict[int, str] = {}
+    for mid, raws in per_match.items():
+        if len(raws) != 1:                       # old multi-round matches have no single score
+            continue
+        raw = raws[0]
+        if isinstance(raw, str):                 # stored as a JSON string in some rows
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                continue
+        if isinstance(raw, dict) and raw.get("final_score"):
+            scores[mid] = str(raw["final_score"])
+    return scores
 
 
 # --------------------------------------------------------------------------
@@ -165,7 +201,11 @@ def _match_outcomes(ds: dict) -> tuple[dict[tuple[int, int], dict], bool]:
         a, b = totals.get("A", 0.0), totals.get("B", 0.0)
         winners[mid] = "A" if a > b else "B" if b > a else None
 
-    have_crown_data = any(r.get("is_crown") is not None for r in ds["results"])
+    # Crowns only exist for matches played since migration_041 (2026-10-06);
+    # older rows have is_crown NULL. Ranking "most crowns" over a few days of a
+    # season-long card would be unfair, so it needs near-full coverage.
+    known = sum(1 for r in ds["results"] if r.get("is_crown") is not None)
+    have_crown_data = bool(ds["results"]) and known / len(ds["results"]) >= MIN_COVERAGE
     out: dict[tuple[int, int], dict] = {}
     for r in ds["results"]:
         key = (r["player_id"], r["match_id"])
@@ -240,7 +280,7 @@ def compute_recap(ds: dict) -> dict:
     if queues:
         total = sum(queues.values())
         recap["queue_split"] = [
-            {"queue": q, "matches": n, "pct": round(100.0 * n / total)}
+            {"queue": q, "matches": n, "pct": round(100.0 * n / total)}   # 0 means "under 0.5%"
             for q, n in sorted(queues.items(), key=lambda kv: (-kv[1], kv[0]))
         ]
 
@@ -252,12 +292,14 @@ def compute_recap(ds: dict) -> dict:
                 "player_id": pid, "kills": rec["kills"], "match_code": matches_by_id[mid].get("match_id"),
             }
     scored = []
+    screen_scores = ds.get("screen_scores") or {}
     for m in real_matches:
-        found = _SCORE_RE.fullmatch(str(m.get("final_score") or ""))
+        found = _SCORE_RE.fullmatch(str(m.get("final_score") or screen_scores.get(m["id"]) or ""))
         if found and int(found[1]) != int(found[2]):
             a, b = int(found[1]), int(found[2])
             scored.append((abs(a - b), m.get("match_id"), f"{a}–{b}"))
-    if scored:
+    # "Closest" and "biggest" are only honest when nearly every match has a score.
+    if scored and real_matches and len(scored) / len(real_matches) >= MIN_COVERAGE:
         gap, code, shown = min(scored, key=lambda t: (t[0], str(t[1])))
         recap["closest_finish"] = {"gap": gap, "match_code": code, "score": shown}
         gap, code, shown = max(scored, key=lambda t: (t[0], str(t[1])))
@@ -290,11 +332,14 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
             logger.exception("season_stats: HoF extra %r failed, leaving it out", name)
             extras[name] = None
 
-    def most_assists():
-        rows = [{"player_id": p, "matches_played": len(ms), "total_assists": sum(r["assists"] for _, r in ms)}
-                for p, ms in per_player.items()]
-        best = _pick(rows, "total_assists")
-        return best if best and best["total_assists"] > 0 else None
+    def best_avg_assists():
+        rows = []
+        for p, ms in per_player.items():
+            if len(ms) >= MIN_MATCHES_FLOOR:
+                rows.append({"player_id": p, "matches_played": len(ms),
+                             "avg_assists": round(sum(r["assists"] for _, r in ms) / len(ms), 1)})
+        best = _pick(rows, "avg_assists")
+        return best if best and best["avg_assists"] > 0 else None
 
     def best_avg_impact():
         rows = []
@@ -306,11 +351,13 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
         return _pick(rows, "avg_impact")
 
     def hill_king():
-        rows = [{"player_id": p, "matches_played": len(ms),
-                 "hill_hours": round(sum(r["hill_time"] for _, r in ms) / 3600.0, 1)}
-                for p, ms in per_player.items()]
-        best = _pick(rows, "hill_hours")
-        return best if best and best["hill_hours"] > 0 else None
+        rows = []
+        for p, ms in per_player.items():
+            if len(ms) >= MIN_MATCHES_FLOOR:
+                rows.append({"player_id": p, "matches_played": len(ms),
+                             "avg_hill_seconds": round(sum(r["hill_time"] for _, r in ms) / len(ms))})
+        best = _pick(rows, "avg_hill_seconds")
+        return best if best and best["avg_hill_seconds"] > 0 else None
 
     def most_crowns():
         if not have_crown_data:
@@ -359,7 +406,7 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
                 rows.append({"player_id": p, "matches_played": len(ms), "streak": longest})
         return _pick(rows, "streak")
 
-    guarded("most_assists", most_assists)
+    guarded("best_avg_assists", best_avg_assists)
     guarded("best_avg_impact", best_avg_impact)
     guarded("hill_king", hill_king)
     guarded("most_crowns", most_crowns)
@@ -371,9 +418,9 @@ def compute_hof_extras(ds: dict) -> dict[str, dict | None]:
 
 # Same table the embed and the hall_of_fame table use: category -> number that is stored.
 EXTRA_VALUE_KEYS = {
-    "most_assists": "total_assists",
+    "best_avg_assists": "avg_assists",
     "best_avg_impact": "avg_impact",
-    "hill_king": "hill_hours",
+    "hill_king": "avg_hill_seconds",
     "most_crowns": "crown_count",
     "best_single_game": "kills",
     "most_wins": "wins",

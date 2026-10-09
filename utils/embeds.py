@@ -67,7 +67,7 @@ def season_recap_embed(season: dict, stats: dict, ai_tokens_used: str | None = N
         m = stats["top_map"]
         add("🗺️ Most Played Map", f"**{m['name']}**\n{n_matches(m['matches'])}")
     if stats.get("queue_split"):
-        parts = [f"{q['queue'].replace('_', '/')} {q['pct']}%" for q in stats["queue_split"][:4]]
+        parts = [f"{_queue_label(q['queue'])} {q['pct'] if q['pct'] else '<1'}%" for q in stats["queue_split"][:4]]
         embed.add_field(name="🌍 Where We Queued", value=" · ".join(parts), inline=False)
     if stats.get("best_single_game") and stats["best_single_game"].get("ign"):
         b = stats["best_single_game"]
@@ -84,16 +84,27 @@ def season_recap_embed(season: dict, stats: dict, ai_tokens_used: str | None = N
     return embed
 
 
+def _mmss(seconds: int) -> str:
+    return f"{int(seconds) // 60}m {int(seconds) % 60:02d}s"
+
+
+def _queue_label(key: str) -> str:
+    """EU_AF -> EU/AF, INDIA_ME_ONLY -> INDIA/ME-only."""
+    only = key.endswith("_ONLY")
+    base = (key[:-5] if only else key).replace("_", "/")
+    return f"{base}-only" if only else base
+
+
 # Hall of Fame categories that are worked out in Python (services/season_stats).
 # They are optional: a category with no winner is left off the card entirely.
 # key -> (field title, how to write the winner's line)
 HOF_EXTRA_FIELDS = {
     "most_wins": ("🏅 Most Wins", lambda r: f"{r['wins']} wins ({r['matches_played']} matches)"),
     "longest_win_streak": ("🔥 Longest Win Streak", lambda r: f"{r['streak']} wins in a row"),
-    "most_assists": ("🤝 Most Assists", lambda r: f"{r['total_assists']:,} assists ({r['matches_played']} matches)"),
+    "best_avg_assists": ("🤝 Best Avg Assists", lambda r: f"{r['avg_assists']} assists per match ({r['matches_played']} matches)"),
     "best_avg_impact": ("🎖️ Best Avg Impact", lambda r: f"{r['avg_impact']} Impact per match ({r['matches_played']} matches)"),
     "most_crowns": ("💠 Most Impact Crowns", lambda r: f"{r['crown_count']} crowns ({r['matches_played']} matches)"),
-    "hill_king": ("⏱️ Hill King", lambda r: f"{r['hill_hours']} hours on the hill ({r['matches_played']} matches)"),
+    "hill_king": ("⏱️ Hill King", lambda r: f"{_mmss(r['avg_hill_seconds'])} on the hill per match ({r['matches_played']} matches)"),
     "best_single_game": ("💣 Best Single Game", lambda r: f"{r['kills']} kills in one game ({r['match_code']})"),
 }
 

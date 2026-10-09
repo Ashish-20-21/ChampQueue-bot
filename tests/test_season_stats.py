@@ -109,12 +109,30 @@ def test_best_single_game_and_score_extremes():
     specs = [
         {"id": 1, "code": "CQ-1", "created": "2026-10-01T10:00:00+00:00", "winner": "A", "score": "250-249"},
         {"id": 2, "code": "CQ-2", "created": "2026-10-02T10:00:00+00:00", "winner": "A", "score": "250-60"},
-        {"id": 3, "code": "CQ-3", "created": "2026-10-03T10:00:00+00:00", "winner": "A", "score": None},
+        {"id": 3, "code": "CQ-3", "created": "2026-10-03T10:00:00+00:00", "winner": "A", "score": "250-180"},
     ]
     r = season_stats.compute_recap(make_ds(specs))
     assert r["best_single_game"] == {"player_id": 10, "kills": 20, "match_code": "CQ-1"}   # earliest wins a tie
     assert r["closest_finish"] == {"gap": 1, "match_code": "CQ-1", "score": "250–249"}
     assert r["biggest_blowout"] == {"gap": 190, "match_code": "CQ-2", "score": "250–60"}
+
+
+def test_scores_for_only_some_matches_are_not_used_for_superlatives():
+    # Real life: matches.final_score is filled for a minority of matches, so the
+    # "closest finish" of that minority would be wrong. Under 90% coverage -> hidden.
+    specs = eight_matches(lambda i: "A")
+    specs[0]["score"], specs[1]["score"] = "250-158", "250-90"
+    r = season_stats.compute_recap(make_ds(specs))
+    assert "closest_finish" not in r and "biggest_blowout" not in r
+
+
+def test_scores_can_come_from_the_screenshots():
+    ds = make_ds(eight_matches(lambda i: "A"))
+    ds["screen_scores"] = {i: "250-200" for i in range(1, 9)}
+    ds["screen_scores"][5] = "243-250"
+    r = season_stats.compute_recap(ds)
+    assert r["closest_finish"]["score"] == "243–250" and r["closest_finish"]["gap"] == 7
+    assert r["biggest_blowout"]["gap"] == 50
 
 
 def test_no_final_scores_means_no_score_fields():
@@ -127,9 +145,9 @@ def test_no_final_scores_means_no_score_fields():
 # ---------------------------------------------------------------------------
 def test_extras_pick_the_right_winners():
     ex = season_stats.compute_hof_extras(make_ds(eight_matches(lambda i: "B")))
-    assert ex["most_assists"]["player_id"] == 10 and ex["most_assists"]["total_assists"] == 80
+    assert ex["best_avg_assists"]["player_id"] == 10 and ex["best_avg_assists"]["avg_assists"] == 10.0
     assert ex["best_avg_impact"]["player_id"] == 10 and ex["best_avg_impact"]["avg_impact"] == 110.0
-    assert ex["hill_king"]["player_id"] == 3
+    assert ex["hill_king"]["player_id"] == 3 and ex["hill_king"]["avg_hill_seconds"] == 120
     assert ex["most_crowns"]["player_id"] == 1 and ex["most_crowns"]["crown_count"] == 8   # tie -> lowest id
     assert ex["best_single_game"]["player_id"] == 10 and ex["best_single_game"]["kills"] == 20
     assert ex["most_wins"]["player_id"] == 6 and ex["most_wins"]["wins"] == 8
@@ -157,8 +175,8 @@ def test_win_streak_resets_on_a_loss_and_needs_three():
 
 def test_rate_category_needs_eight_matches():
     ex = season_stats.compute_hof_extras(make_ds(eight_matches(lambda i: "B")[:7]))
-    assert ex["best_avg_impact"] is None
-    assert ex["most_assists"] is not None            # cumulative: no floor
+    assert ex["best_avg_impact"] is None and ex["best_avg_assists"] is None and ex["hill_king"] is None
+    assert ex["most_wins"] is not None and ex["best_single_game"] is not None     # totals / records: no floor
 
 
 def test_crowns_left_out_when_the_database_has_no_crown_columns():
@@ -166,6 +184,15 @@ def test_crowns_left_out_when_the_database_has_no_crown_columns():
     ex = season_stats.compute_hof_extras(ds)
     assert ex["most_crowns"] is None
     assert ex["most_wins"]["player_id"] == 6         # still works from the MVP-tag bonus
+
+
+def test_crowns_need_near_full_coverage_of_the_season():
+    # crown data exists only for the last 2 of 8 matches (rows before migration_041 have is_crown NULL)
+    ds = make_ds(eight_matches(lambda i: "B"))
+    for r in ds["results"]:
+        if r["match_id"] <= 6:
+            r["is_crown"] = None
+    assert season_stats.compute_hof_extras(ds)["most_crowns"] is None
 
 
 def test_empty_season_gives_nothing_and_does_not_crash():
@@ -221,6 +248,29 @@ def test_loader_reads_every_page():
     assert [lo for t, lo in client.calls if t == "matches"] == [0, 1000, 2000]
 
 
+def test_loader_reads_scores_from_screenshots_even_when_stored_as_a_json_string():
+    tables = {"matches": [], "match_player_stats": [], "match_round_results": [],
+              "match_screenshots": [
+                  {"match_id": 1, "round_number": 1, "raw_extraction": '{"final_score": "243-250", "map": "Summit"}'},
+                  {"match_id": 2, "round_number": 1, "raw_extraction": {"final_score": "250-100"}},
+                  {"match_id": 3, "round_number": 1, "raw_extraction": {"final_score": "250-10"}},    # old 3-round match
+                  {"match_id": 3, "round_number": 2, "raw_extraction": {"final_score": "250-20"}},
+                  {"match_id": 4, "round_number": 1, "raw_extraction": "not json"},
+              ]}
+    ds = season_stats.load_dataset(FakeClient(tables), 2)
+    assert ds["screen_scores"] == {1: "243-250", 2: "250-100"}
+
+
+def test_loader_survives_a_screenshot_read_failure():
+    class Boom(FakeClient):
+        def table(self, name):
+            if name == "match_screenshots":
+                raise RuntimeError("boom")
+            return super().table(name)
+    ds = season_stats.load_dataset(Boom({"matches": [], "match_player_stats": [], "match_round_results": []}), 2)
+    assert ds["screen_scores"] == {}
+
+
 def test_loader_falls_back_when_crown_columns_are_missing():
     tables = {"matches": [], "match_player_stats": [],
               "match_round_results": [{"id": 1, "match_id": 1, "player_id": 1, "team": "A", "mmr_delta": 5, "is_mvp": False}]}
@@ -251,6 +301,15 @@ def test_recap_card_drops_the_duplicate_numbers_and_fixes_the_footer():
         assert wanted in n, wanted
     assert "S2-0901" in e.footer.text and "Season 1" not in e.footer.text
     assert "to **today**" in e.description
+
+
+def test_queue_labels_are_readable_and_tiny_shares_are_not_shown_as_zero():
+    stats = {"matches_played": 1, "rounds_played": 1, "unique_players": 1, "total_kills": 1, "total_deaths": 1,
+             "total_hardpoint_hours": 0.1,
+             "queue_split": [{"queue": "INDIA_ME", "matches": 9, "pct": 93}, {"queue": "EU_AF", "matches": 1, "pct": 6},
+                             {"queue": "INDIA_ME_ONLY", "matches": 1, "pct": 0}]}
+    value = next(f.value for f in embeds.season_recap_embed(SEASON, stats).fields if "Queued" in f.name)
+    assert value == "INDIA/ME 93% · EU/AF 6% · INDIA/ME-only <1%"
 
 
 def test_recap_card_shows_rounds_only_when_they_differ():
@@ -298,6 +357,11 @@ def test_extra_hof_fields_appear_only_with_a_winner():
     e = embeds.hall_of_fame_embed(SEASON, winners)
     assert len(e.fields) == 10
     assert next(f.value for f in e.fields if "Most Wins" in f.name) == "**Ezio** — 30 wins (39 matches)"
+    winners["hill_king"] = {"player_id": 3, "ign": "Piplup", "avg_hill_seconds": 72, "matches_played": 215}
+    winners["best_avg_assists"] = {"player_id": 4, "ign": "Intensity", "avg_assists": 12.8, "matches_played": 371}
+    e = embeds.hall_of_fame_embed(SEASON, winners)
+    assert next(f.value for f in e.fields if "Hill King" in f.name) == "**Piplup** — 1m 12s on the hill per match (215 matches)"
+    assert next(f.value for f in e.fields if "Best Avg Assists" in f.name) == "**Intensity** — 12.8 assists per match (371 matches)"
 
 
 # ---------------------------------------------------------------------------

@@ -1973,6 +1973,11 @@ class Match(commands.Cog):
         """
         ign = raw_ign.strip().lower()
 
+        # Step 1: exact match on the raw string.
+        exact = roster.get(ign)
+        if exact:
+            return exact, None
+
         # Step 0: likely CODM streamer-mode scramble — the game replaces
         # a player's ENTIRE displayed name with a randomized alphanumeric
         # string (observed length ~12-16 chars, mixed letters+digits, no
@@ -1989,11 +1994,6 @@ class Match(commands.Cog):
         # fires on strings that look nothing like a normal IGN.
         if Match._looks_like_streamer_mask(ign):
             return None, "possible streamer-mode masked name — resolve manually"
-
-        # Step 1: exact match on the raw string.
-        exact = roster.get(ign)
-        if exact:
-            return exact, None
 
         # Step 2: fuzzy match on the raw string.
         result, note = Match._fuzzy_lookup(ign, roster)

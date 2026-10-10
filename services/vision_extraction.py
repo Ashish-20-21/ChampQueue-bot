@@ -15,12 +15,15 @@ register it in `_PROVIDERS`.
 from __future__ import annotations
 import base64
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 import httpx
 
 import config
+
+log = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT = """You are extracting structured data from a Call of Duty Mobile \
 Hardpoint match scoreboard screenshot. Return ONLY valid JSON, no markdown fences, \
@@ -144,6 +147,26 @@ class AnthropicVisionProvider(VisionProvider):
         return json.loads(text)
 
 
+def _log_openai_usage(response_json: Any, model: str) -> None:
+    """Log one VISION_USAGE INFO line per OpenAI scoreboard read. Missing
+    fields count as 0; never raises, so logging can't break a read."""
+    try:
+        usage = response_json.get("usage") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        log.info(
+            "VISION_USAGE model=%s prompt=%d completion=%d reasoning=%d cached=%d total=%d",
+            model,
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+            int(completion_details.get("reasoning_tokens") or 0),
+            int(prompt_details.get("cached_tokens") or 0),
+            int(usage.get("total_tokens") or 0),
+        )
+    except Exception:
+        pass
+
+
 class OpenAIVisionProvider(VisionProvider):
     """OpenAI Chat Completions API, vision-capable model. Model name is
     configurable via config.OPENAI_VISION_MODEL rather than hardcoded —
@@ -204,6 +227,7 @@ class OpenAIVisionProvider(VisionProvider):
                                 f"{config.OPENAI_VISION_MODEL!r}: {resp.text}")
         resp.raise_for_status()
         data = resp.json()
+        _log_openai_usage(data, config.OPENAI_VISION_MODEL)
         text = data["choices"][0]["message"]["content"]
         return json.loads(text)
 
